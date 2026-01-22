@@ -12,7 +12,7 @@ export const whatsappProvider: ProviderDefinition = {
 
   schema: z.object({
     contentSid: z.string().nullable().describe('set template_id to other'),
-    contentVariables: z.record(z.string(), z.any()).nullable(),
+    contentVariables: z.record(z.string(), z.any()).nullable().optional(),
   }),
 
   async send({ to, template_id, variables }) {
