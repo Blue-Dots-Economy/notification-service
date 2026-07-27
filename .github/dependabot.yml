@@ -2,6 +2,9 @@ version: 2
 updates:
   # npm dependencies
   - package-ecosystem: "npm"
+    # Check manifests on and raise PRs against the integration branch;
+    # security updates still target the default branch (GitHub limitation).
+    target-branch: "feature"
     directory: "/"
     schedule:
       interval: "weekly"
@@ -21,6 +24,9 @@ updates:
 
   # GitHub Actions — keeps CI workflow action versions current
   - package-ecosystem: "github-actions"
+    # Check manifests on and raise PRs against the integration branch;
+    # security updates still target the default branch (GitHub limitation).
+    target-branch: "feature"
     directory: "/"
     schedule:
       interval: "weekly"
@@ -35,6 +41,9 @@ updates:
 
   # Docker base image (root Dockerfile)
   - package-ecosystem: "docker"
+    # Check manifests on and raise PRs against the integration branch;
+    # security updates still target the default branch (GitHub limitation).
+    target-branch: "feature"
     directory: "/"
     schedule:
       interval: "weekly"
