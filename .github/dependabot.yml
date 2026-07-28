@@ -38,6 +38,9 @@ updates:
       - "ci"
     commit-message:
       prefix: "chore(ci)"
+    groups:
+      github-actions:
+        patterns: ["*"]
 
   # Docker base image (root Dockerfile)
   - package-ecosystem: "docker"
@@ -55,3 +58,6 @@ updates:
       - "docker"
     commit-message:
       prefix: "chore(docker)"
+    groups:
+      docker:
+        patterns: ["*"]
