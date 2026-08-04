@@ -22,7 +22,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.1.2",
-    "@types/nodemailer": "^7.0.4",
+    "@types/nodemailer": "^8.0.1",
     "ts-node": "^10.9.2",
     "typescript": "^7.0.2"
   },
