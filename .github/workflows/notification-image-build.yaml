@@ -4,9 +4,27 @@ on:
   push:
     branches:
       - main
-      - 'feature/**'
+      # `feature`, not 'feature/**'. The glob requires a slash, so it never
+      # matched the integration branch every PR targets — across the last 20 runs
+      # this workflow had only ever run on main and a few test/* branches. The
+      # branch tag from docker/metadata-action is therefore `:feature`.
+      - feature
     tags:
       - '**'
+  # Build (without publishing) on PRs that touch the image inputs, so a broken
+  # Dockerfile is caught in review instead of on a shared branch. This is not
+  # hypothetical: moving pnpm `overrides` into pnpm-workspace.yaml broke the
+  # build with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH because the Dockerfile did not
+  # copy that file, and nothing ran the build to notice.
+  pull_request:
+    paths:
+      - Dockerfile
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - tsconfig.json
+      - src/**
+      - .github/workflows/notification-image-build.yaml
   workflow_dispatch:
 
 env:
@@ -31,6 +49,9 @@ jobs:
         uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
+        # Not needed on the PR path, which only builds. Skipping also keeps
+        # Dependabot-raised PRs working, where GITHUB_TOKEN is read-only.
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
@@ -56,8 +77,11 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
+          # Single platform on PRs: the arm64 leg is emulated through QEMU and
+          # roughly doubles the run for a check whose job is only to prove the
+          # image still builds. Pushes keep both.
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
