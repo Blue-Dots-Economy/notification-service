@@ -1,0 +1,47 @@
+name: CI
+
+# This repo had no CI at all: the only workflow was the GHCR image build, which
+# runs on push to main (and a 'feature/**' glob that never matches the branch
+# literally named `feature`). Nothing validated a pull request, which is how a
+# tsconfig incompatible with TypeScript 7 reached main and broke the image build.
+on:
+  push:
+    branches: [main, develop, feature]
+  pull_request:
+    branches: [main, develop, feature]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      # Deliberately 20, matching `FROM node:20-alpine` in the Dockerfile rather
+      # than the Node 24 the sibling DPG repos use. The module/moduleResolution
+      # settings model the runtime's ESM support, so type-checking on the version
+      # we actually ship is what catches a CommonJS `require()` of an ESM-only
+      # package — the failure that TS1479 reported for `uuid`.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # `pnpm build` is `tsc`, so this is both the build and the type-check.
+      # `pnpm test` is deliberately NOT run: it is still the placeholder
+      # (`echo "Error: no test specified" && exit 1`) and there are no test files,
+      # so it would fail every run. Add it here in the same commit that adds a
+      # real test runner.
+      - name: Build (tsc)
+        run: pnpm run build

@@ -1,5 +1,5 @@
+import { randomUUID } from 'node:crypto';
 import { FastifyInstance } from 'fastify';
-import { v4 as uuid } from 'uuid';
 import { z } from 'zod';
 import { dedupe } from '../lib/dedupe';
 import { providers } from '../lib/providers';
@@ -36,7 +36,7 @@ export async function notifyRoutes(app: FastifyInstance) {
       if (!v.success)
         return reply.code(400).send({ error: z.formatError(v.error) });
 
-      const job_id = uuid();
+      const job_id = randomUUID();
       const priority = body.priority ?? 'other';
 
       const dedupeKey =
