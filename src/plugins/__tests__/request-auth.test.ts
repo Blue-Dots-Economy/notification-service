@@ -197,3 +197,88 @@ describe('requestAuth', () => {
     expect(reply.body).toEqual({ error: 'Invalid signature' });
   });
 });
+
+describe('requestAuth — nonce is claimed only after the signature checks out (#52)', () => {
+  it('does not burn the nonce when the signature is wrong', async () => {
+    const ts = String(Math.floor(Date.now() / 1000));
+    const nonce = 'reusable-after-bad-signature';
+
+    const bad = replyDouble();
+    await requestAuth(
+      requestDouble({
+        headers: {
+          'x-ns-key': KEY_ID,
+          'x-ns-timestamp': ts,
+          'x-ns-nonce': nonce,
+          'x-ns-signature': sign('POST', '/notify', ts, nonce, 'wrong-secret'),
+        },
+      }),
+      bad as never,
+    );
+
+    expect(bad.body).toEqual({ error: 'Invalid signature' });
+    expect([...redis.strings.keys()]).toEqual([]);
+
+    // The client fixes its signing and retries with the SAME nonce. Before the
+    // reorder this returned 'Replay detected', hiding the real cause.
+    const good = replyDouble();
+    await requestAuth(
+      requestDouble({
+        headers: {
+          'x-ns-key': KEY_ID,
+          'x-ns-timestamp': ts,
+          'x-ns-nonce': nonce,
+          'x-ns-signature': sign('POST', '/notify', ts, nonce),
+        },
+      }),
+      good as never,
+    );
+
+    expect(good.statusCode).toBe(0);
+    expect(good.body).toBeUndefined();
+  });
+
+  it('does not let an unsigned caller with a known key id write nonce keys', async () => {
+    const req = requestDouble() as unknown as { headers: Record<string, string> };
+    req.headers['x-ns-signature'] = 'v1=' + '00'.repeat(32);
+    const reply = replyDouble();
+
+    await requestAuth(req as never, reply as never);
+
+    expect(reply.body).toEqual({ error: 'Invalid signature' });
+    expect(redis.strings.size).toBe(0);
+  });
+
+  it('still rejects a genuine replay — same nonce, both validly signed', async () => {
+    const req = requestDouble();
+    const first = replyDouble();
+    const second = replyDouble();
+
+    await requestAuth(req, first as never);
+    await requestAuth(req, second as never);
+
+    expect(first.statusCode).toBe(0);
+    expect(second.body).toEqual({ error: 'Replay detected' });
+  });
+
+  it('does not claim a nonce for an expired timestamp either', async () => {
+    const ts = String(Math.floor(Date.now() / 1000) - 120);
+    const nonce = 'expired-request';
+    const reply = replyDouble();
+
+    await requestAuth(
+      requestDouble({
+        headers: {
+          'x-ns-key': KEY_ID,
+          'x-ns-timestamp': ts,
+          'x-ns-nonce': nonce,
+          'x-ns-signature': sign('POST', '/notify', ts, nonce),
+        },
+      }),
+      reply as never,
+    );
+
+    expect(reply.body).toEqual({ error: 'Request expired' });
+    expect(redis.strings.size).toBe(0);
+  });
+});

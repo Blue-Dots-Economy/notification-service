@@ -131,6 +131,35 @@ export class RedisFake {
     return slice.flatMap((e) => [e.member, String(e.score)]);
   }
 
+  /**
+   * EVAL — recognises only the scripts this service ships, by shape.
+   *
+   * A fake cannot interpret Lua, and pretending otherwise would be worse than not
+   * supporting it: the point of the real script is atomicity, which a
+   * single-threaded fake cannot exercise anyway. What this *can* verify is the
+   * observable contract — which members come back and which are removed — so the
+   * queue tests keep their meaning. The atomicity itself is covered by
+   * queue.integration.test.ts against a real Redis.
+   */
+  async eval(script: string, _numKeys: number, key: string, arg: string): Promise<string[]> {
+    const isClaimDueRetries =
+      script.includes('ZRANGEBYSCORE') && script.includes('ZREM');
+    if (!isClaimDueRetries) {
+      throw new Error(`RedisFake.eval: unrecognised script:\n${script}`);
+    }
+
+    const max = Number(arg);
+    const due = await this.zrangebyscore(key, 0, max);
+    // ZREM of exactly those members — NOT a score range. That distinction is the
+    // fix in #51, so the fake has to model it or the tests would pass either way.
+    const z = this.zset(key);
+    this.zsets.set(
+      key,
+      z.filter((e) => !due.includes(e.member)),
+    );
+    return due;
+  }
+
   /** MULTI — queues calls, then `exec()` resolves to ioredis's [err, result] pairs. */
   multi() {
     const queued: Array<() => Promise<unknown>> = [];

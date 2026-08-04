@@ -28,13 +28,6 @@ export const requestAuth = async (req: FastifyRequest, reply: FastifyReply) => {
     return reply.code(401).send({ error: 'Request expired' });
   }
 
-  // Replay protection
-  const nonceKey = `nonce:${keyId}:${nonce}`;
-  const ok = await redis.set(nonceKey, '1', 'EX', NONCE_TTL, 'NX');
-  if (!ok) {
-    return reply.code(401).send({ error: 'Replay detected' });
-  }
-
   const path = req.url;
 
   const baseString = [req.method.toUpperCase(), path, ts, nonce].join('\n');
@@ -52,5 +45,21 @@ export const requestAuth = async (req: FastifyRequest, reply: FastifyReply) => {
     !crypto.timingSafeEqual(expectedBuf, sigBuf)
   ) {
     return reply.code(401).send({ error: 'Invalid signature' });
+  }
+
+  // Replay protection LAST, deliberately (#52). Claiming the nonce before the
+  // signature was checked meant anyone presenting a known key id — which is not a
+  // secret, it travels in every request — could burn nonce keys without proving
+  // possession of the secret, and a legitimate client that signed incorrectly got
+  // 'Invalid signature' once and then 'Replay detected' on every retry with the
+  // same nonce, pointing the investigation at the wrong thing.
+  //
+  // With the order this way round the two failures are orthogonal: 'Invalid
+  // signature' means the signature is wrong, and 'Replay detected' means a validly
+  // signed request was seen twice — which is the only thing that is actually a replay.
+  const nonceKey = `nonce:${keyId}:${nonce}`;
+  const ok = await redis.set(nonceKey, '1', 'EX', NONCE_TTL, 'NX');
+  if (!ok) {
+    return reply.code(401).send({ error: 'Replay detected' });
   }
 };
