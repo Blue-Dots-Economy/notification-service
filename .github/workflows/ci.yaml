@@ -25,14 +25,14 @@ jobs:
 
       - uses: pnpm/action-setup@v6
 
-      # Deliberately 20, matching `FROM node:20-alpine` in the Dockerfile rather
-      # than the Node 24 the sibling DPG repos use. The module/moduleResolution
-      # settings model the runtime's ESM support, so type-checking on the version
-      # we actually ship is what catches a CommonJS `require()` of an ESM-only
-      # package — the failure that TS1479 reported for `uuid`.
+      # Keep this in step with `FROM node:24-alpine` in the Dockerfile and with
+      # `engines.node` in package.json. Testing on the version actually shipped is
+      # what makes runtime-specific failures visible — a CommonJS `require()` of an
+      # ESM-only package (TS1479, which is how the `uuid` bug surfaced) behaves
+      # differently across Node majors, since 22.12+ can require ESM and 20 cannot.
       - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
           cache: pnpm
 
       - name: Install dependencies
