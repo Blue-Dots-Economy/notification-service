@@ -215,10 +215,18 @@ Two workflows:
   Note the branch list says `feature`, not `'feature/**'`: the glob needs a slash, so it never
   matched the integration branch.
 
-**Docker gotcha:** the Dockerfile must `COPY pnpm-workspace.yaml` alongside `package.json` and
-`pnpm-lock.yaml`. That file holds the pnpm `overrides` (pnpm 10 no longer reads them from
-`package.json`), and `--frozen-lockfile` compares that config against the lockfile — omit it
-and the build fails with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`.
+**Two Docker gotchas**, both of which broke the image build in ways CI did not see:
+
+1. The Dockerfile must `COPY pnpm-workspace.yaml` alongside `package.json` and
+   `pnpm-lock.yaml`. That file holds the pnpm `overrides` (pnpm 10 no longer reads them from
+   `package.json`), and `--frozen-lockfile` compares that config against the lockfile — omit
+   it and the build fails with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH`.
+2. The global pnpm must be installed at the **exact** version in `packageManager`, which the
+   Dockerfile reads out of `package.json` with `sed` so the two cannot drift. A bare
+   `npm install -g pnpm` takes whatever is latest: once pnpm 11 shipped, that newer pnpm
+   honoured `packageManager: pnpm@10.x`, tried to self-provision it, and failed with
+   `Cannot verify the identity of the @pnpm/exe.linux-x64 native binary: it is missing from
+   pnpm-lock.yaml` — a build break with no change on our side.
 
 ## Common Patterns
 
