@@ -11,7 +11,12 @@ updates:
       day: "monday"
       time: "03:00"
       timezone: "UTC"
-    open-pull-requests-limit: 5
+    # The limit counts open *version-update* PRs. Grouped updates plus a singleton
+    # can sit right at 5, after which Dependabot silently stops raising npm PRs —
+    # indistinguishable from "nothing to update". Observed in aggregator-dpg on
+    # 2026-08-04, where the production group PR appeared within minutes of slots
+    # being freed. Matches aggregator-dpg and signals-search.
+    open-pull-requests-limit: 10
     labels:
       - "dependencies"
     commit-message:

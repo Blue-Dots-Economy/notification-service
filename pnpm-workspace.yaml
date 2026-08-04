@@ -1,0 +1,27 @@
+# pnpm 10 no longer reads the `pnpm` field from package.json — it warns
+# `The "pnpm" field in package.json is no longer read by pnpm. The following keys
+# were ignored: "pnpm.overrides"` on every install. These security pins lived
+# there and were therefore inert as configuration; only the copy the lockfile had
+# already recorded kept them in force, which a lockfile regeneration would have
+# dropped silently. See https://pnpm.io/settings.
+#
+# This is not a workspace (single package, no `packages:` key) — the file exists
+# solely because it is where pnpm 10 reads settings from.
+#
+# Entries are a faithful move of what was in package.json, minus `uuid`: that
+# dependency was removed in #46 (replaced by node:crypto randomUUID) so its pin
+# can never apply again. The `fast-xml-parser` pins are KEPT even though the
+# package is currently absent from the tree — it is a transitive of the AWS SDK
+# family, so it can return with a future @aws-sdk bump, and a floor that is never
+# exercised costs nothing.
+overrides:
+  diff@>=4.0.0 <4.0.4: '>=4.0.4'
+  fast-uri@<=3.1.0: '>=3.1.1'
+  fast-uri@<=3.1.1: '>=3.1.2'
+  fast-xml-parser@<5.7.0: '>=5.7.0'
+  fast-xml-parser@>=5.0.0 <5.3.5: '>=5.3.5'
+  fast-xml-parser@>=5.0.0 <5.3.6: '>=5.3.6'
+  fast-xml-parser@>=5.0.0 <5.3.8: '>=5.3.8'
+  fast-xml-parser@>=5.0.0 <5.5.6: '>=5.5.6'
+  fast-xml-parser@>=5.0.0 <5.5.7: '>=5.5.7'
+  fast-xml-parser@>=5.0.9 <=5.3.3: '>=5.3.4'
