@@ -39,9 +39,12 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # `pnpm build` is `tsc`, so this is both the build and the type-check.
-      # `pnpm test` is deliberately NOT run: it is still the placeholder
-      # (`echo "Error: no test specified" && exit 1`) and there are no test files,
-      # so it would fail every run. Add it here in the same commit that adds a
-      # real test runner.
       - name: Build (tsc)
         run: pnpm run build
+
+      # Redis is faked in-process (src/lib/__tests__/redis-fake.ts), so this needs
+      # no service container and no Docker. If real-Redis coverage is added later
+      # it belongs in `*.integration.test.ts`, which vitest.config.ts excludes from
+      # this run — wire it up as a separate step with a `services: redis` block.
+      - name: Test
+        run: pnpm test

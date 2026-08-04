@@ -167,11 +167,15 @@ export async function getQueueMetrics() {
   let retry_eta_seconds: number | null = null;
 
   if (Array.isArray(oldestRetryRaw) && oldestRetryRaw.length === 2) {
-    const score = Number(oldestRetryRaw[1]); // timestamp in seconds
-    retry_oldest = score;
+    // The score is set by scheduleRetry as Date.now() + delay, i.e. epoch
+    // MILLISECONDS — the old comment here said seconds, and retry_eta_seconds
+    // was reported as the raw millisecond difference despite its name (a 30s
+    // retry read as 30000). Convert for the *_seconds field; retry_oldest stays
+    // the raw epoch-ms timestamp it has always been.
+    const scoreMs = Number(oldestRetryRaw[1]);
+    retry_oldest = scoreMs;
 
-    const now = Date.now();
-    retry_eta_seconds = Math.max(0, score - now);
+    retry_eta_seconds = Math.max(0, Math.round((scoreMs - Date.now()) / 1000));
   }
 
   return {
