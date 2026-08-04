@@ -18,9 +18,12 @@ This is a **Fastify notification service** that queues and asynchronously proces
 - `pnpm start` — Run compiled server from `dist/server.js`
 
 **Testing:**
-- `pnpm test` — vitest, single run (what CI runs)
+- `pnpm test` — vitest, single run. No Docker or Redis needed: Redis is faked in-process
+  (`src/lib/__tests__/redis-fake.ts`)
 - `pnpm test:watch` — vitest in watch mode
-- No Docker or Redis needed: Redis is faked in-process (`src/lib/__tests__/redis-fake.ts`)
+- `pnpm test:integration` — needs a **real** Redis. Locally:
+  `redis-server --port 6399 --daemonize yes` then
+  `REDIS_PORT=6399 pnpm test:integration`. In CI, the `redis` service container
 
 ## Architecture
 
@@ -181,13 +184,19 @@ ioredis's exact return shapes — the ones easy to get wrong: `set(..., 'NX')` �
 `vi.mock('../redis', ...)`; the module under test and the test share one instance, so
 assertions can read the state the code wrote.
 
+`worker.test.ts` covers `processJob`: provider/template routing, attempt counting, the full
+backoff ladder (5s → 10 → 20 → 40) and DLQ-on-exhaustion. It mocks `../queue` (these tests are
+about which queue call is made, not Redis behaviour) and must mock `../providers`, which
+auto-discovers by `require`-ing each `index.js` and so is not importable from source.
+
+`queue.integration.test.ts` runs against a **real** Redis via `pnpm test:integration`, covering
+the one thing a fake cannot: that `popScheduledRetries` claims atomically. Against the old
+two-round-trip implementation, eight concurrent claimers returned **400 claims for 50 jobs** —
+every retry sent eight times.
+
 **Deliberately not covered yet:**
-- `worker.ts`'s `processJob` — the backoff ladder (5s → 10 → 20 → 40) and DLQ-on-exhaustion.
-  Needs `processJob` exported and `./providers` mocked.
+- `mainLoop`'s priority ordering (realtime → due retries → other) — it is an infinite loop.
 - Provider implementations (real SES/Twilio calls).
-- Anything depending on **real** Redis semantics. The fake is single-threaded and cannot
-  reproduce a race; such coverage belongs in `*.integration.test.ts`, which
-  `vitest.config.ts` already excludes from the default run.
 
 ## Known Issues
 

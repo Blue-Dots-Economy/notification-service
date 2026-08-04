@@ -20,6 +20,21 @@ jobs:
     name: CI
     runs-on: ubuntu-latest
 
+    # A real Redis for the integration suite. The default `pnpm test` run does not
+    # need it (Redis is faked in-process); the atomicity coverage for
+    # popScheduledRetries does, because a single-threaded fake can never interleave
+    # two claims — see #51.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v7
 
@@ -42,9 +57,16 @@ jobs:
       - name: Build (tsc)
         run: pnpm run build
 
-      # Redis is faked in-process (src/lib/__tests__/redis-fake.ts), so this needs
-      # no service container and no Docker. If real-Redis coverage is added later
-      # it belongs in `*.integration.test.ts`, which vitest.config.ts excludes from
-      # this run — wire it up as a separate step with a `services: redis` block.
+      # Redis is faked in-process (src/lib/__tests__/redis-fake.ts), so this step
+      # needs nothing external.
       - name: Test
         run: pnpm test
+
+      # Against the `redis` service above. Kept separate from `pnpm test` so the
+      # fast suite stays runnable anywhere, including machines without Docker.
+      - name: Test (integration, real Redis)
+        run: pnpm test:integration
+        env:
+          REDIS_HOST: 127.0.0.1
+          REDIS_PORT: 6379
+          REDIS_PASSWORD: ''
