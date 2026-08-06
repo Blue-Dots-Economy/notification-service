@@ -1,12 +1,13 @@
 # Event Platform & Notification-Service Redesign
 
 > This is the umbrella design. It fixes the whole-platform vision, decisions, and phasing; each stage gets its own detailed spec.
-> A formatted version for the system architect lives alongside this file as `2026-06-26-event-platform-design.technical.md`. **That copy predates the 2026-08-06 revision and is stale.**
+> A formatted version for the system architect lives alongside this file as `2026-06-26-event-platform-design.technical.md`, kept in sync as of the 2026-08-06 revision.
 
 ## Revision history
 
 - **2026-06-26** — original.
 - **2026-08-06** — substantial revision. Reframed the ingress model (consumer-owned APIs are the default contract, the bus is for fan-out and decoupled reaction); added urgent-path isolation, the template/routing-policy split, the content resolver, the trace and status lifecycle, and a retention/PII policy; removed consent enforcement from notification-service's scope; re-ordered the stages so notification-service delivers value before any Kafka infrastructure exists; added the issue decomposition.
+- **2026-08-06 (later)** — added §Security, reconciling the design against the Phase-B security audit (#15). Two consequences for the design rather than for implementation: request integrity must cover the request **body** for as long as HMAC is accepted, and the `content_ref` keyspace must be allowlisted.
 
 ## Overview
 
@@ -210,6 +211,34 @@ Because `epic/keycloak-iam` has not reached `feature`, this ships behind the **p
 
 **OSI-open bill of materials.** Kafka · Strimzi · Apicurio (not Confluent SR) · Debezium · Valkey (not Redis ≥ 7.4 — RSALv2/SSPL).
 
+## Security
+
+> Requirements below derive from the Phase-B security audit of this service (notification-service #15). Candidate findings and their detail are held in a **private** advisory; this repo is public, so what follows is stated as design requirements rather than as findings. They are acceptance criteria for the stage items they sit under, not follow-up work.
+
+The redesign both closes existing exposure and **creates new attack surface**. Both halves need stating, because a notification service is an unusually attractive target: it can reach every participant in the network, and it renders attacker-influenced content into messages those participants trust.
+
+**What the redesign closes**
+
+- **Activating the rate limiter** (§Ingress and isolation) is a security control before it is a performance feature. It must be enforced on *every* send path — the transactional API, the worker pools, and the retry/replay endpoints — and keyed by network × channel × provider, so one tenant cannot consume another's headroom.
+- **Retiring the WhatsApp `other` passthrough** removes a caller's ability to put arbitrary provider-approved content in front of a recipient.
+- **Moving durable job state into Postgres** narrows how much of the system's behaviour can be influenced by anything holding the cache.
+
+**What the redesign adds, and must ship already defended**
+
+- **Template rendering.** In `owned` mode NS renders HTML from variables, so interpolated values are **HTML-escaped by default**; raw is an explicit, reviewable per-variable decision. URL-typed variables are scheme-checked and, where the value should be ours, allowlisted — link injection into a delivered message is a phishing primitive.
+- **The content resolver.** `content_ref` keys resolve against an **allowlist**. An unconstrained, caller-influenceable key is an arbitrary-configuration-read primitive that ends with its result rendered into a delivered message. Resolution failure fails the send: a consent notice with a blank T&C link is worse than one not sent.
+- **The admin API.** Template edit carries a compliance blast radius — a wrong DLT-registered template is an incident. Admin scopes are therefore separate from send scopes: a credential that may send must not thereby be able to edit templates. This is the concrete reason the network-admin role is being specced separately.
+- **Receipt webhooks.** Public inbound endpoints where **the signature is the authorization**, since the provider is the caller. Unverified, they let anyone rewrite delivery history — an audit-integrity problem as much as a spoofing one. Unmatched `provider_message_id` values are dropped and counted, never created on the fly.
+- **The bulk door.** An authenticated mass-send endpoint is the highest-value target in the system. Scope binds it to one network, and `audience_basis` records why the audience was contacted.
+
+**Cross-cutting requirements**
+
+- **Request integrity must cover the request body.** For as long as HMAC is accepted, the signed canonical string includes a digest of the body. Signing only method, path, timestamp, and nonce authenticates the *request* while leaving the *contents of the send* unauthenticated. Bearer auth does not inherit this property either — a token proves who is calling, not what they asked for — so scope must bound which networks a credential may send for.
+- **Tenancy is enforced at resolution, not just at the edge.** `network` comes from the verified claim, and the template and policy a send resolves to must belong to that network. Cross-tenant resolution is a tenancy break, not a lookup bug.
+- **Recipients are validated per channel** — RFC-shaped addresses for email, E.164 for phone. Loose recipient typing is what lets one channel's payload be smuggled into another's. **Sender identity is server-side configuration** bound to the credential's network, never caller-supplied.
+- **Redaction reaches everywhere a value comes to rest** — logs and queue payloads, not only database rows (§Retention and PII). OTP codes and activation URLs never appear in logs at any level, including debug and any mail-tracing mode; a verbose flag must not be able to turn a log stream into a credential feed. Erasure covers every tier, which is why Tier 2 is designed to hold no personal data.
+- **The cache is authenticated** — no empty-password default, internal network only — and a provider exception is contained at the worker-pool boundary, so a crash loop in one pool cannot deny the others.
+
 ## Architecture
 
 ```
@@ -309,7 +338,7 @@ Ordering is deliberately **not** backbone-first. Stages 1–2 deliver a working 
 5. **Content resolver** — `source: content_ref` variables, pluggable provider (`configmap` now, `db`/`http` later), locale- and version-aware caching, `in_force` / `on_offer` keys.
 6. **Send API v1** — `event_type` or explicit `template_key`; recipient contact points; policy resolution + capability filtering + synchronous fallback; `idempotency_key`; `priority`; `basic_email` dual-accept.
 7. **Priority isolation** — urgent/normal/bulk worker pools; token bucket activated and split with reserved urgent quota; fire-and-forget audit on the urgent path; OTP codes never persisted.
-8. **Keycloak-native service auth + admin scopes** — `client_credentials` + JWKS following aggregator #570's shared-realm pattern, `network` from a verified claim, behind the pluggable boundary with HMAC dual-accept.
+8. **Keycloak-native service auth + admin scopes** — `client_credentials` + JWKS following aggregator #570's shared-realm pattern, `network` from a verified claim, behind the pluggable boundary with HMAC dual-accept. **Extends the HMAC canonical string to cover a body digest** (§Security) — this must land *with* the dual-accept window, not after it, or the window ships a known weakness.
 
 ### Stage 2 — aggregator-dpg migrates onto NS
 
