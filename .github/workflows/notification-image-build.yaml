@@ -98,9 +98,15 @@ jobs:
       # ("Blue-Dots-Economy"). docker/metadata-action lowercases that for its own tag
       # outputs, but an image reference we build by hand must be normalised too —
       # an uppercase path is an invalid reference and Trivy would reject it.
+      # Gated on the EVENT, not on `digest != ''`. Those look equivalent but are not:
+      # with the default docker driver, build-push-action populates `digest` from the
+      # locally-built image even when `push: false`, and Trivy would then resolve a
+      # digest for an image that is in no registry (MANIFEST_UNKNOWN). This job does
+      # configure buildx, where the output is empty on the PR path — but gating on
+      # the same condition that drives `push:` above does not depend on that detail.
       - name: Resolve scanned image ref
         id: scanref
-        if: steps.build.outputs.digest != ''
+        if: github.event_name != 'pull_request'
         run: echo "ref=${IMAGE,,}@${DIGEST}" >> "$GITHUB_OUTPUT"
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
