@@ -114,15 +114,15 @@ jobs:
 
       # Scanned by digest, not by tag: buildx pushes straight to the registry without
       # loading into the local docker image store, so the action's `imageid` output is
-      # not resolvable by Trivy. The digest guard also means the PR path — which builds
-      # WITHOUT pushing, so no digest exists — skips cleanly instead of failing.
+      # not resolvable by Trivy. `scanref` is empty on the PR path (see above), so this
+      # step and the upload both skip there rather than failing on an absent image.
       #
       # TRIVY_PLATFORM is pinned because pushes build a linux/amd64 + linux/arm64
       # manifest list; the digest therefore points at the list rather than one image,
       # and picking the platform explicitly keeps results comparable between runs.
       - name: Trivy image scan
         if: steps.scanref.outputs.ref != ''
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         env:
           TRIVY_PLATFORM: linux/amd64
         with:
