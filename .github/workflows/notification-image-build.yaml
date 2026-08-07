@@ -37,6 +37,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      security-events: write   # Trivy image scan uploads SARIF to code-scanning
 
     steps:
       - name: Checkout repository
@@ -73,6 +74,7 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
 
       - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -86,3 +88,48 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Image scanning (Sec-Audit A2 — Blue-Dots-Economy/signals-dpg#300).
+      # Scans the OS + system packages baked into the shipped artifact, which the
+      # source/lockfile scan in security.yml structurally cannot see (an outdated
+      # base-image library appears in no package.json).
+      #
+      # IMAGE_NAME is `github.repository`, which preserves the org's capitalisation
+      # ("Blue-Dots-Economy"). docker/metadata-action lowercases that for its own tag
+      # outputs, but an image reference we build by hand must be normalised too —
+      # an uppercase path is an invalid reference and Trivy would reject it.
+      - name: Resolve scanned image ref
+        id: scanref
+        if: steps.build.outputs.digest != ''
+        run: echo "ref=${IMAGE,,}@${DIGEST}" >> "$GITHUB_OUTPUT"
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      # Scanned by digest, not by tag: buildx pushes straight to the registry without
+      # loading into the local docker image store, so the action's `imageid` output is
+      # not resolvable by Trivy. The digest guard also means the PR path — which builds
+      # WITHOUT pushing, so no digest exists — skips cleanly instead of failing.
+      #
+      # TRIVY_PLATFORM is pinned because pushes build a linux/amd64 + linux/arm64
+      # manifest list; the digest therefore points at the list rather than one image,
+      # and picking the platform explicitly keeps results comparable between runs.
+      - name: Trivy image scan
+        if: steps.scanref.outputs.ref != ''
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          scan-type: image
+          image-ref: ${{ steps.scanref.outputs.ref }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          exit-code: "0"   # Phase A: report-only, never fails the build
+
+      - name: Upload Trivy image SARIF
+        if: always() && steps.scanref.outputs.ref != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image-notification
