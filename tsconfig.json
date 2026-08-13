@@ -1,11 +1,11 @@
 {
   "compilerOptions": {
     "target": "ES2020",
-    "module": "CommonJS",
+    "module": "Node16",
     "lib": [
       "ES2020"
     ],
-    "moduleResolution": "Node",
+    "moduleResolution": "node16",
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "strict": true,
@@ -16,13 +16,11 @@
       "node"
     ],
     "typeRoots": [
-      "./node_modules/@types",
-      "./src/types/fastify.d.ts"
+      "./node_modules/@types"
     ],
-    "baseUrl": ".",
     "paths": {
       "src/*": [
-        "src/*"
+        "./src/*"
       ]
     },
     "noUnusedLocals": true,
@@ -33,6 +31,13 @@
   ],
   "exclude": [
     "node_modules",
-    "dist"
+    "dist",
+    // Tests live beside the code under src/, so without these they would be
+    // compiled into dist/ and shipped in the image. They are also written for
+    // vitest's ESM transform (top-level await around vi.mock), which tsc's
+    // CommonJS emit rejects. `pnpm test` is what checks them; `pnpm build`
+    // should only ever produce runtime code.
+    "**/*.test.ts",
+    "src/**/__tests__/**"
   ]
 }

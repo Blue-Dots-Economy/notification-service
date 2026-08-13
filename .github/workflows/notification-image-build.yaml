@@ -4,9 +4,27 @@ on:
   push:
     branches:
       - main
-      - 'feature/**'
+      # `feature`, not 'feature/**'. The glob requires a slash, so it never
+      # matched the integration branch every PR targets — across the last 20 runs
+      # this workflow had only ever run on main and a few test/* branches. The
+      # branch tag from docker/metadata-action is therefore `:feature`.
+      - feature
     tags:
       - '**'
+  # Build (without publishing) on PRs that touch the image inputs, so a broken
+  # Dockerfile is caught in review instead of on a shared branch. This is not
+  # hypothetical: moving pnpm `overrides` into pnpm-workspace.yaml broke the
+  # build with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH because the Dockerfile did not
+  # copy that file, and nothing ran the build to notice.
+  pull_request:
+    paths:
+      - Dockerfile
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - tsconfig.json
+      - src/**
+      - .github/workflows/notification-image-build.yaml
   workflow_dispatch:
 
 env:
@@ -19,6 +37,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      security-events: write   # Trivy image scan uploads SARIF to code-scanning
 
     steps:
       - name: Checkout repository
@@ -31,6 +50,9 @@ jobs:
         uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
+        # Not needed on the PR path, which only builds. Skipping also keeps
+        # Dependabot-raised PRs working, where GITHUB_TOKEN is read-only.
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
@@ -52,13 +74,68 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
 
       - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
+          # Single platform on PRs: the arm64 leg is emulated through QEMU and
+          # roughly doubles the run for a check whose job is only to prove the
+          # image still builds. Pushes keep both.
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Image scanning (Sec-Audit A2 — Blue-Dots-Economy/signals-dpg#300).
+      # Scans the OS + system packages baked into the shipped artifact, which the
+      # source/lockfile scan in security.yml structurally cannot see (an outdated
+      # base-image library appears in no package.json).
+      #
+      # IMAGE_NAME is `github.repository`, which preserves the org's capitalisation
+      # ("Blue-Dots-Economy"). docker/metadata-action lowercases that for its own tag
+      # outputs, but an image reference we build by hand must be normalised too —
+      # an uppercase path is an invalid reference and Trivy would reject it.
+      # Gated on the EVENT, not on `digest != ''`. Those look equivalent but are not:
+      # with the default docker driver, build-push-action populates `digest` from the
+      # locally-built image even when `push: false`, and Trivy would then resolve a
+      # digest for an image that is in no registry (MANIFEST_UNKNOWN). This job does
+      # configure buildx, where the output is empty on the PR path — but gating on
+      # the same condition that drives `push:` above does not depend on that detail.
+      - name: Resolve scanned image ref
+        id: scanref
+        if: github.event_name != 'pull_request'
+        run: echo "ref=${IMAGE,,}@${DIGEST}" >> "$GITHUB_OUTPUT"
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      # Scanned by digest, not by tag: buildx pushes straight to the registry without
+      # loading into the local docker image store, so the action's `imageid` output is
+      # not resolvable by Trivy. `scanref` is empty on the PR path (see above), so this
+      # step and the upload both skip there rather than failing on an absent image.
+      #
+      # TRIVY_PLATFORM is pinned because pushes build a linux/amd64 + linux/arm64
+      # manifest list; the digest therefore points at the list rather than one image,
+      # and picking the platform explicitly keeps results comparable between runs.
+      - name: Trivy image scan
+        if: steps.scanref.outputs.ref != ''
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          scan-type: image
+          image-ref: ${{ steps.scanref.outputs.ref }}
+          format: sarif
+          output: trivy-image.sarif
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          exit-code: "0"   # Phase A: report-only, never fails the build
+
+      - name: Upload Trivy image SARIF
+        if: always() && steps.scanref.outputs.ref != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image-notification

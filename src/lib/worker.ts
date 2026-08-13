@@ -11,7 +11,15 @@ import { loadSecrets } from './auth/secrets';
 
 const MAX_RETRIES = 5;
 
-async function processJob(job: Job) {
+/**
+ * Runs one job through its provider, then decides its fate: delivered, scheduled
+ * for another attempt with exponential backoff, or moved to the dead-letter queue.
+ *
+ * Exported for tests. `mainLoop` is the only production caller.
+ *
+ * @param job - The job to attempt. Its `attempt` counter is incremented in place.
+ */
+export async function processJob(job: Job) {
   const provider = providers[job.channel];
   job.attempt = (job.attempt ?? 0) + 1;
 

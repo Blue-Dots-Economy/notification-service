@@ -1,0 +1,72 @@
+name: CI
+
+# This repo had no CI at all: the only workflow was the GHCR image build, which
+# runs on push to main (and a 'feature/**' glob that never matches the branch
+# literally named `feature`). Nothing validated a pull request, which is how a
+# tsconfig incompatible with TypeScript 7 reached main and broke the image build.
+on:
+  push:
+    branches: [main, develop, feature]
+  pull_request:
+    branches: [main, develop, feature]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+
+    # A real Redis for the integration suite. The default `pnpm test` run does not
+    # need it (Redis is faked in-process); the atomicity coverage for
+    # popScheduledRetries does, because a single-threaded fake can never interleave
+    # two claims — see #51.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      # Keep this in step with `FROM node:24-alpine` in the Dockerfile and with
+      # `engines.node` in package.json. Testing on the version actually shipped is
+      # what makes runtime-specific failures visible — a CommonJS `require()` of an
+      # ESM-only package (TS1479, which is how the `uuid` bug surfaced) behaves
+      # differently across Node majors, since 22.12+ can require ESM and 20 cannot.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # `pnpm build` is `tsc`, so this is both the build and the type-check.
+      - name: Build (tsc)
+        run: pnpm run build
+
+      # Redis is faked in-process (src/lib/__tests__/redis-fake.ts), so this step
+      # needs nothing external.
+      - name: Test
+        run: pnpm test
+
+      # Against the `redis` service above. Kept separate from `pnpm test` so the
+      # fast suite stays runnable anywhere, including machines without Docker.
+      - name: Test (integration, real Redis)
+        run: pnpm test:integration
+        env:
+          REDIS_HOST: 127.0.0.1
+          REDIS_PORT: 6379
+          REDIS_PASSWORD: ''
