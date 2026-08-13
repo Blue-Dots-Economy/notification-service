@@ -35,5 +35,10 @@ RUN pnpm install --prod --frozen-lockfile
 
 COPY --from=builder /app/dist ./dist
 
+# Drop root: the node:alpine base ships a uid-1000 `node` user. The app only
+# reads /app (world-readable) and writes nothing to disk (all state is in Redis),
+# and listens on a non-privileged port, so it runs fine unprivileged. (Trivy DS-0002)
+USER node
+
 EXPOSE 3001
 CMD ["node", "dist/server.js"]
