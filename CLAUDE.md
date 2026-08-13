@@ -184,6 +184,11 @@ ioredis's exact return shapes — the ones easy to get wrong: `set(..., 'NX')` �
 `vi.mock('../redis', ...)`; the module under test and the test share one instance, so
 assertions can read the state the code wrote.
 
+**ioredis 6 `zrange` typing.** ioredis 6 types `zrange`'s `stop` as `string | Buffer` (not
+`number`), so `getQueueMetrics` passes **string** indices (`zrange(key, '0', '0', 'WITHSCORES')`)
+and the fake coerces its index args with `Number()`. If you add a `zrange`/`zrangebyscore`
+call, pass string indices to satisfy the v6 overloads.
+
 `worker.test.ts` covers `processJob`: provider/template routing, attempt counting, the full
 backoff ladder (5s → 10 → 20 → 40) and DLQ-on-exhaustion. It mocks `../queue` (these tests are
 about which queue call is made, not Redis behaviour) and must mock `../providers`, which
