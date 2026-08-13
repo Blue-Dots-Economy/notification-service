@@ -40,7 +40,7 @@ src/
 
 ## Local Requirements
 
-- Node.js 20+
+- Node.js 24+
 - pnpm
 - Redis 6+
 - Provider credentials for the providers you enable
@@ -68,6 +68,19 @@ pnpm dev
 
 The API listens on `SERVER_PORT` or `3000` by default. `src/server.ts` also
 spawns one background worker process.
+
+## Testing
+
+```bash
+pnpm test              # unit suite (vitest) — no Docker/Redis; Redis is faked in-process
+pnpm test:integration  # integration suite — needs a real Redis
+                       # e.g. redis-server --port 6399 --daemonize yes; REDIS_PORT=6399 pnpm test:integration
+```
+
+CI (`ci.yaml`) runs a frozen install, `pnpm build` (which is `tsc`, so also the
+type-check), then `pnpm test` on every PR/push; the GHCR image build + Trivy scan
+run on `main`/`feature`/tags. See `CLAUDE.md` for the in-memory fake's contract
+and what each suite covers.
 
 ## API Docs
 
