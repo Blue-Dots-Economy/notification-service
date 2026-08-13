@@ -4,6 +4,13 @@ import SMTPTransport from 'nodemailer/lib/smtp-transport';
 
 let transporter: nodemailer.Transporter<SMTPTransport.SentMessageInfo>;
 
+export interface Email_attachment {
+  filename: string;
+  contentType: string;
+  /** Base64-encoded content, no `data:` prefix. */
+  data: string;
+}
+
 interface Email_request {
   fromName: string;
   fromEmail: string;
@@ -13,6 +20,7 @@ interface Email_request {
   html: string;
   activationUrl?: string;
   cc?: string;
+  attachments?: Email_attachment[];
 }
 
 const {
@@ -74,10 +82,19 @@ export async function sendMail({
   html,
   activationUrl,
   cc,
+  attachments,
 }: Email_request): Promise<{ ok: boolean }> {
   if (MAIL_LOG === 'true') {
     console.log('📧 Sending mail to:', to);
     if (activationUrl) console.log('🔗 Activation URL/OTP:', activationUrl);
+    // Names and sizes only — never the base64 content, which would dump
+    // megabytes of a user's file into the service logs.
+    if (attachments?.length) {
+      console.log(
+        '📎 Attachments:',
+        attachments.map((a) => `${a.filename} (${a.contentType}, ${a.data.length}B base64)`).join(', ')
+      );
+    }
   }
 
   await initTransporter();
@@ -91,6 +108,18 @@ export async function sendMail({
       subject,
       text: html.replace(/<[^>]+>/g, ''),
       html,
+      // Decoded here rather than passing `encoding: 'base64'` so nodemailer
+      // handles the transfer encoding itself for whatever transport is active
+      // (the SES transport re-encodes into raw MIME).
+      ...(attachments?.length
+        ? {
+            attachments: attachments.map((a) => ({
+              filename: a.filename,
+              content: Buffer.from(a.data, 'base64'),
+              contentType: a.contentType,
+            })),
+          }
+        : {}),
     });
 
     if (MAIL_LOG === 'true') {

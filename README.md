@@ -218,6 +218,47 @@ Response:
 }
 ```
 
+### Email Attachments
+
+`channel=email` accepts an optional `variables.attachments` array:
+
+```json
+{
+  "variables": {
+    "fromName": "Signals Support",
+    "fromEmail": "no-reply@example.com",
+    "subject": "Complaint from Asha",
+    "html": "<p>details</p>",
+    "attachments": [
+      { "filename": "evidence.png", "contentType": "image/png", "data": "<base64>" }
+    ]
+  }
+}
+```
+
+`data` is base64 with no `data:` prefix. Two limits apply, both env-configurable:
+`NOTIFY_ATTACHMENT_MAX_FILES` (default 3) and
+`NOTIFY_ATTACHMENT_MAX_TOTAL_BYTES` (default 5 MB, decoded). Over either bound
+the request is rejected with a 400 rather than enqueued. The HTTP `bodyLimit` is
+derived from the byte budget (base64 inflates payloads by 4/3, plus envelope
+headroom), so raising the cap does not need a second config change;
+`NOTIFY_BODY_LIMIT_BYTES` overrides it if you need to.
+
+Operational notes:
+
+- The relay does **not** restrict content types — that is the calling product's
+  policy. It enforces only count and size, which are its own resource limits.
+- An attachment-bearing job is JSON-serialised into the Redis queue like any
+  other, so a 5 MB attachment occupies roughly 6.7 MB of Redis (base64) from
+  enqueue until delivery — and stays there in the retry ZSET or DLQ if delivery
+  keeps failing. Size Redis accordingly if attachment traffic is expected to be
+  heavy.
+- `MAIL_LOG=true` logs attachment filenames, content types and encoded sizes,
+  never the content itself.
+- Transport ceilings still apply on top of these limits: SES caps a message at
+  10 MB **after** base64 inflation, so ~7 MB of original file is the practical
+  maximum regardless of configuration.
+
 If the request is a duplicate inside the dedupe window:
 
 ```json
