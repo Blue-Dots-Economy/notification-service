@@ -121,12 +121,14 @@ export class RedisFake {
   /** ZRANGE with WITHSCORES returns a flat [member, score, ...] string array. */
   async zrange(
     key: string,
-    start: number,
-    stop: number,
+    start: number | string,
+    stop: number | string,
     withScores?: 'WITHSCORES',
   ): Promise<string[]> {
+    const startIdx = Number(start);
+    const stopIdx = Number(stop);
     const sorted = this.zset(key).sort((a, b) => a.score - b.score);
-    const slice = stop === -1 ? sorted.slice(start) : sorted.slice(start, stop + 1);
+    const slice = stopIdx === -1 ? sorted.slice(startIdx) : sorted.slice(startIdx, stopIdx + 1);
     if (!withScores) return slice.map((e) => e.member);
     return slice.flatMap((e) => [e.member, String(e.score)]);
   }
@@ -172,7 +174,12 @@ export class RedisFake {
         queued.push(() => this.zcard(key));
         return chain;
       },
-      zrange: (key: string, start: number, stop: number, withScores?: 'WITHSCORES') => {
+      zrange: (
+        key: string,
+        start: number | string,
+        stop: number | string,
+        withScores?: 'WITHSCORES',
+      ) => {
         queued.push(() => this.zrange(key, start, stop, withScores));
         return chain;
       },
