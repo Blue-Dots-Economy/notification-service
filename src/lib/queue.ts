@@ -165,7 +165,7 @@ export async function getQueueMetrics() {
     .llen(REALTIME_QUEUE)
     .llen(OTHER_QUEUE)
     .zcard(RETRY_ZSET)
-    .zrange(RETRY_ZSET, 0, 0, 'WITHSCORES') // oldest retry entry
+    .zrange(RETRY_ZSET, '0', '0', 'WITHSCORES') // oldest retry entry (string indices: ioredis 6 types zrange stop as string|Buffer)
     .llen(DLQ_QUEUE)
     .exec();
 
