@@ -11,8 +11,16 @@ const EmailAttachmentSchema = z.object({
   /** Shown to the recipient and used as the MIME filename. */
   filename: z.string().min(1).max(255),
   contentType: z.string().min(1).max(127),
-  /** Base64-encoded file content, no `data:` prefix. */
-  data: z.string().min(1),
+  /**
+   * Base64-encoded file content, no `data:` prefix.
+   *
+   * Validated as base64 rather than any non-empty string: the decoder silently
+   * ignores characters outside the alphabet, so a malformed or `data:`-prefixed
+   * payload would pass the 400 boundary and be delivered as garbage bytes. The
+   * calling APIs compact whitespace before forwarding, so wrapped base64 from a
+   * client arrives here already canonical.
+   */
+  data: z.base64().min(1),
 });
 
 export const emailProvider: ProviderDefinition = {

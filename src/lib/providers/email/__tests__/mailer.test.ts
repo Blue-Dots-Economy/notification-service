@@ -93,6 +93,19 @@ describe('emailProvider.schema', () => {
     const serialised = serializeProvider(emailProvider);
     expect(JSON.stringify(serialised)).toContain('attachments');
   });
+
+  it('rejects a data value that is not base64', () => {
+    // The decoder ignores characters outside the alphabet, so without this an
+    // unvalidated payload is accepted at the 400 boundary and delivered as
+    // garbage bytes — no crash, no DLQ loop, just a corrupt file.
+    for (const bad of ['data:image/png;base64,aGVsbG8=', 'nope!!', 'aGVsbG8=tail', 'aGVs bG8=']) {
+      const parsed = emailProvider.schema.safeParse({
+        ...base,
+        attachments: [{ filename: 'a.png', contentType: 'image/png', data: bad }],
+      });
+      expect(parsed.success).toBe(false);
+    }
+  });
 });
 
 describe('emailProvider.send', () => {
