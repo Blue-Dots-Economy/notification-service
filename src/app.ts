@@ -1,15 +1,14 @@
 import Fastify from 'fastify';
-import { notifyBodyLimitBytes } from './lib/providers/email/attachments';
 import { docsRoutes } from './routes/docs';
 import { metricsRoutes } from './routes/metrics';
 import { notifyRoutes } from './routes/notify';
 import { providerRoutes } from './routes/providers';
 import { retryRoutes } from './routes/retry';
 
-// Fastify's 1 MB default would reject every attachment-bearing notify request
-// (base64 inflates a 5 MB file to ~6.7 MB), so the limit is derived from the
-// configured attachment budget — see notifyBodyLimitBytes (#551).
-const app = Fastify({ logger: true, bodyLimit: notifyBodyLimitBytes() });
+// Note: the raised body limit for attachment-bearing requests is set on the
+// /notify route itself (see routes/notify.ts), not here — every other route
+// keeps Fastify's 1 MB default.
+const app = Fastify({ logger: true });
 
 app.register(docsRoutes);
 app.register(notifyRoutes);

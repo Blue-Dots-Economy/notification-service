@@ -5,6 +5,7 @@ import { dedupe } from '../lib/dedupe';
 import { providers } from '../lib/providers';
 import * as queue from '../lib/queue';
 import { requestAuth } from '../plugins/request-auth';
+import { notifyBodyLimitBytes } from '../lib/providers/email/attachments';
 
 const NotifySchema = z.object({
   channel: z.string(),
@@ -20,6 +21,11 @@ export async function notifyRoutes(app: FastifyInstance) {
     url: '/notify',
     method: 'POST',
     preHandler: requestAuth,
+    // Fastify's 1 MB default would reject every attachment-bearing request
+    // (base64 inflates a 5 MB file to ~6.7 MB), so this route — and only this
+    // route — is raised to the derived attachment budget. /failed/retry and the
+    // rest keep the 1 MB default (#551).
+    bodyLimit: notifyBodyLimitBytes(),
     handler: async (req, reply) => {
       const parsed = NotifySchema.safeParse(req.body);
       if (!parsed.success)
