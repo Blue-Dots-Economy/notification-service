@@ -14,13 +14,16 @@ on:
       # Matches the fleet standard (signals-dpg#570, aggregator-dpg#641,
       # signals-search#129), so one cross-repo cut tags every service's image
       # with the same release tag:
-      #   v*.*.*  semver releases   e.g. v1.2.0
-      #   GA-*    dated GA cuts      e.g. GA-2026-08-18
+      #   v*.*.*      semver releases   e.g. v1.2.0
+      #   20*-s*-rc*  sprint release    e.g. 202608-s1-rc1
+      #               <YYYYMM>-s<sprint>-rc<candidate>. A fix for an issue found
+      #               in -rc1 ships as -rc2, so every candidate is its own image.
+      #               Supersedes the dated GA-<date> scheme, no longer built here.
       # GitHub reads this workflow FROM THE TAGGED COMMIT, so a tag cut from a
       # commit predating this change won't pick the new pattern up.
       # (type=ref,event=tag below already tags the image verbatim with the tag.)
       - 'v*.*.*'
-      - 'GA-*'
+      - '20*-s*-rc*'
   # Build (without publishing) on PRs that touch the image inputs, so a broken
   # Dockerfile is caught in review instead of on a shared branch. This is not
   # hypothetical: moving pnpm `overrides` into pnpm-workspace.yaml broke the
