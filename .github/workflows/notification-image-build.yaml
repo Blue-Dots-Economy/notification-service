@@ -10,7 +10,17 @@ on:
       # branch tag from docker/metadata-action is therefore `:feature`.
       - feature
     tags:
-      - '**'
+      # Release tags only (was '**', which published an image on EVERY tag).
+      # Matches the fleet standard (signals-dpg#570, aggregator-dpg#641,
+      # signals-search#129), so one cross-repo cut tags every service's image
+      # with the same release tag:
+      #   v*.*.*  semver releases   e.g. v1.2.0
+      #   GA-*    dated GA cuts      e.g. GA-2026-08-18
+      # GitHub reads this workflow FROM THE TAGGED COMMIT, so a tag cut from a
+      # commit predating this change won't pick the new pattern up.
+      # (type=ref,event=tag below already tags the image verbatim with the tag.)
+      - 'v*.*.*'
+      - 'GA-*'
   # Build (without publishing) on PRs that touch the image inputs, so a broken
   # Dockerfile is caught in review instead of on a shared branch. This is not
   # hypothetical: moving pnpm `overrides` into pnpm-workspace.yaml broke the
