@@ -114,22 +114,48 @@ export async function scheduleRetry(job: Job, delaySeconds: number) {
 }
 
 /**
- * Pop due retry jobs:
- * - Fetch jobs where timestamp <= NOW
- * - Remove them atomically
+ * Claim-and-remove of due retries, in one atomic step.
+ *
+ * ZRANGEBYSCORE then ZREM of exactly the members returned, inside a single Lua
+ * script so no other client can interleave. The previous implementation issued
+ * the read and a ZREMRANGEBYSCORE as two round trips (#51), which had two
+ * failure modes:
+ *
+ *   - a retry written between the two calls with a score <= now was deleted
+ *     without ever being returned — the job silently vanished, neither delivered,
+ *     retried, nor dead-lettered. No concurrency was needed for this: a
+ *     scheduleRetry with a small or non-positive delay during the read's round
+ *     trip is enough.
+ *   - two workers (which the deployment notes explicitly suggest for scale)
+ *     could both complete the read before either deleted, so both returned the
+ *     same jobs and both sent them.
+ *
+ * Deleting the exact members rather than the score range is the part that closes
+ * the first mode; doing both in one EVAL closes the second.
  */
+// A fixed, module-level script — Redis-side Lua via EVAL, not JavaScript eval().
+// Nothing is interpolated into it: the key and the cutoff are passed as KEYS[1]
+// and ARGV[1], so no caller-controlled value can become code.
+const CLAIM_DUE_RETRIES = `
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1])
+if #due > 0 then
+  redis.call('ZREM', KEYS[1], unpack(due))
+end
+return due
+`;
+
 export async function popScheduledRetries(): Promise<Job[]> {
   const now = Date.now();
 
-  // Step 1: get due jobs
-  const results = await redis.zrangebyscore(RETRY_ZSET, 0, now);
+  const results = (await redis.eval(
+    CLAIM_DUE_RETRIES,
+    1,
+    RETRY_ZSET,
+    now.toString(),
+  )) as string[];
 
-  if (results.length === 0) return [];
+  if (!results || results.length === 0) return [];
 
-  // Step 2: remove fetched jobs
-  await redis.zremrangebyscore(RETRY_ZSET, 0, now);
-
-  // Step 3: Deserialize to Job[]
   return results.map((raw) => JSON.parse(raw));
 }
 
@@ -139,7 +165,7 @@ export async function getQueueMetrics() {
     .llen(REALTIME_QUEUE)
     .llen(OTHER_QUEUE)
     .zcard(RETRY_ZSET)
-    .zrange(RETRY_ZSET, 0, 0, 'WITHSCORES') // oldest retry entry
+    .zrange(RETRY_ZSET, '0', '0', 'WITHSCORES') // oldest retry entry (string indices: ioredis 6 types zrange stop as string|Buffer)
     .llen(DLQ_QUEUE)
     .exec();
 
@@ -167,11 +193,15 @@ export async function getQueueMetrics() {
   let retry_eta_seconds: number | null = null;
 
   if (Array.isArray(oldestRetryRaw) && oldestRetryRaw.length === 2) {
-    const score = Number(oldestRetryRaw[1]); // timestamp in seconds
-    retry_oldest = score;
+    // The score is set by scheduleRetry as Date.now() + delay, i.e. epoch
+    // MILLISECONDS — the old comment here said seconds, and retry_eta_seconds
+    // was reported as the raw millisecond difference despite its name (a 30s
+    // retry read as 30000). Convert for the *_seconds field; retry_oldest stays
+    // the raw epoch-ms timestamp it has always been.
+    const scoreMs = Number(oldestRetryRaw[1]);
+    retry_oldest = scoreMs;
 
-    const now = Date.now();
-    retry_eta_seconds = Math.max(0, score - now);
+    retry_eta_seconds = Math.max(0, Math.round((scoreMs - Date.now()) / 1000));
   }
 
   return {

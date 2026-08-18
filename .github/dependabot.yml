@@ -11,7 +11,12 @@ updates:
       day: "monday"
       time: "03:00"
       timezone: "UTC"
-    open-pull-requests-limit: 5
+    # The limit counts open *version-update* PRs. Grouped updates plus a singleton
+    # can sit right at 5, after which Dependabot silently stops raising npm PRs —
+    # indistinguishable from "nothing to update". Observed in aggregator-dpg on
+    # 2026-08-04, where the production group PR appeared within minutes of slots
+    # being freed. Matches aggregator-dpg and signals-search.
+    open-pull-requests-limit: 10
     labels:
       - "dependencies"
     commit-message:
@@ -28,7 +33,12 @@ updates:
       # typescript-eslint does not support TS 7 yet — hold the major.
       - dependency-name: "typescript"
         update-types: ["version-update:semver-major"]
-      # vitest 4 needs vite 6 in lockstep — hold the major.
+      # Hold the vitest major. This entry was inherited from a sibling repo and
+      # was meaningless until vitest was actually installed (#48); the sibling
+      # reason — "vitest 4 needs vite 6 in lockstep" — does not apply here, since
+      # this repo has no vite of its own. It is kept so the runner moves major
+      # versions deliberately, in step with the other DPG repos (all on 3.x),
+      # rather than on a Monday morning.
       - dependency-name: "vitest"
         update-types: ["version-update:semver-major"]
 
