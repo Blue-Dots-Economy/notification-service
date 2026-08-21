@@ -44,6 +44,15 @@ describe('msg91 SMS provider', () => {
     expect(bodyOf(fetchMock).recipients[0].mobiles).toBe('919000000003');
   });
 
+  it('a `mobiles` variable cannot override the resolved recipient phone', async () => {
+    const fetchMock = mockFetchOk();
+    await sendSmsWithMsg91('+919000000004', 'flow', {
+      name: 'X',
+      mobiles: '910000000000', // hijack attempt
+    });
+    expect(bodyOf(fetchMock).recipients[0].mobiles).toBe('919000000004');
+  });
+
   it('returns ok:false on a non-2xx MSG91 response', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, json: () => ({}) }));
     expect((await sendSmsWithMsg91('9100', 'flow', { name: 'X' })).ok).toBe(false);

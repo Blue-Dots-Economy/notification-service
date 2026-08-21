@@ -28,7 +28,9 @@ export async function sendSmsWithMsg91(
     body: JSON.stringify({
       template_id,
       short_url: 0,
-      recipients: [{ mobiles: phone, ...recipientVars }],
+      // `mobiles` spread LAST: a caller variable named `mobiles` must never be
+      // able to override the resolved recipient phone (SMS-redirect guard).
+      recipients: [{ ...recipientVars, mobiles: phone }],
     }),
   });
 
