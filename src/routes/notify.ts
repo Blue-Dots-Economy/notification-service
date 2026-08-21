@@ -35,7 +35,11 @@ export async function notifyRoutes(app: FastifyInstance) {
       const provider = providers[body.channel];
       if (!provider)
         return reply.code(400).send({ error: 'Unknown provider channel' });
-      if (typeof provider.templates[body.template_id] !== 'string')
+      // Strict allowlist unless the provider owns raw ids (SMS, #532/#535).
+      if (
+        !provider.allowRawTemplateId &&
+        typeof provider.templates[body.template_id] !== 'string'
+      )
         return reply.code(400).send({ error: 'Unknown template for provider' });
 
       const v = provider.schema.safeParse(body.variables);
