@@ -40,7 +40,7 @@ jobs:
 
       - uses: pnpm/action-setup@v6
 
-      # Keep this in step with `FROM node:24-alpine` in the Dockerfile and with
+      # Keep this in step with `FROM dhi.io/node:24-alpine{,-dev}` in the Dockerfile and with
       # `engines.node` in package.json. Testing on the version actually shipped is
       # what makes runtime-specific failures visible — a CommonJS `require()` of an
       # ESM-only package (TS1479, which is how the `uuid` bug surfaced) behaves

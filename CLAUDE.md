@@ -267,7 +267,10 @@ Import helpers from `src/lib/queue.ts`:
 - **Redis requirement:** Redis 6+ (uses sorted sets for retries, lists for queues).
 - **Stateless API:** The server itself is stateless; all state is in Redis. Multiple API instances can run behind a load balancer.
 - **Docker:** `Dockerfile` and `docker-compose.yaml` included. Compose also starts Redis service.
-- **Node 24** — `node:24-alpine` in both Dockerfile stages, `node-version: 24` in CI, and
+- **Node 24** — `dhi.io/node:24-alpine-dev` for the build/prod-deps stages and
+  `dhi.io/node:24-alpine` for the runtime (three stages, not two — the runtime has
+  no shell, so the production install happens in `prod-deps` and is copied in),
+  `node-version: 24` in CI, and
   `engines.node: ">=24"` in `package.json`. Keep all three in step; `@types/node` is pinned to
   the matching major (`^24`) on purpose, since types ahead of the runtime let code compile
   against APIs that do not exist where it runs.
