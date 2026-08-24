@@ -28,7 +28,11 @@ export async function processJob(job: Job) {
     return pushDLQ(job);
   }
 
-  const templateId = provider.templates[job.template_id];
+  // Resolve a known template name to its provider-side id; when the provider
+  // owns raw ids (SMS, #532/#535) an unknown id is passed through verbatim.
+  const templateId =
+    provider.templates[job.template_id] ??
+    (provider.allowRawTemplateId ? job.template_id : undefined);
   if (!templateId) {
     console.log('Unknown provider template, sending to DLQ:', job.job_id);
     return pushDLQ(job);
