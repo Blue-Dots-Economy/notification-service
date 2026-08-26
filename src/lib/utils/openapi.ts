@@ -88,7 +88,8 @@ export function openApiDocument() {
           },
           responses: {
             '200': {
-              description: 'Job accepted or deduped',
+              description:
+                'Job accepted, or suppressed as a duplicate of a send the caller asked to dedupe via `dedupe_id`. Inspect `enqueued`: false means nothing was sent.',
               content: {
                 'application/json': {
                   schema: {
@@ -96,6 +97,7 @@ export function openApiDocument() {
                     properties: {
                       job_id: { type: 'string' },
                       enqueued: { type: 'boolean' },
+                      reason: { type: 'string', enum: ['duplicate'] },
                     },
                   },
                 },
@@ -103,6 +105,22 @@ export function openApiDocument() {
             },
             '400': { description: 'Invalid request or provider/template' },
             '401': { description: 'Missing or invalid request signature' },
+            '409': {
+              description:
+                'Suppressed as a duplicate by the fallback content-hash key (no `dedupe_id` was supplied). Nothing was sent. Pass an explicit `dedupe_id` if the send is a deliberate retry.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    properties: {
+                      job_id: { type: 'string' },
+                      enqueued: { type: 'boolean' },
+                      reason: { type: 'string', enum: ['duplicate-fallback'] },
+                    },
+                  },
+                },
+              },
+            },
           },
         },
       },

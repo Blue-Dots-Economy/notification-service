@@ -206,8 +206,14 @@ Fields:
 - `to`: recipient address or phone number.
 - `priority`: optional, either `realtime` or `other`; defaults to `other`.
 - `variables`: provider-specific variables validated by that provider schema.
-- `dedupe_id`: optional override for dedupe. Without it, the service dedupes by
-  `channel:to:template_id`.
+- `dedupe_id`: optional dedupe key, and the recommended one. Supplying it means
+  "send this message once": it is used verbatim, with a **1 hour** window, and a
+  suppressed repeat answers `200` with `reason: duplicate`. Without it the service
+  falls back to `channel:to:template_id:<sha256 of the rendered payload>` with a
+  **5 second** window, and a suppressed repeat answers `409`. The hash covers
+  `variables`, so the fallback only ever collapses a byte-identical resend — it
+  used to key on `channel:to:template_id` alone, which for a generic template such
+  as `basic_email` meant one email per recipient per window regardless of content.
 
 Response:
 
@@ -268,14 +274,18 @@ Operational notes:
   10 MB **after** base64 inflation, so ~7 MB of original file is the practical
   maximum regardless of configuration.
 
-If the request is a duplicate inside the dedupe window:
+If the request is a duplicate inside the dedupe window, **nothing is sent** — and
+the two cases are answered differently, because only one of them is intentional:
 
-```json
-{
-  "job_id": "uuid",
-  "enqueued": false
-}
+```text
+POST /notify  with dedupe_id  ->  200  {"job_id":"uuid","enqueued":false,"reason":"duplicate"}
+POST /notify  without         ->  409  {"job_id":"uuid","enqueued":false,"reason":"duplicate-fallback"}
 ```
+
+The caller asked for suppression in the first case, so it is not an error. In the
+second nobody did, so it is a dropped message and the status code says so — a
+client that checks only `res.ok` would otherwise read it as a delivery. Either way
+the service logs a warning carrying the dedupe key.
 
 ## Provider Discovery
 

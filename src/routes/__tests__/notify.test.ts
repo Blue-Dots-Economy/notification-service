@@ -3,7 +3,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // Auth, dedupe and Redis each have their own tests; this file is about what the
 // /notify route accepts and — crucially — what it refuses to enqueue.
 vi.mock('../../plugins/request-auth', () => ({ requestAuth: async () => {} }));
-vi.mock('../../lib/dedupe', () => ({ dedupe: async () => true }));
+// Only the Redis SET NX is doubled. `buildDedupeKey` lives in its own
+// dependency-free module and is used for real, so these tests exercise the key
+// the route actually derives.
+const dedupe = vi.fn(async (_key: string, _ttl?: number) => true);
+vi.mock('../../lib/dedupe', () => ({ dedupe: (key: string, ttl?: number) => dedupe(key, ttl) }));
 
 const pushRealtime = vi.fn(async () => {});
 const pushOther = vi.fn(async () => {});
@@ -69,6 +73,8 @@ const post = async (payload: unknown) => {
 beforeEach(() => {
   pushRealtime.mockClear();
   pushOther.mockClear();
+  dedupe.mockClear();
+  dedupe.mockImplementation(async () => true);
 });
 
 describe('POST /notify — attachment limits', () => {
@@ -115,5 +121,45 @@ describe('POST /notify — attachment limits', () => {
     const res = await post(body());
     expect(res.statusCode).toBe(200);
     expect(pushOther).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('POST /notify — duplicate suppression (#88)', () => {
+  it('keys the fallback on the rendered payload, not just the template', async () => {
+    await post(body());
+
+    const [key, ttl] = dedupe.mock.calls[0]!;
+    expect(key).toMatch(/^email:support@example\.com:basic_email:[0-9a-f]{32}$/);
+    expect(ttl).toBe(5);
+  });
+
+  it('honours an explicit dedupe_id with the long window', async () => {
+    await post({ ...body(), dedupe_id: 'item_lifecycle:profile.create:u1:item-9' });
+
+    expect(dedupe).toHaveBeenCalledWith('item_lifecycle:profile.create:u1:item-9', 3600);
+  });
+
+  // An explicit dedupe_id means the caller asked for suppression, so a hit is
+  // not an error — but it must still be distinguishable from a delivery.
+  it('reports a suppressed explicit send as 200 with a reason', async () => {
+    dedupe.mockImplementation(async () => false);
+
+    const res = await post({ ...body(), dedupe_id: 'retire_cancel:a-1:u1' });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ enqueued: false, reason: 'duplicate' });
+    expect(pushOther).not.toHaveBeenCalled();
+  });
+
+  // The fallback path is the accidental case: nobody opted in, so a hit is a
+  // dropped message and must not read as success to a caller checking res.ok.
+  it('reports a suppressed fallback send as 409', async () => {
+    dedupe.mockImplementation(async () => false);
+
+    const res = await post(body());
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({ enqueued: false, reason: 'duplicate-fallback' });
+    expect(pushOther).not.toHaveBeenCalled();
   });
 });
