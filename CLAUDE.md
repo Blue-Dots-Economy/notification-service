@@ -89,6 +89,7 @@ Providers are extensible implementations for different notification channels (em
 export const emailProvider: ProviderDefinition = {
   name: 'email',                     // Channel name used in /notify requests
   templates: { welcome: '...' },     // Public template keys → provider IDs
+  allowRawTemplateId: false,         // optional; see below
   schema: z.object({ ... }),         // Zod schema for variables
   async send({ to, template_id, variables }) { ... }
 };
@@ -96,14 +97,37 @@ export const emailProvider: ProviderDefinition = {
 
 Providers are auto-discovered and registered by `src/lib/providers/index.ts`. To add a provider, create a folder and export the definition (see README for full example).
 
+**`allowRawTemplateId` (raw template-id pass-through).** By default a `template_id`
+must name a key in the provider's `templates` map or `/notify` rejects it with a
+400. When `allowRawTemplateId: true`, an unknown `template_id` is passed through to
+the provider verbatim — treated as a raw provider-side id the caller owns. SMS uses
+this (#532/#535): signalstack sends DLT-approved MSG91 flow ids directly, so only
+the legacy `login_otp` flow is named in its `templates` map. Email keeps the default
+(strict allowlist).
+
+**SMS variables schema.** SMS switched its `schema` to `z.record(z.string(),
+z.string())` — an open map of named string variables (the DLT template's
+placeholders), rather than a fixed `z.object`. This carries the multi-variable
+flow (`name`, `link`, …) through to MSG91 as per-recipient vars.
+
 ### Request Deduplication
 
-Requests within a short window (configurable) are deduplicated by default using:
-```
-key = `channel:to:template_id`
-```
+`/notify` deduplicates by a Redis `SET NX` key with a per-mode TTL (windows are
+**not** configurable). Two modes (`src/lib/dedupe_key.ts`, `src/routes/notify.ts`):
 
-Override with `dedupe_id` in the request body. Prevents accidental duplicate sends from retries or client-side resends.
+- **Explicit `dedupe_id`** — the caller promising "send this once". Used verbatim
+  as the key, **1 hour** window. A suppressed repeat is a success with a reason:
+  `200 {"enqueued": false, "reason": "duplicate"}`.
+- **No `dedupe_id`** — fallback key `channel:to:template_id:<sha256 of the rendered
+  payload>` (the `channel:to:template_id` prefix stays in the clear so the key is
+  greppable; the digest carries message identity), **5 second** window. A suppressed
+  repeat is nobody's intent — a dropped message — so it answers
+  `409 {"enqueued": false, "reason": "duplicate-fallback"}` (#88).
+
+Hashing the whole payload is what makes the fallback message-identifying: it used
+to key on `channel:to:template_id` alone, which for a generic template like
+`basic_email` collapsed to one email per recipient per window regardless of content.
+See README for the full request/response contract.
 
 ## Key Files
 
@@ -147,7 +171,13 @@ Required for API operation:
 
 Required for providers (varies by implementation):
 - AWS SESv2 credentials for email
-- Twilio credentials for SMS/WhatsApp
+- `MSG91_AUTH_KEY` for SMS (MSG91 Flow API)
+- `SMS_LOGIN_OTP_TEMPLATE_ID` — MSG91 flow id for the legacy `login_otp` template.
+  Read in `src/lib/providers/sms/msg91.ts`; optional, with a back-compat default of
+  the previously-hardcoded id. Per-event DLT flow ids are sent raw and need no env
+  (see `allowRawTemplateId`). Note: `MSG91_TEMPLATE_ID` in `example.env` is unused —
+  the code never reads it; use `SMS_LOGIN_OTP_TEMPLATE_ID` instead.
+- Twilio credentials for WhatsApp
 - etc.
 
 ## TypeScript Configuration
