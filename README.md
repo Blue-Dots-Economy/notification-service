@@ -202,12 +202,20 @@ Request body:
 Fields:
 
 - `channel`: provider name, such as `email`, `sms`, or `whatsapp`.
-- `template_id`: public template key from the provider metadata.
+- `template_id`: a public template key from the provider metadata, or — for
+  providers that accept raw provider-side ids (SMS; see "SMS Templates &
+  Variables" below) — a provider template id passed through verbatim.
 - `to`: recipient address or phone number.
 - `priority`: optional, either `realtime` or `other`; defaults to `other`.
 - `variables`: provider-specific variables validated by that provider schema.
-- `dedupe_id`: optional override for dedupe. Without it, the service dedupes by
-  `channel:to:template_id`.
+- `dedupe_id`: optional dedupe key, and the recommended one. Supplying it means
+  "send this message once": it is used verbatim, with a **1 hour** window, and a
+  suppressed repeat answers `200` with `reason: duplicate`. Without it the service
+  falls back to `channel:to:template_id:<sha256 of the rendered payload>` with a
+  **5 second** window, and a suppressed repeat answers `409`. The hash covers
+  `variables`, so the fallback only ever collapses a byte-identical resend — it
+  used to key on `channel:to:template_id` alone, which for a generic template such
+  as `basic_email` meant one email per recipient per window regardless of content.
 
 Response:
 
@@ -268,14 +276,18 @@ Operational notes:
   10 MB **after** base64 inflation, so ~7 MB of original file is the practical
   maximum regardless of configuration.
 
-If the request is a duplicate inside the dedupe window:
+If the request is a duplicate inside the dedupe window, **nothing is sent** — and
+the two cases are answered differently, because only one of them is intentional:
 
-```json
-{
-  "job_id": "uuid",
-  "enqueued": false
-}
+```text
+POST /notify  with dedupe_id  ->  200  {"job_id":"uuid","enqueued":false,"reason":"duplicate"}
+POST /notify  without         ->  409  {"job_id":"uuid","enqueued":false,"reason":"duplicate-fallback"}
 ```
+
+The caller asked for suppression in the first case, so it is not an error. In the
+second nobody did, so it is a dropped message and the status code says so — a
+client that checks only `res.ok` would otherwise read it as a delivery. Either way
+the service logs a warning carrying the dedupe key.
 
 ## Provider Discovery
 
@@ -375,6 +387,27 @@ SMS:
   }
 }
 ```
+
+### SMS Templates & Variables
+
+SMS is delivered through the MSG91 Flow API and accepts **raw provider-side
+template ids** (#86/#532/#535). Two ways to pass `template_id`:
+
+- **Named template** — `login_otp` is the one key in the SMS provider metadata. Its
+  MSG91 flow id comes from `SMS_LOGIN_OTP_TEMPLATE_ID` (a built-in default applies
+  if unset), so it is deployment-specific per MSG91 account.
+- **Raw DLT flow id** — any other `template_id` is passed through verbatim to MSG91
+  (the SMS provider sets `allowRawTemplateId`). Signalstack sends its per-event
+  DLT-approved flow ids directly this way; they need no entry in the templates map.
+
+`variables` is an open map of named string values
+(`z.record(z.string(), z.string())`) — the DLT template's placeholders. Each key is
+spread as an MSG91 recipient variable, so a multi-variable flow is sent as, e.g.,
+`{ "name": "Asha", "link": "https://…" }`. Two rules:
+
+- **Legacy back-compat:** a lone `{ "message": "…" }` is mapped to MSG91's `##var##`
+  placeholder, so existing single-variable OTP callers are byte-for-byte unchanged.
+- A caller variable named `mobiles` can never override the resolved recipient phone.
 
 WhatsApp:
 
