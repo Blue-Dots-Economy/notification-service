@@ -22,7 +22,7 @@ importers:
     dependencies:
       '@aws-sdk/client-sesv2':
         specifier: ^3.948.0
-        version: 3.1120.0
+        version: 3.1121.0
       fastify:
         specifier: ^5.6.2
         version: 5.12.1
@@ -34,7 +34,7 @@ importers:
         version: 9.0.3
       zod:
         specifier: ^4.1.13
-        version: 4.4.3
+        version: 4.5.2
     devDependencies:
       '@types/node':
         specifier: ^26.1.2
@@ -54,8 +54,8 @@ importers:
 
 packages:
 
-  '@aws-sdk/client-sesv2@3.1120.0':
-    resolution: {integrity: sha512-bG2J+6PAQd7rgHvrJTLT+oGbK1P16Xq5LvaauL9kUyPPIbCjPL9HfmVtUXiLDPEllzxozbHVuk0sn9+Iuce7kw==}
+  '@aws-sdk/client-sesv2@3.1121.0':
+    resolution: {integrity: sha512-Vk7tHo7TPBlR5MmvpfR4XXNL5uld/5uWHNBceUArtQrzhwNaxt/5ANp45JETZfLH9VDoaX3bTmoHeSMOWc0Ldg==}
     engines: {node: '>=20.0.0'}
 
   '@aws-sdk/core@3.977.9':
@@ -1097,12 +1097,12 @@ packages:
     resolution: {integrity: sha512-Ux4ygGWsu2c7isFWe8Yu1YluJmqVhxqK2cLXNQA5AcC3QfbGNpM7fu0Y8b/z16pXLnFxZYvWhd3fhBY9DLmC6Q==}
     engines: {node: '>=6'}
 
-  zod@4.4.3:
-    resolution: {integrity: sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ==}
+  zod@4.5.2:
+    resolution: {integrity: sha512-XkYXCol10+ba/6F/cueWV+TezUeOqXW0hdeJt5CdXjTYeAgAQg5N03RQdJ80mhfFE72+pblvYMW4wy2Qp4Qbrg==}
 
 snapshots:
 
-  '@aws-sdk/client-sesv2@3.1120.0':
+  '@aws-sdk/client-sesv2@3.1121.0':
     dependencies:
       '@aws-sdk/core': 3.977.9
       '@aws-sdk/credential-provider-node': 3.972.81
@@ -2067,4 +2067,4 @@ snapshots:
 
   yn@3.1.1: {}
 
-  zod@4.4.3: {}
+  zod@4.5.2: {}
