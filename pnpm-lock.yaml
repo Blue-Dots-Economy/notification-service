@@ -22,7 +22,7 @@ importers:
     dependencies:
       '@aws-sdk/client-sesv2':
         specifier: ^3.948.0
-        version: 3.1116.0
+        version: 3.1120.0
       fastify:
         specifier: ^5.6.2
         version: 5.12.1
@@ -54,8 +54,8 @@ importers:
 
 packages:
 
-  '@aws-sdk/client-sesv2@3.1116.0':
-    resolution: {integrity: sha512-5j2Zu5e6I0GbvrpSe86+z4I760TWGiypkBTNVGF+B46h8CkcWACG8EMwi0xVpXbjAQm1sBRvIFoinIJaEP0qcA==}
+  '@aws-sdk/client-sesv2@3.1120.0':
+    resolution: {integrity: sha512-bG2J+6PAQd7rgHvrJTLT+oGbK1P16Xq5LvaauL9kUyPPIbCjPL9HfmVtUXiLDPEllzxozbHVuk0sn9+Iuce7kw==}
     engines: {node: '>=20.0.0'}
 
   '@aws-sdk/core@3.977.9':
@@ -1102,7 +1102,7 @@ packages:
 
 snapshots:
 
-  '@aws-sdk/client-sesv2@3.1116.0':
+  '@aws-sdk/client-sesv2@3.1120.0':
     dependencies:
       '@aws-sdk/core': 3.977.9
       '@aws-sdk/credential-provider-node': 3.972.81
