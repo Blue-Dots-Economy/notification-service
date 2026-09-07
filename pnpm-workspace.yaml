@@ -18,6 +18,20 @@ overrides:
   diff@>=4.0.0 <4.0.4: '>=4.0.4'
   fast-uri@<=3.1.0: '>=3.1.1'
   fast-uri@<=3.1.1: '>=3.1.2'
+  # 3.1.5 and 4.1.2 carry four HIGH advisories — CVE-2026-75899, CVE-2026-75931,
+  # CVE-2026-75975, CVE-2026-76172 (SSRF via repeated hostname percent-decoding
+  # and malformed IPv6 normalization; host confusion via skipped IDN
+  # canonicalization). Fixed in 2.4.5 / 3.1.6 / 4.1.3.
+  #
+  # Only the 4.x floor is added. The two open-ended entries above already lift
+  # this tree's 3.x consumer across the major into 4.x — `'>=3.1.1'` is not
+  # bounded by the selector's major — so it lands on 4.1.4 via this line and the
+  # tree keeps a single copy. Adding a matching `fast-uri@>=3.0.0 <3.1.6` floor
+  # was tried and is worse here: it bounds that consumer back to 3.1.7 and
+  # leaves two patched copies instead of one, for no security gain.
+  # signals-dpg and aggregator-dpg DO floor both lines, because both majors are
+  # genuinely present there.
+  fast-uri@>=4.0.0 <4.1.3: 4.1.4
   fast-xml-parser@<5.7.0: '>=5.7.0'
   fast-xml-parser@>=5.0.0 <5.3.5: '>=5.3.5'
   fast-xml-parser@>=5.0.0 <5.3.6: '>=5.3.6'
