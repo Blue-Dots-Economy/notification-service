@@ -106,7 +106,18 @@ export async function sendMail({
       replyTo,
       cc,
       subject,
-      text: html.replace(/<[^>]+>/g, ''),
+      // The plain-text alternative. The trailing `<`-strip is not redundant: the
+      // tag regex is a single pass, so an UNTERMINATED tag leaves its `<` behind
+      // ("<p>x<script" -> "x<script") — CodeQL
+      // js/incomplete-multi-character-sanitization. Nothing executes in a
+      // text/plain part, so this was never exploitable, but removing any residual
+      // `<` makes a surviving `<script` impossible for one linear pass.
+      //
+      // Only `<` is stripped, deliberately NOT `>`. A blanket /[<>]/ also deletes
+      // legitimate unescaped `>` from visible copy — "Score > 90" became
+      // "Score  90" and "A => B" became "A = B" — which silently corrupts the
+      // plain-text body of ordinary mail. See the mailer test.
+      text: html.replace(/<[^>]+>/g, '').replace(/</g, ''),
       html,
       // Decoded here rather than passing `encoding: 'base64'` so nodemailer
       // handles the transfer encoding itself for whatever transport is active

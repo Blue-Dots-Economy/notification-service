@@ -109,6 +109,28 @@ describe('emailProvider.schema', () => {
 });
 
 describe('emailProvider.send', () => {
+  // The text/plain alternative is derived from `html` by stripping tags. Two
+  // properties matter and pull in opposite directions, so both are pinned here:
+  // no `<script` may survive an unterminated tag (CodeQL
+  // js/incomplete-multi-character-sanitization), and legitimate `>` in visible
+  // copy must NOT be eaten — a blanket /[<>]/ strip turned "Score > 90" into
+  // "Score  90" in review.
+  it.each([
+    ['<p>Hello <b>Asha</b></p>', 'Hello Asha'],
+    ['<p>Score > 90</p>', 'Score > 90'],
+    ['<p>Use A => B</p>', 'Use A => B'],
+    ['<p>x<script', 'xscript'],
+  ])('derives the text/plain body from %j as %j', async (html, expected) => {
+    await emailProvider.send({
+      to: 'support@example.com',
+      template_id: 'BASIC_EMAIL',
+      variables: { ...base, html },
+    });
+    const sent = sendMailSpy.mock.calls[0][0] as { text: string };
+    expect(sent.text).toBe(expected);
+    expect(sent.text).not.toContain('<script');
+  });
+
   it('decodes attachments into nodemailer buffers', async () => {
     const content = Buffer.from('a tiny png');
     await emailProvider.send({
