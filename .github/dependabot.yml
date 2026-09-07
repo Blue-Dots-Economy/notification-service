@@ -23,8 +23,7 @@ updates:
     target-branch: "feature"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "03:00"
       timezone: "UTC"
     # The limit counts open *version-update* PRs. Grouped updates plus a singleton
@@ -54,7 +53,7 @@ updates:
       # reason — "vitest 4 needs vite 6 in lockstep" — does not apply here, since
       # this repo has no vite of its own. It is kept so the runner moves major
       # versions deliberately, in step with the other DPG repos (all on 3.x),
-      # rather than on a Monday morning.
+      # rather than on an unattended scheduled run.
       - dependency-name: "vitest"
         update-types: ["version-update:semver-major"]
 
@@ -65,8 +64,7 @@ updates:
     target-branch: "feature"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "03:15"
       timezone: "UTC"
     labels:
@@ -89,8 +87,7 @@ updates:
     target-branch: "feature"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
       time: "03:30"
       timezone: "UTC"
     labels:
