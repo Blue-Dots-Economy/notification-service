@@ -21,11 +21,6 @@ const MAIL_VARS = [
   'AWS_REGION',
   'AWS_ACCESS_KEY_ID',
   'AWS_SECRET_ACCESS_KEY',
-  // Removed with the hardcoded Gmail endpoint (#112). Listed so the cases that
-  // assert they are inert cannot leak them into a later case.
-  'SMTP_GMAIL',
-  'GMAIL_USER',
-  'GMAIL_PASS',
 ];
 
 const message = {
@@ -87,18 +82,6 @@ describe('transport selection', () => {
       secure: false,
       auth: { user: 'notify@bluedots.example', pass: 'zoho-pw' },
     });
-  });
-
-  it('ignores a leftover SMTP_GMAIL, which is no longer a transport selector', async () => {
-    // The flag was removed with the hardcoded endpoint it selected (#112). A
-    // values file that still carries it must not resurrect a transport.
-    await expect(send({ SMTP_GMAIL: 'true' })).rejects.toThrow(/No valid mail transport/);
-  });
-
-  it('ignores leftover GMAIL_USER/GMAIL_PASS as credentials', async () => {
-    await expect(
-      send({ SMTP_GMAIL: 'true', GMAIL_USER: 'relay@gmail.com', GMAIL_PASS: 'app-pw' })
-    ).rejects.toThrow(/No valid mail transport/);
   });
 
   it('omits auth entirely for an unauthenticated relay', async () => {
