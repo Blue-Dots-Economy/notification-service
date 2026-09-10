@@ -1,8 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-// The transport is resolved from the environment at module load, so each case
-// re-imports sendMailCore under a fresh env. nodemailer is mocked to capture the
-// options it is handed instead of opening a socket.
+// Transport resolves at module load, so each case re-imports under a fresh env.
 const sendMailSpy = vi.fn(async () => ({ messageId: 'msg-1' }));
 const createTransportSpy = vi.fn((_opts: unknown) => ({ sendMail: sendMailSpy }));
 vi.mock('nodemailer', () => ({
@@ -128,8 +126,7 @@ describe('secure flag', () => {
   });
 
   it('treats an empty SMTP_SECURE as unset, so port 465 keeps implicit TLS', async () => {
-    // The chart renders an unset value as "", and reading that as `false` would
-    // leave a 465 endpoint with no TLS — a connection that never completes.
+    // The chart renders unset as "", and reading that as `false` breaks 465.
     const { transport } = await send({ ...GMAIL_ENV, SMTP_SECURE: '' });
     expect(transport).toMatchObject({ port: 465, secure: true });
   });
@@ -143,8 +140,7 @@ describe('From address', () => {
   });
 
   it('keeps the caller-supplied address on a generic relay', async () => {
-    // A relay username is often not a mailbox at all (postmaster@mg.…, AKIA…),
-    // so it must not leak into the From header.
+    // A relay username is often not a mailbox, so it must not leak into From.
     const { sent } = await send({
       SMTP_HOST: 'smtp.mailgun.org',
       SMTP_USER: 'postmaster@mg.example',

@@ -39,38 +39,24 @@ const {
 
 const isTrue = (v?: string) => String(v).toLowerCase() === 'true';
 
-/**
- * Gmail's SMTP endpoint. Only its HOST is special-cased, and only for the From
- * address below — Gmail is configured like any other relay.
- */
+/** Special-cased only for the From address below; otherwise Gmail is just a relay. */
 const GMAIL_HOST = 'smtp.gmail.com';
 
-/**
- * The SMTP connection, resolved from the environment.
- *
- * `SMTP_HOST` is the only thing that selects this transport, which is what makes
- * Gmail / Zoho / Mailgun / a corporate relay a values change rather than a code
- * change, matching how the aggregator reads SMTP_HOST/PORT/SECURE (#112).
- */
+/** The SMTP connection, resolved from the environment. `SMTP_HOST` selects it (#112). */
 function resolveSmtp(): SMTPTransport.Options | undefined {
   if (!SMTP_HOST) return undefined;
 
-  // 587 + STARTTLS is the common default among third-party providers, so an
-  // unset port must NOT assume 465.
+  // 587 + STARTTLS is the common third-party default, so never assume 465.
   const port = Number(SMTP_PORT) || 587;
-  // `secure` means implicit TLS from the first byte, which is port 465. On 587
-  // the session opens plaintext and upgrades via STARTTLS, which nodemailer
-  // does on its own — so derive it from the port unless it is stated outright.
-  // The empty string counts as unset, since the chart renders unset values as "".
+  // `secure` = implicit TLS (465); on 587 nodemailer upgrades via STARTTLS itself.
+  // Empty string counts as unset, since the chart renders unset values as "".
   const secure = SMTP_SECURE ? isTrue(SMTP_SECURE) : port === 465;
 
   return {
     host: SMTP_HOST,
     port,
     secure,
-    // An open relay (a local MTA, a dev mailcatcher) has no credentials, and an
-    // `auth` object with undefined members still makes nodemailer attempt AUTH
-    // and fail. Only send it when there is something to send.
+    // An `auth` with undefined members still attempts AUTH, so omit it entirely.
     ...(SMTP_USER && SMTP_PASS ? { auth: { user: SMTP_USER, pass: SMTP_PASS } } : {}),
   };
 }
@@ -79,14 +65,10 @@ const smtp = resolveSmtp();
 const useSes = isTrue(SMTP_AWS_SES);
 
 /**
- * The address the envelope is sent from, or `undefined` to use the caller's
- * `fromEmail`.
+ * Sender override, or `undefined` to use the caller's `fromEmail`.
  *
- * Gmail rewrites (or rejects) a From that is not the authenticated account, so
- * pointing SMTP_HOST at it overrides the caller. That is a property of Gmail,
- * not of how it is configured. Any other relay keeps the caller's address —
- * its SMTP username is often not even a mailbox (`AKIA…`, `postmaster@mg.…`) —
- * unless `SMTP_FROM` names one explicitly.
+ * Gmail rewrites a From that is not the authenticated account, so it overrides the
+ * caller. Other relays keep it — their username is often not a mailbox at all.
  */
 const envelopeFrom = useSes
   ? undefined
@@ -118,8 +100,7 @@ async function initTransporter() {
       console.log('SMTP TRANSPORTER ERROR: ', err);
     }
   } else {
-    // Thrown on the first send, long after the misconfigured deploy went out,
-    // so it names what is missing rather than just saying no.
+    // Thrown on the first send, so name what is missing rather than just saying no.
     throw new Error(
       'No valid mail transport configuration found. Set SMTP_HOST (with SMTP_PORT, ' +
         'SMTP_SECURE and SMTP_USER/SMTP_PASS), or SMTP_AWS_SES=true with AWS_REGION ' +
