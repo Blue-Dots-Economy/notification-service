@@ -12,18 +12,20 @@ vi.mock('nodemailer', () => ({
 
 const MAIL_VARS = [
   'SMTP_AWS_SES',
-  'SMTP_GMAIL',
   'SMTP_HOST',
   'SMTP_PORT',
   'SMTP_SECURE',
   'SMTP_USER',
   'SMTP_PASS',
   'SMTP_FROM',
-  'GMAIL_USER',
-  'GMAIL_PASS',
   'AWS_REGION',
   'AWS_ACCESS_KEY_ID',
   'AWS_SECRET_ACCESS_KEY',
+  // Removed with the hardcoded Gmail endpoint (#112). Listed so the cases that
+  // assert they are inert cannot leak them into a later case.
+  'SMTP_GMAIL',
+  'GMAIL_USER',
+  'GMAIL_PASS',
 ];
 
 const message = {
@@ -49,7 +51,13 @@ async function send(env: Record<string, string>) {
   };
 }
 
-const GMAIL_ENV = { SMTP_GMAIL: 'true', GMAIL_USER: 'relay@gmail.com', GMAIL_PASS: 'app-pw' };
+// Gmail is configured like any other relay — no dedicated flag.
+const GMAIL_ENV = {
+  SMTP_HOST: 'smtp.gmail.com',
+  SMTP_PORT: '465',
+  SMTP_USER: 'relay@gmail.com',
+  SMTP_PASS: 'app-pw',
+};
 
 beforeEach(() => {
   createTransportSpy.mockClear();
@@ -57,7 +65,7 @@ beforeEach(() => {
 });
 
 describe('transport selection', () => {
-  it('keeps the SMTP_GMAIL shorthand on smtp.gmail.com:465 with implicit TLS', async () => {
+  it('reaches Gmail through plain SMTP_HOST, with implicit TLS on 465', async () => {
     const { transport } = await send(GMAIL_ENV);
     expect(transport).toEqual({
       host: 'smtp.gmail.com',
@@ -81,26 +89,16 @@ describe('transport selection', () => {
     });
   });
 
-  it('lets SMTP_HOST win over the SMTP_GMAIL shorthand', async () => {
-    const { transport } = await send({ ...GMAIL_ENV, SMTP_HOST: 'mail.internal.example' });
-    expect(transport).toMatchObject({ host: 'mail.internal.example', port: 587 });
+  it('ignores a leftover SMTP_GMAIL, which is no longer a transport selector', async () => {
+    // The flag was removed with the hardcoded endpoint it selected (#112). A
+    // values file that still carries it must not resurrect a transport.
+    await expect(send({ SMTP_GMAIL: 'true' })).rejects.toThrow(/No valid mail transport/);
   });
 
-  it('falls back to GMAIL_USER/GMAIL_PASS when the generic credentials are unset', async () => {
-    // The whole point of keeping the old names: a values file that still ships
-    // only GMAIL_* keeps authenticating after SMTP_HOST is introduced.
-    const { transport } = await send({ ...GMAIL_ENV, SMTP_HOST: 'smtp.mailgun.org' });
-    expect(transport).toMatchObject({ auth: { user: 'relay@gmail.com', pass: 'app-pw' } });
-  });
-
-  it('prefers SMTP_USER/SMTP_PASS over the Gmail-named fallbacks', async () => {
-    const { transport } = await send({
-      ...GMAIL_ENV,
-      SMTP_HOST: 'smtp.mailgun.org',
-      SMTP_USER: 'postmaster@mg.example',
-      SMTP_PASS: 'mg-pw',
-    });
-    expect(transport).toMatchObject({ auth: { user: 'postmaster@mg.example', pass: 'mg-pw' } });
+  it('ignores leftover GMAIL_USER/GMAIL_PASS as credentials', async () => {
+    await expect(
+      send({ SMTP_GMAIL: 'true', GMAIL_USER: 'relay@gmail.com', GMAIL_PASS: 'app-pw' })
+    ).rejects.toThrow(/No valid mail transport/);
   });
 
   it('omits auth entirely for an unauthenticated relay', async () => {
@@ -122,7 +120,7 @@ describe('transport selection', () => {
 
   it('names the variables it wanted when nothing is configured', async () => {
     await expect(send({})).rejects.toThrow(/SMTP_HOST/);
-    await expect(send({})).rejects.toThrow(/SMTP_GMAIL/);
+    await expect(send({})).rejects.toThrow(/SMTP_USER\/SMTP_PASS/);
     await expect(send({})).rejects.toThrow(/SMTP_AWS_SES/);
   });
 });
@@ -146,9 +144,9 @@ describe('secure flag', () => {
     expect(transport).toMatchObject({ secure: expected });
   });
 
-  it('treats an empty SMTP_SECURE as unset, so the Gmail shorthand keeps implicit TLS', async () => {
+  it('treats an empty SMTP_SECURE as unset, so port 465 keeps implicit TLS', async () => {
     // The chart renders an unset value as "", and reading that as `false` would
-    // leave the shorthand on 465 with no TLS — a connection that never completes.
+    // leave a 465 endpoint with no TLS — a connection that never completes.
     const { transport } = await send({ ...GMAIL_ENV, SMTP_SECURE: '' });
     expect(transport).toMatchObject({ port: 465, secure: true });
   });
@@ -182,7 +180,7 @@ describe('From address', () => {
     expect(sent.from).toBe('Signals Support <noreply@bluedots.example>');
   });
 
-  it('lets SMTP_FROM override the Gmail account too', async () => {
+  it('lets SMTP_FROM override the Gmail account', async () => {
     const { sent } = await send({ ...GMAIL_ENV, SMTP_FROM: 'alerts@bluedots.example' });
     expect(sent.from).toBe('Signals Support <alerts@bluedots.example>');
   });

@@ -23,11 +23,6 @@ services:
       SMTP_USER: ${SMTP_USER}
       SMTP_PASS: ${SMTP_PASS}
       SMTP_FROM: ${SMTP_FROM}
-      # Legacy names, still read as a fallback. Passed through so an existing
-      # .env keeps working; new setups use the SMTP_* pair above.
-      SMTP_GMAIL: ${SMTP_GMAIL}
-      GMAIL_USER: ${GMAIL_USER}
-      GMAIL_PASS: ${GMAIL_PASS}
       MSG91_AUTH_KEY: ${MSG91_AUTH_KEY}
       MSG91_TEMPLATE_ID: ${MSG91_TEMPLATE_ID}
       TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}

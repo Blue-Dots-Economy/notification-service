@@ -77,8 +77,7 @@ first match wins and nothing else is consulted:
 | Set this | Transport |
 | --- | --- |
 | `SMTP_AWS_SES=true` | AWS SESv2 API (`AWS_REGION` + `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`) |
-| `SMTP_HOST=<host>` | That SMTP server — Zoho, Mailgun, a self-hosted relay, an SES SMTP endpoint |
-| `SMTP_GMAIL=true` | Legacy shorthand for `SMTP_HOST=smtp.gmail.com SMTP_PORT=465 SMTP_SECURE=true` |
+| `SMTP_HOST=<host>` | That SMTP server — Gmail, Zoho, Mailgun, a self-hosted relay, an SES SMTP endpoint |
 
 Nothing set is a startup-time misconfiguration that only surfaces on the first
 send, so the error names all three.
@@ -87,11 +86,11 @@ SMTP connection variables:
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `SMTP_HOST` | — | Selects the generic transport. Overrides `SMTP_GMAIL`. |
-| `SMTP_PORT` | `587` | `465` under the `SMTP_GMAIL` shorthand. |
+| `SMTP_HOST` | — | Selects the SMTP transport. |
+| `SMTP_PORT` | `587` | |
 | `SMTP_SECURE` | `true` on port 465, else `false` | Implicit TLS from the first byte. On 587 the session opens plaintext and nodemailer upgrades it with STARTTLS, so `false` there is correct, not insecure. |
-| `SMTP_USER` | falls back to `GMAIL_USER` | |
-| `SMTP_PASS` | falls back to `GMAIL_PASS` | Omitted entirely when either half is missing, for an unauthenticated relay. |
+| `SMTP_USER` | — | |
+| `SMTP_PASS` | — | `auth` is omitted entirely when either half is missing, for an unauthenticated relay. |
 | `SMTP_FROM` | — | Fixed envelope sender; see below. |
 
 **Which address mail is sent from.** Normally the caller's `variables.fromEmail`
@@ -105,12 +104,11 @@ is used as-is. Two exceptions:
   mailbox at all (`postmaster@mg.example`, an SES `AKIA…` key id) — putting it
   in the `From` header would be wrong, so they keep the caller's address.
 
-**Legacy names.** `SMTP_GMAIL`, `GMAIL_USER` and `GMAIL_PASS` are what this
-service read before `SMTP_HOST` existed. They still work — `GMAIL_USER` /
-`GMAIL_PASS` are honoured as a fallback on *any* transport, not just Gmail — so
-a deployment that ships only those keeps authenticating unchanged. Don't set
-them in a new one: use `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=465`,
-`SMTP_SECURE=true` and the `SMTP_USER` / `SMTP_PASS` pair instead.
+**Gmail is not a special case.** Point `SMTP_HOST` at `smtp.gmail.com` with
+`SMTP_PORT=465`, `SMTP_SECURE=true` and an App Password in `SMTP_PASS`. The
+`SMTP_GMAIL`, `GMAIL_USER` and `GMAIL_PASS` variables this service used to read
+were removed along with the hardcoded endpoint they selected (#112); they are
+ignored if a stale values file still sets them.
 
 ## Testing
 

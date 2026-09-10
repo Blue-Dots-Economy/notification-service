@@ -170,15 +170,17 @@ Required for API operation:
   `{"jobstack": {"secret": "ns_jobstack_secret-key"}}`
 
 Required for providers (varies by implementation):
-- Email transport — **one** of `SMTP_AWS_SES=true` (+ AWS SESv2 credentials),
-  `SMTP_HOST` (+ `SMTP_PORT`/`SMTP_SECURE`/`SMTP_USER`/`SMTP_PASS`), or
-  `SMTP_GMAIL=true` (+ `GMAIL_USER`/`GMAIL_PASS`), checked in that order.
-  `SMTP_HOST` was added in #112 — before it the only non-SES option was Gmail,
-  hardcoded to `smtp.gmail.com:465`. `SMTP_GMAIL` is now a shorthand for exactly
-  those settings, and `GMAIL_USER`/`GMAIL_PASS` are honoured as fallbacks for
-  `SMTP_USER`/`SMTP_PASS` on every transport so existing values files keep
-  working. Resolution lives in `src/lib/providers/email/sendMailCore.ts`; the
-  README table is the operator-facing version.
+- Email transport — **one** of `SMTP_AWS_SES=true` (+ AWS SESv2 credentials) or
+  `SMTP_HOST` (+ `SMTP_PORT`/`SMTP_SECURE`/`SMTP_USER`/`SMTP_PASS`), checked in
+  that order. Added in #112: before it the only non-SES option was Gmail,
+  hardcoded to `smtp.gmail.com:465`, selected by an `SMTP_GMAIL` flag with
+  `GMAIL_USER`/`GMAIL_PASS` credentials. Those three variables were **removed** —
+  Gmail is now configured like any other relay. Only its *host* is still
+  special-cased, and only for the From address: Gmail rewrites or rejects a From
+  that is not the authenticated account, so `SMTP_HOST=smtp.gmail.com` sends as
+  `SMTP_USER` unless `SMTP_FROM` says otherwise. Resolution lives in
+  `src/lib/providers/email/sendMailCore.ts`; the README table is the
+  operator-facing version.
 - `MSG91_AUTH_KEY` for SMS (MSG91 Flow API)
 - `SMS_LOGIN_OTP_TEMPLATE_ID` — MSG91 flow id for the legacy `login_otp` template.
   Read in `src/lib/providers/sms/msg91.ts`; optional, with a back-compat default of
