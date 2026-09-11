@@ -69,6 +69,47 @@ pnpm dev
 The API listens on `SERVER_PORT` or `3000` by default. `src/server.ts` also
 spawns one background worker process.
 
+## Mail Transport
+
+`channel=email` picks its transport from the environment, in this order. The
+first match wins and nothing else is consulted:
+
+| Set this | Transport |
+| --- | --- |
+| `SMTP_AWS_SES=true` | AWS SESv2 API (`AWS_REGION` + `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`) |
+| `SMTP_HOST=<host>` | That SMTP server — Gmail, Zoho, Mailgun, a self-hosted relay, an SES SMTP endpoint |
+
+Nothing set is a startup-time misconfiguration that only surfaces on the first
+send, so the error names all three.
+
+SMTP connection variables:
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `SMTP_HOST` | — | Selects the SMTP transport. |
+| `SMTP_PORT` | `587` | |
+| `SMTP_SECURE` | `true` on port 465, else `false` | Implicit TLS from the first byte. On 587 the session opens plaintext and nodemailer upgrades it with STARTTLS, so `false` there is correct, not insecure. |
+| `SMTP_USER` | — | |
+| `SMTP_PASS` | — | `auth` is omitted entirely when either half is missing, for an unauthenticated relay. |
+| `SMTP_FROM` | — | Fixed envelope sender; see below. |
+
+**Which address mail is sent from.** Normally the caller's `variables.fromEmail`
+is used as-is. Two exceptions:
+
+- `SMTP_FROM`, when set, replaces it for every message. Use this with a relay
+  that only accepts one sender identity.
+- Gmail replaces it with the authenticated account, because Gmail rewrites or
+  rejects a `From` that is not the mailbox that authenticated. Other providers
+  do not have that constraint, and their SMTP username is frequently not a
+  mailbox at all (`postmaster@mg.example`, an SES `AKIA…` key id) — putting it
+  in the `From` header would be wrong, so they keep the caller's address.
+
+**Gmail is not a special case.** Point `SMTP_HOST` at `smtp.gmail.com` with
+`SMTP_PORT=465`, `SMTP_SECURE=true` and an App Password in `SMTP_PASS`. The
+`SMTP_GMAIL`, `GMAIL_USER` and `GMAIL_PASS` variables this service used to read
+were removed along with the hardcoded endpoint they selected (#112); they are
+ignored if a stale values file still sets them.
+
 ## Testing
 
 ```bash

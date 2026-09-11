@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// SMTP_GMAIL is read at module load by sendMailCore, so it has to be set before
+// SMTP_HOST is read at module load by sendMailCore, so it has to be set before
 // the dynamic import below — and nodemailer mocked so no transport is opened.
-process.env.SMTP_GMAIL = 'true';
-process.env.GMAIL_USER = 'relay@example.com';
-process.env.GMAIL_PASS = 'secret';
+process.env.SMTP_HOST = 'smtp.example.com';
+process.env.SMTP_USER = 'relay@example.com';
+process.env.SMTP_PASS = 'secret';
 
 const sendMailSpy = vi.fn(async () => ({ messageId: 'msg-1' }));
 vi.mock('nodemailer', () => ({
