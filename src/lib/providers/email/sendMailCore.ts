@@ -49,7 +49,7 @@ function resolveSmtp(): SMTPTransport.Options | undefined {
   // 587 + STARTTLS is the common third-party default, so never assume 465.
   const port = Number(SMTP_PORT) || 587;
   // `secure` = implicit TLS (465); on 587 nodemailer upgrades via STARTTLS itself.
-  // Empty string counts as unset, since the chart renders unset values as "".
+  // Empty counts as unset: the chart omits the key, but compose expands an unset var to "".
   const secure = SMTP_SECURE ? isTrue(SMTP_SECURE) : port === 465;
 
   return {
