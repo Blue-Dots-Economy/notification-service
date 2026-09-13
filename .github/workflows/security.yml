@@ -49,7 +49,7 @@ jobs:
       contents: read
       security-events: write
       packages: read
-    uses: Blue-Dots-Economy/bluedots-automation/.github/workflows/security-scan.yml@d4a1481df0843abcf8140d8bb69ee5a0bed0615f  # main 2026-08-20
+    uses: Blue-Dots-Economy/bluedots-automation/.github/workflows/security-scan.yml@255c2039633ad0ac25b760e95896e4b995aca883  # main 2026-09-07
     with:
       language: ts
       node-version: "24"   # matches engines.node (>=24) and ci.yaml
