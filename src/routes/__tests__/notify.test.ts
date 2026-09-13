@@ -22,9 +22,9 @@ vi.mock('../../lib/providers', async () => {
   return { providers: { email: emailProvider } };
 });
 
-process.env.SMTP_GMAIL = 'true';
-process.env.GMAIL_USER = 'relay@example.com';
-process.env.GMAIL_PASS = 'secret';
+process.env.SMTP_HOST = 'smtp.example.com';
+process.env.SMTP_USER = 'relay@example.com';
+process.env.SMTP_PASS = 'secret';
 vi.mock('nodemailer', () => ({
   default: { createTransport: () => ({ sendMail: async () => ({ messageId: 'm' }) }) },
   createTransport: () => ({ sendMail: async () => ({ messageId: 'm' }) }),

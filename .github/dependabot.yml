@@ -48,12 +48,15 @@ updates:
       # typescript-eslint does not support TS 7 yet — hold the major.
       - dependency-name: "typescript"
         update-types: ["version-update:semver-major"]
-      # Hold the vitest major. This entry was inherited from a sibling repo and
-      # was meaningless until vitest was actually installed (#48); the sibling
-      # reason — "vitest 4 needs vite 6 in lockstep" — does not apply here, since
-      # this repo has no vite of its own. It is kept so the runner moves major
-      # versions deliberately, in step with the other DPG repos (all on 3.x),
-      # rather than on an unattended scheduled run.
+      # Hold the vitest major. Now on 4.1.11, taken as the CVE-2026-84373 floor
+      # (the advisory covers >= 2.1.0, < 4.1.11), so the old note about the fleet
+      # sitting on 3.x is spent — signals-dpg and aggregator-dpg are on 4.x too.
+      # What is held is v5, which Dependabot proposed via the security path and
+      # which is a migration, not a bump: it clears mocks by default before each
+      # test. This repo still has no vite of its own, so the sibling repos'
+      # Vite 6.4 constraint is not the binding reason here — the mock semantics
+      # are. The major stays held; 4.x patches and minors flow normally, which is
+      # what the next advisory on this package will need.
       - dependency-name: "vitest"
         update-types: ["version-update:semver-major"]
 
