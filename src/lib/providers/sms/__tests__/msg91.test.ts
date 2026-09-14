@@ -1,9 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+// `../../../metrics` opens a Redis connection on import, which would keep the test
+// process alive. These tests are about the MSG91 request, not about counters.
+vi.mock('../../../metrics', () => ({
+  incr: vi.fn(async () => {}),
+  setGauge: vi.fn(async () => {}),
+  renderPrometheus: vi.fn(async () => ''),
+}));
+
 import { sendSmsWithMsg91, smsProvider } from '../msg91';
 
 function mockFetchOk() {
-  const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: () => ({}) });
+  const fetchMock = vi
+    .fn()
+    .mockResolvedValue({ ok: true, status: 200, json: async () => ({}), text: async () => '' });
   vi.stubGlobal('fetch', fetchMock);
   return fetchMock;
 }
@@ -54,8 +64,45 @@ describe('msg91 SMS provider', () => {
   });
 
   it('returns ok:false on a non-2xx MSG91 response', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, json: () => ({}) }));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ ok: false, status: 400, text: async () => 'bad flow id' })
+    );
     expect((await sendSmsWithMsg91('9100', 'flow', { name: 'X' })).ok).toBe(false);
+  });
+
+  it('logs the MSG91 error body, which used to print as a pending Promise', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ ok: false, status: 400, text: async () => 'bad flow id' })
+    );
+
+    await sendSmsWithMsg91('9100', 'flow', { name: 'X' });
+
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('bad flow id'));
+    log.mockRestore();
+  });
+
+  it('does not retry a 4xx (our request) but does retry a 5xx (theirs)', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ ok: false, status: 401, text: async () => '' })
+    );
+    expect((await sendSmsWithMsg91('9100', 'flow', { name: 'X' })).retryable).toBe(false);
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ ok: false, status: 502, text: async () => '' })
+    );
+    expect((await sendSmsWithMsg91('9100', 'flow', { name: 'X' })).retryable).toBe(true);
+  });
+
+  it('retries a network failure rather than dropping the message', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('ECONNRESET')));
+    const res = await sendSmsWithMsg91('9100', 'flow', { name: 'X' });
+    expect(res.ok).toBe(false);
+    expect(res.retryable).toBe(true);
   });
 
   it('allows raw template ids and accepts named-variable payloads', () => {

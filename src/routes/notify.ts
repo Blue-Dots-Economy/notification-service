@@ -15,6 +15,10 @@ const NotifySchema = z.object({
   priority: z.enum(['realtime', 'other']).optional(),
   variables: z.record(z.string(), z.any()),
   dedupe_id: z.string().optional(),
+  // Only read by providers that cannot render server-side (Pinnacle SMS), and
+  // only for a raw pass-through `template_id` — when the provider names the
+  // template it owns the body, which is why the OTP callers send none.
+  body: z.string().optional(),
 });
 
 export async function notifyRoutes(app: FastifyInstance) {
