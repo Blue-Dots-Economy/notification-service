@@ -18,7 +18,12 @@ const NotifySchema = z.object({
   // Only read by providers that cannot render server-side (Pinnacle SMS), and
   // only for a raw pass-through `template_id` — when the provider names the
   // template it owns the body, which is why the OTP callers send none.
-  body: z.string().optional(),
+  //
+  // Bounded because it is caller-supplied text that ends up on the wire: the
+  // ceiling is the largest single message any supported vendor accepts (2000
+  // for Latin-1), so anything longer could not have been delivered anyway and
+  // is better rejected here than after being queued.
+  body: z.string().max(2000).optional(),
 });
 
 export async function notifyRoutes(app: FastifyInstance) {

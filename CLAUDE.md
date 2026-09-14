@@ -135,6 +135,14 @@ caller change — which is why the OTP callers (Keycloak, Signals guardian OTP)
 were untouched by the Pinnacle work. A **raw pass-through** id has no entry, so
 its body must come from the caller's optional `body` field on `/notify`.
 
+**`??`, never `||` — this one is load-bearing.** A *declared but blank* body
+(`bodies: { login_otp: '' }`, the state while a DLT approval is pending) is
+dead-lettered alongside a blank template id, and must never fall through to the
+caller's `body`. With `||` it did, which let any caller put arbitrary text on the
+wire under a DLT-approved template id: a compliance break and a phishing
+primitive in one. Declaring a template is this service claiming its text;
+blank means unconfigured, not "caller may supply it".
+
 The body must be **byte-identical to the DLT-approved text**. The operator
 matches on it; drift is scrubbed downstream rather than rejected upfront, so it
 fails silently. `src/lib/providers/sms/render.ts` substitutes `{{token}}` and
@@ -316,16 +324,37 @@ live at scrape time rather than counted, so they cannot drift.
 | Metric | Type | Labels |
 |---|---|---|
 | `ns_sms_send_total` | counter | `provider`, `result` (`ok`/`failed`) |
-| `ns_sms_provider_error_total` | counter | `provider`, `code` (`EC1003`, `HTTP_502`, …) |
+| `ns_sms_provider_error_total` | counter | `provider`, `code` (`EC1003`, `HTTP_502`, `OTHER`) |
+| `ns_job_dlq_total` | counter | `channel`, `reason` |
 | `ns_provider_balance` | gauge | `provider` |
+| `ns_provider_balance_updated_at` | gauge | `provider` |
+| `ns_provider_balance_poll_failures_total` | counter | `provider`, `reason` |
 | `ns_queue_depth` | gauge | `queue` (`realtime`/`other`/`retry_count`/`dlq`) |
 | `ns_retry_eta_seconds` | gauge | — |
+
+Two constraints on this exposition that are easy to undo:
+
+- **Label values are sanitised and error codes are allowlisted** (`EC1\d{3}` /
+  `HTTP_\d{3}`, else `OTHER`). `|`, `,` and `=` delimit the Redis field
+  encoding, so an unsanitised vendor string round-trips as a different series —
+  or as a malformed name, and Prometheus rejects the **entire** scrape document
+  on one parse error. Codes come from vendor responses, so they are also an
+  unbounded-cardinality source into a hash with no TTL.
+- **`renderPrometheus` does not catch its Redis reads.** `incr` swallows because
+  it has a send in flight to protect; the scrape has none. Serving 200 with the
+  counters absent looks like a healthy service with no traffic, which is exactly
+  the reading under which no alert can fire. Let it fail and surface as `up==0`.
 
 `ns_provider_balance` exists because `EC1003 Insufficient Balance` is otherwise a silent
 killer: every send fails permanently and looks exactly like a bad template id from the outside.
 The worker polls Pinnacle's `/checkbalance` on `BALANCE_POLL_INTERVAL_MS` (default 15 min) and
-only when `SMS_PROVIDER=pinnacle`. Every metric write is best-effort and swallows its errors —
+only when `SMS_PROVIDER=pinnacle`. Metric **writes** are best-effort and swallow their errors —
 a Redis hiccup while recording a send must never turn a delivered message into a retry.
+
+The balance gauge ships with `ns_provider_balance_updated_at` and a failure counter because the
+value alone cannot distinguish a healthy balance from a poller that died an hour ago, and the
+gauge has no TTL — a silent poller would report the last healthy number forever while every send
+dead-letters on EC1003. **Alert on staleness, not just on the number.**
 
 ## Known Issues
 

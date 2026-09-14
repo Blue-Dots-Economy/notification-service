@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { ProviderDefinition, ProviderSendResult } from '../../../types/provider';
 import * as metrics from '../../metrics';
+import { isRetryableHttpStatus } from './http_status';
 import { MAX_LENGTH, messageType, renderBody, UnresolvedTemplateVariables } from './render';
 
 /**
@@ -31,22 +32,23 @@ interface PinnacleConfig {
 }
 
 /**
- * Codes that will still be true on the next attempt: bad credentials, an
- * unregistered template, an invalid sender. Retrying these burns the 5-attempt
- * ladder and buries the real cause under "max retries reached", so they
- * dead-letter on the first response instead.
+ * The only two codes the vendor documents as transient: EC1009 ("unable to
+ * process request") and EC1010 ("submission exceeded time limit").
  *
- * EC1009 (unable to process) and EC1010 (submission time limit) are the two
- * documented transient codes, so they are absent here and retry normally.
- * An unrecognised code also retries — unknown is treated as possibly transient.
+ * The classification is deliberately an allowlist of RETRYABLE codes rather
+ * than a list of permanent ones. An enumeration of permanent codes has to track
+ * the vendor's table exactly, and that table has holes — EC1018 and EC1020 do
+ * not exist in it at all, and EC1024/EC1025/EC1029/EC1030 are reseller and
+ * account-management errors that a send can never produce. Listing permanents
+ * meant those six looked like deliberate retry decisions when they were just
+ * gaps, and each one silently cost five attempts.
+ *
+ * Inverting it also fails safe: an `EC` code we do not recognise is the vendor
+ * telling us it understood the request and refused it, which does not improve
+ * on retry. Genuinely transient conditions arrive as HTTP 5xx, 408, 429 or a
+ * socket error, all handled separately.
  */
-const PERMANENT_ERROR_CODES = new Set([
-  'EC1000', 'EC1001', 'EC1002', 'EC1003', 'EC1004', 'EC1005', 'EC1006',
-  'EC1007', 'EC1008', 'EC1011', 'EC1012', 'EC1013', 'EC1014', 'EC1015',
-  'EC1016', 'EC1017', 'EC1019', 'EC1021', 'EC1022', 'EC1023', 'EC1026',
-  'EC1027', 'EC1028', 'EC1031', 'EC1032', 'EC1033', 'EC1034', 'EC1035',
-  'EC1036', 'EC1037', 'EC1038', 'EC1039',
-]);
+const RETRYABLE_ERROR_CODES = new Set(['EC1009', 'EC1010']);
 
 export function loadPinnacleConfig(env = process.env): PinnacleConfig | { error: string } {
   const missing = ['PINNACLE_API_KEY', 'PINNACLE_SENDER_ID', 'PINNACLE_DLT_ENTITY_ID'].filter(
@@ -77,6 +79,17 @@ function normalisePhone(to: string): string {
  * nothing. Success is `status: success` AND `code: 200`; anything else carries
  * an `EC1xxx` in `code`.
  */
+/**
+ * Only `EC1xxx` and `HTTP_nnn` become metric labels; anything else collapses to
+ * `OTHER`. The code comes from a vendor response, so left unbounded it is both
+ * a cardinality leak into a Redis hash with no TTL and — since the value is
+ * interpolated into the exposition — a way for a malformed vendor payload to
+ * break the entire scrape document.
+ */
+export function errorCodeLabel(code: string): string {
+  return /^EC1\d{3}$/.test(code) || /^HTTP_\d{3}$/.test(code) ? code : 'OTHER';
+}
+
 function readResponse(payload: any): { ok: boolean; code: string; message?: string; uniqueid?: string } {
   const code = String(payload?.code ?? '');
   const status = String(payload?.status ?? '').toLowerCase();
@@ -168,13 +181,27 @@ export async function sendSmsWithPinnacle(
       await metrics.incr('ns_sms_send_total', { provider: 'pinnacle', result: 'failed' });
       await metrics.incr('ns_sms_provider_error_total', {
         provider: 'pinnacle',
-        code: `HTTP_${resp.status}`,
+        code: errorCodeLabel(`HTTP_${resp.status}`),
       });
-      // 4xx is our request and will not improve; 5xx is theirs and might.
-      return { ok: false, error: `pinnacle http ${resp.status}`, retryable: resp.status >= 500 };
+      return {
+        ok: false,
+        error: `pinnacle http ${resp.status}`,
+        retryable: isRetryableHttpStatus(resp.status),
+      };
     }
 
-    parsed = readResponse(await resp.json());
+    // A vendor that answers 200 with a non-JSON body would otherwise throw out
+    // of `json()` and be reported as a network error. It is a bad response, not
+    // a bad connection, and retrying it is still right — but it should say so.
+    let responsePayload: unknown;
+    try {
+      responsePayload = await resp.json();
+    } catch {
+      await metrics.incr('ns_sms_send_total', { provider: 'pinnacle', result: 'failed' });
+      await metrics.incr('ns_sms_provider_error_total', { provider: 'pinnacle', code: 'OTHER' });
+      return { ok: false, error: 'pinnacle returned a non-JSON body', retryable: true };
+    }
+    parsed = readResponse(responsePayload);
   } catch (err) {
     // Network-level failure — genuinely transient, and the message is logged
     // rather than the error object, which can carry the request (phone, text).
@@ -188,11 +215,14 @@ export async function sendSmsWithPinnacle(
 
   if (!parsed.ok) {
     await metrics.incr('ns_sms_send_total', { provider: 'pinnacle', result: 'failed' });
-    await metrics.incr('ns_sms_provider_error_total', { provider: 'pinnacle', code: parsed.code });
+    await metrics.incr('ns_sms_provider_error_total', {
+      provider: 'pinnacle',
+      code: errorCodeLabel(parsed.code),
+    });
     return {
       ok: false,
       error: `pinnacle ${parsed.code}${parsed.message ? `: ${parsed.message}` : ''}`,
-      retryable: !PERMANENT_ERROR_CODES.has(parsed.code),
+      retryable: RETRYABLE_ERROR_CODES.has(parsed.code),
     };
   }
 
@@ -208,20 +238,43 @@ export async function sendSmsWithPinnacle(
  */
 export async function pollPinnacleBalance(env = process.env): Promise<number | null> {
   const config = loadPinnacleConfig(env);
-  if ('error' in config) return null;
+  if ('error' in config) return await failPoll('not_configured', config.error);
+
   try {
     const resp = await fetch(`${config.baseUrl}/index.php/checkbalance`, {
       headers: { apikey: config.apiKey },
     });
-    if (!resp.ok) return null;
+    if (!resp.ok) return await failPoll('http_error', `HTTP ${resp.status}`);
+
     const payload = (await resp.json()) as { data?: { balance?: unknown } };
     const balance = Number(payload?.data?.balance);
-    if (!Number.isFinite(balance)) return null;
+    if (!Number.isFinite(balance)) return await failPoll('unparseable', 'no numeric balance in response');
+
     await metrics.setGauge('ns_provider_balance', balance, { provider: 'pinnacle' });
+    // Freshness is published alongside the value because the value alone cannot
+    // distinguish "balance is healthy" from "the poller died an hour ago and
+    // this number is stale" — and those two look identical right up until every
+    // send starts failing on EC1003.
+    await metrics.setGauge('ns_provider_balance_updated_at', Math.floor(Date.now() / 1000), {
+      provider: 'pinnacle',
+    });
     return balance;
-  } catch {
-    return null;
+  } catch (err) {
+    return await failPoll('request_failed', err instanceof Error ? err.message : 'unknown');
   }
+}
+
+/**
+ * A balance poll that fails silently is worse than no poll at all: the gauge
+ * keeps reporting the last healthy number forever. Every exit records why.
+ */
+async function failPoll(reason: string, detail: string): Promise<null> {
+  console.log(`pinnacle balance poll failed (${reason}): ${detail}`);
+  await metrics.incr('ns_provider_balance_poll_failures_total', {
+    provider: 'pinnacle',
+    reason,
+  });
+  return null;
 }
 
 export const pinnacleSmsProvider: ProviderDefinition = {

@@ -4,6 +4,15 @@ import type { Job } from 'src/types';
 // The queue is mocked rather than faked here: these tests are about which queue
 // call processJob makes and with what delay, not about Redis behaviour (that is
 // queue.test.ts's job).
+// `../metrics` opens a Redis connection on import, which would keep the test
+// process alive. The DLQ counters it records are asserted via this mock.
+const { incr } = vi.hoisted(() => ({ incr: vi.fn(async () => {}) }));
+vi.mock('../metrics', () => ({
+  incr,
+  setGauge: vi.fn(async () => {}),
+  renderPrometheus: vi.fn(async () => ''),
+}));
+
 vi.mock('../queue', () => ({
   pushDLQ: vi.fn(async () => 1),
   scheduleRetry: vi.fn(async () => 1),
@@ -31,8 +40,8 @@ vi.mock('../providers', () => ({
     // has not landed yet" placeholder.
     sms: {
       name: 'sms',
-      templates: { login_otp: 'DLT-1', pending_case: '' },
-      bodies: { login_otp: '{{message}} is your OTP' },
+      templates: { login_otp: 'DLT-1', pending_case: '', blank_body: 'DLT-2' },
+      bodies: { login_otp: '{{message}} is your OTP', blank_body: '' },
       allowRawTemplateId: true,
       schema: { safeParse: () => ({ success: true, data: {} }) },
       send,
@@ -229,5 +238,81 @@ describe('processJob — permanent failures', () => {
     await processJob(job());
 
     expect(queue.scheduleRetry).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('processJob — a blank body is a config gap, not a caller opening', () => {
+  // The security case: `bodies` declares that THIS service owns the template's
+  // text. If a declared-but-blank body fell back to the caller's `body`, any
+  // caller could put arbitrary text on the wire under a DLT-approved template
+  // id — a compliance break and a phishing primitive in one.
+  it('dead-letters rather than letting a caller body ride a named template', async () => {
+    await processJob(job({ channel: 'sms', template_id: 'blank_body', body: 'CLAIM YOUR PRIZE' }));
+
+    expect(send).not.toHaveBeenCalled();
+    expect(queue.pushDLQ).toHaveBeenCalledTimes(1);
+  });
+
+  it('records why the job was dead-lettered', async () => {
+    await processJob(job({ channel: 'sms', template_id: 'blank_body', body: 'x' }));
+
+    expect(incr).toHaveBeenCalledWith(
+      'ns_job_dlq_total',
+      expect.objectContaining({ reason: 'template_not_configured' })
+    );
+  });
+});
+
+describe('processJob — DLQ paths are observable', () => {
+  it.each([
+    ['unknown channel', { channel: 'carrier-pigeon' }, 'unknown_channel'],
+    ['unknown template', { template_id: 'no-such-template' }, 'unknown_template'],
+  ])('counts a %s dead-letter', async (_label, over, reason) => {
+    await processJob(job(over));
+
+    expect(incr).toHaveBeenCalledWith('ns_job_dlq_total', expect.objectContaining({ reason }));
+  });
+
+  it('counts a permanent-failure dead-letter', async () => {
+    send.mockResolvedValue({ ok: false, retryable: false });
+
+    await processJob(job());
+
+    expect(incr).toHaveBeenCalledWith(
+      'ns_job_dlq_total',
+      expect.objectContaining({ reason: 'permanent_failure' })
+    );
+  });
+
+  it('counts a max-retries dead-letter', async () => {
+    send.mockResolvedValue({ ok: false });
+
+    await processJob(job({ attempt: 4 }));
+
+    expect(incr).toHaveBeenCalledWith(
+      'ns_job_dlq_total',
+      expect.objectContaining({ reason: 'max_retries' })
+    );
+  });
+});
+
+describe('processJob — a provider that throws must not lose the job', () => {
+  it('retries instead of dropping the notification', async () => {
+    // The job is already popped and not yet in the DLQ, so an escaping throw
+    // would lose it with no record anywhere.
+    send.mockRejectedValue(new Error('boom'));
+
+    await processJob(job());
+
+    expect(queue.scheduleRetry).toHaveBeenCalledTimes(1);
+    expect(queue.pushDLQ).not.toHaveBeenCalled();
+  });
+
+  it('still dead-letters a thrower once the ladder is exhausted', async () => {
+    send.mockRejectedValue(new Error('boom'));
+
+    await processJob(job({ attempt: 4 }));
+
+    expect(queue.pushDLQ).toHaveBeenCalledTimes(1);
   });
 });

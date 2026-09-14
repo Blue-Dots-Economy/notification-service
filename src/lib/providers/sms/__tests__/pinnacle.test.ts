@@ -3,13 +3,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // `../../metrics` opens a Redis connection on import, which would keep the test
 // process alive. The assertions here are about the request Pinnacle receives and
 // how its answer is classified, not about counters.
-vi.mock('../../../metrics', () => ({
+// `vi.hoisted` because `vi.mock` is hoisted above ordinary top-level consts.
+const { incr, setGauge } = vi.hoisted(() => ({
   incr: vi.fn(async () => {}),
   setGauge: vi.fn(async () => {}),
+}));
+vi.mock('../../../metrics', () => ({
+  incr,
+  setGauge,
   renderPrometheus: vi.fn(async () => ''),
 }));
 
-import { loadPinnacleConfig, pollPinnacleBalance, sendSmsWithPinnacle } from '../pinnacle';
+import { errorCodeLabel, loadPinnacleConfig, pollPinnacleBalance, sendSmsWithPinnacle } from '../pinnacle';
 
 const ENV = {
   PINNACLE_API_KEY: 'key-123',
@@ -56,6 +61,7 @@ function send(over: SendOverrides = {}) {
 }
 
 describe('pinnacle SMS provider', () => {
+  beforeEach(() => vi.clearAllMocks());
   afterEach(() => vi.unstubAllGlobals());
 
   describe('request shape', () => {
@@ -186,40 +192,51 @@ describe('pinnacle SMS provider', () => {
       expect(res.error).toMatch(/EC1013/);
     });
 
-    it('does not retry an invalid template id', async () => {
-      mockFetch({ code: 'EC1013', status: 'error' });
+    // Every documented code, so a change to the classification cannot pass by
+    // being tested on three of thirty-odd. The two transient codes are the
+    // vendor's only documented retryables; everything else is a refusal that
+    // will be refused identically four more times.
+    const TRANSIENT = ['EC1009', 'EC1010'];
+    const PERMANENT = [
+      'EC1000', 'EC1001', 'EC1002', 'EC1003', 'EC1004', 'EC1005', 'EC1006',
+      'EC1007', 'EC1008', 'EC1011', 'EC1012', 'EC1013', 'EC1014', 'EC1015',
+      'EC1016', 'EC1017', 'EC1019', 'EC1021', 'EC1022', 'EC1023', 'EC1024',
+      'EC1025', 'EC1026', 'EC1027', 'EC1028', 'EC1029', 'EC1030', 'EC1031',
+      'EC1032', 'EC1033', 'EC1034', 'EC1035', 'EC1036', 'EC1037', 'EC1038',
+      'EC1039',
+    ];
+
+    it.each(PERMANENT)('does not retry %s', async (code) => {
+      mockFetch({ code, status: 'error' });
       expect((await send()).retryable).toBe(false);
     });
 
-    it('does not retry insufficient balance', async () => {
-      mockFetch({ code: 'EC1003', status: 'error' });
-      expect((await send()).retryable).toBe(false);
-    });
-
-    it('does not retry an invalid sender id', async () => {
-      mockFetch({ code: 'EC1004', status: 'error' });
-      expect((await send()).retryable).toBe(false);
-    });
-
-    it('retries the documented transient codes', async () => {
-      for (const code of ['EC1009', 'EC1010']) {
-        mockFetch({ code, status: 'error' });
-        expect((await send()).retryable, code).not.toBe(false);
-        vi.unstubAllGlobals();
-      }
-    });
-
-    it('retries an unrecognised code — unknown may be transient', async () => {
-      mockFetch({ code: 'EC9999', status: 'error' });
-      expect((await send()).retryable).not.toBe(false);
-    });
-
-    it('retries a 5xx but not a 4xx', async () => {
-      mockFetch({}, { ok: false, status: 503 });
+    it.each(TRANSIENT)('retries %s', async (code) => {
+      mockFetch({ code, status: 'error' });
       expect((await send()).retryable).toBe(true);
-      vi.unstubAllGlobals();
-      mockFetch({}, { ok: false, status: 401 });
+    });
+
+    it('does not retry an unrecognised code — a refusal is a refusal', async () => {
+      // Classification is an allowlist of retryables, so an EC code absent from
+      // the vendor table fails closed. Transient conditions arrive as HTTP
+      // 5xx/408/429 or a socket error, never as an EC code.
+      mockFetch({ code: 'EC9999', status: 'error' });
       expect((await send()).retryable).toBe(false);
+    });
+
+    it.each([
+      [503, true],
+      [500, true],
+      // 408 and 429 are about timing, not content, and both retried before this
+      // classification existed. Dead-lettering a rate-limited OTP on its first
+      // attempt turns a brief burst into failed logins.
+      [408, true],
+      [429, true],
+      [401, false],
+      [400, false],
+    ])('HTTP %i retryable=%s', async (status, retryable) => {
+      mockFetch({}, { ok: false, status });
+      expect((await send()).retryable).toBe(retryable);
     });
 
     it('retries a network failure', async () => {
@@ -230,15 +247,117 @@ describe('pinnacle SMS provider', () => {
     });
   });
 
-  describe('balance polling', () => {
-    it('reads the balance from the vendor payload', async () => {
-      mockFetch({ code: 200, status: 'Success', data: { balance: 10000 } });
-      expect(await pollPinnacleBalance(ENV)).toBe(10000);
+  describe('malformed vendor responses', () => {
+    // The whole reason this adapter exists is that Pinnacle answers 200 for
+    // business errors, so the shapes it can return under 200 are the ones that
+    // matter most and were previously unreachable in tests.
+    it('treats a non-JSON body as a retryable bad response, not a network error', async () => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => {
+          throw new SyntaxError('Unexpected token <');
+        },
+        text: async () => '<html>502</html>',
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const res = await send();
+      expect(res.ok).toBe(false);
+      expect(res.retryable).toBe(true);
+      expect(res.error).toMatch(/non-JSON/);
     });
 
-    it('returns null rather than throwing when the vendor is unreachable', async () => {
-      vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('down')));
+    it('treats an empty body as a failure rather than a delivery', async () => {
+      mockFetch(null);
+      expect((await send()).ok).toBe(false);
+    });
+
+    it('accepts success with no code field', async () => {
+      mockFetch({ status: 'success', data: [{ uniqueid: 'u-9' }] });
+      expect((await send()).ok).toBe(true);
+    });
+
+    it('does not let status:success mask an error code', async () => {
+      // A vendor that reports both must not be read as a delivery.
+      mockFetch({ status: 'success', code: 'EC1003' });
+      const res = await send();
+      expect(res.ok).toBe(false);
+      expect(res.retryable).toBe(false);
+    });
+  });
+
+  describe('metrics the alerts depend on', () => {
+    it('counts a successful send', async () => {
+      mockFetch(OK);
+      await send();
+      expect(incr).toHaveBeenCalledWith('ns_sms_send_total', {
+        provider: 'pinnacle',
+        result: 'ok',
+      });
+    });
+
+    it('counts a failure and its vendor code', async () => {
+      mockFetch({ code: 'EC1003', status: 'error' });
+      await send();
+
+      expect(incr).toHaveBeenCalledWith('ns_sms_send_total', {
+        provider: 'pinnacle',
+        result: 'failed',
+      });
+      expect(incr).toHaveBeenCalledWith('ns_sms_provider_error_total', {
+        provider: 'pinnacle',
+        code: 'EC1003',
+      });
+    });
+
+    it('bounds the code label so a vendor string cannot break the scrape', () => {
+      // Prometheus rejects the ENTIRE exposition document on one parse error,
+      // and the encoding's own delimiters would corrupt the series round-trip.
+      expect(errorCodeLabel('EC1003')).toBe('EC1003');
+      expect(errorCodeLabel('HTTP_502')).toBe('HTTP_502');
+      expect(errorCodeLabel('something,weird=here|now')).toBe('OTHER');
+      expect(errorCodeLabel('')).toBe('OTHER');
+      expect(errorCodeLabel('EC99999')).toBe('OTHER');
+    });
+  });
+
+  describe('balance polling', () => {
+    it('publishes the balance and its freshness', async () => {
+      mockFetch({ code: 200, status: 'Success', data: { balance: 10000 } });
+      await pollPinnacleBalance(ENV);
+
+      expect(setGauge).toHaveBeenCalledWith('ns_provider_balance', 10000, {
+        provider: 'pinnacle',
+      });
+      // Freshness alongside the value: the number alone cannot distinguish a
+      // healthy balance from a poller that died an hour ago.
+      expect(setGauge).toHaveBeenCalledWith(
+        'ns_provider_balance_updated_at',
+        expect.any(Number),
+        { provider: 'pinnacle' }
+      );
+    });
+
+    it.each([
+      ['unreachable vendor', () => vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('down'))), 'request_failed'],
+      ['non-2xx', () => mockFetch({}, { ok: false, status: 500 }), 'http_error'],
+      ['unparseable payload', () => mockFetch({ data: { balance: 'lots' } }), 'unparseable'],
+    ])('records a failure counter on %s', async (_label, arrange, reason) => {
+      arrange();
       expect(await pollPinnacleBalance(ENV)).toBeNull();
+
+      expect(incr).toHaveBeenCalledWith('ns_provider_balance_poll_failures_total', {
+        provider: 'pinnacle',
+        reason,
+      });
+    });
+
+    it('does not publish a stale balance when the poll fails', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('down')));
+      await pollPinnacleBalance(ENV);
+
+      expect(setGauge).not.toHaveBeenCalled();
     });
   });
 });

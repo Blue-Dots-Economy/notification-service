@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { ProviderDefinition, ProviderSendResult } from '../../../types/provider';
 import * as metrics from '../../metrics';
+import { isRetryableHttpStatus } from './http_status';
 
 export async function sendSmsWithMsg91(
   to: string,
@@ -55,8 +56,27 @@ export async function sendSmsWithMsg91(
       provider: 'msg91',
       code: `HTTP_${resp.status}`,
     });
-    // 4xx is our request (bad flow id, bad key) and will not improve on retry.
-    return { ok: false, error: `msg91 http ${resp.status}`, retryable: resp.status >= 500 };
+    return {
+      ok: false,
+      error: `msg91 http ${resp.status}`,
+      retryable: isRetryableHttpStatus(resp.status),
+    };
+  }
+
+  // MSG91 answers 200 with `{"type":"error"}` for business rejections, so the
+  // HTTP status alone says nothing — the same trap this adapter's Pinnacle
+  // sibling exists to handle. Treating every 2xx as delivered is what made a
+  // bad flow id look like a successful send on the current production vendor.
+  const payload = await resp.json().catch(() => null);
+  const type = String((payload as { type?: unknown } | null)?.type ?? '').toLowerCase();
+  if (type === 'error') {
+    const detail = String((payload as { message?: unknown } | null)?.message ?? '');
+    console.log(`msg91 error (HTTP 200): ${detail.slice(0, 500)}`);
+    await metrics.incr('ns_sms_send_total', { provider: 'msg91', result: 'failed' });
+    await metrics.incr('ns_sms_provider_error_total', { provider: 'msg91', code: 'BUSINESS' });
+    // The vendor understood the request and refused it; retrying sends the same
+    // rejected payload four more times.
+    return { ok: false, error: `msg91 rejected: ${detail}`, retryable: false };
   }
 
   await metrics.incr('ns_sms_send_total', { provider: 'msg91', result: 'ok' });

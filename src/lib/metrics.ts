@@ -20,11 +20,22 @@ const GAUGES_KEY = 'metrics:gauges';
 
 export type Labels = Record<string, string>;
 
+/**
+ * `|`, `,` and `=` are the field encoding's own delimiters, so a label value
+ * containing one would round-trip through `parseField` as a different series —
+ * or as a malformed name, which makes Prometheus reject the ENTIRE scrape
+ * document, not just that line. Values reaching here come from provider
+ * responses, so they are not ours to trust.
+ */
+function sanitiseLabelValue(value: string): string {
+  return value.replace(/[|,=]/g, '_');
+}
+
 /** `name|k=v,k=v` — label keys sorted so one series has exactly one field. */
 function field(name: string, labels: Labels): string {
   const pairs = Object.keys(labels)
     .sort()
-    .map((k) => `${k}=${labels[k]}`)
+    .map((k) => `${k}=${sanitiseLabelValue(labels[k]!)}`)
     .join(',');
   return pairs ? `${name}|${pairs}` : name;
 }
@@ -77,7 +88,16 @@ function formatSeries(name: string, labels: Labels, value: string | number): str
 const HELP: Record<string, [type: string, help: string]> = {
   ns_sms_send_total: ['counter', 'SMS sends attempted, by provider and outcome.'],
   ns_sms_provider_error_total: ['counter', 'SMS provider error responses, by provider and code.'],
+  ns_job_dlq_total: ['counter', 'Jobs dead-lettered, by channel and reason.'],
   ns_provider_balance: ['gauge', 'Provider account balance, where the provider exposes one.'],
+  ns_provider_balance_updated_at: [
+    'gauge',
+    'Unix time of the last successful balance poll. Alert on staleness: without it a broken poller reports a healthy balance forever.',
+  ],
+  ns_provider_balance_poll_failures_total: [
+    'counter',
+    'Balance polls that failed, by provider and reason.',
+  ],
   ns_queue_depth: ['gauge', 'Jobs currently in each queue.'],
   ns_retry_eta_seconds: ['gauge', 'Seconds until the oldest scheduled retry is due.'],
 };
@@ -97,9 +117,14 @@ export async function renderPrometheus(
   // at the point of use, so a shape change cannot emit a NaN series.
   queue: Record<string, unknown>
 ): Promise<string> {
+  // Deliberately NOT caught. `incr` swallows because it has a send in flight to
+  // protect; this has none. Serving 200 with the counters silently absent looks
+  // to Prometheus like a healthy service with no traffic, which is the one
+  // reading that makes every alert built on these metrics unable to fire.
+  // Failing the scrape is what surfaces as `up == 0`.
   const [counters, gauges] = await Promise.all([
-    redis.hgetall(COUNTERS_KEY).catch(() => ({}) as Record<string, string>),
-    redis.hgetall(GAUGES_KEY).catch(() => ({}) as Record<string, string>),
+    redis.hgetall(COUNTERS_KEY),
+    redis.hgetall(GAUGES_KEY),
   ]);
 
   const byName = new Map<string, string[]>();

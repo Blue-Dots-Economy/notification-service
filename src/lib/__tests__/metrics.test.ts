@@ -93,3 +93,28 @@ describe('queue depths', () => {
     expect(await renderPrometheus(EMPTY_QUEUE)).not.toContain('ns_retry_eta_seconds');
   });
 });
+
+describe('scrape failures are visible', () => {
+  it('propagates a Redis read failure instead of serving an empty scrape', async () => {
+    // Serving 200 with the counters silently absent reads to Prometheus as a
+    // healthy service with no traffic — the one interpretation under which none
+    // of the alerts built on these metrics can fire. Failing surfaces as up==0.
+    const boom = vi.spyOn(redis, 'hgetall').mockRejectedValueOnce(new Error('down'));
+
+    await expect(renderPrometheus(EMPTY_QUEUE)).rejects.toThrow();
+    boom.mockRestore();
+  });
+});
+
+describe('label values cannot corrupt the exposition', () => {
+  it('neutralises the encoding delimiters', async () => {
+    // `|`, `,` and `=` delimit the Redis field encoding, so a vendor string
+    // containing one would round-trip as a different series — or as a malformed
+    // name, which makes Prometheus reject the whole document.
+    await incr('ns_sms_send_total', { provider: 'a|b,c=d', result: 'ok' });
+
+    const out = await renderPrometheus(EMPTY_QUEUE);
+    expect(out).toContain('provider="a_b_c_d"');
+    expect(out.split('\n').filter((l) => l.startsWith('ns_sms_send_total'))).toHaveLength(1);
+  });
+});
