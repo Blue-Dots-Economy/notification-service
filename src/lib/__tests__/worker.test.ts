@@ -4,6 +4,15 @@ import type { Job } from 'src/types';
 // The queue is mocked rather than faked here: these tests are about which queue
 // call processJob makes and with what delay, not about Redis behaviour (that is
 // queue.test.ts's job).
+// `../metrics` opens a Redis connection on import, which would keep the test
+// process alive. The DLQ counters it records are asserted via this mock.
+const { incr } = vi.hoisted(() => ({ incr: vi.fn(async () => {}) }));
+vi.mock('../metrics', () => ({
+  incr,
+  setGauge: vi.fn(async () => {}),
+  renderPrometheus: vi.fn(async () => ''),
+}));
+
 vi.mock('../queue', () => ({
   pushDLQ: vi.fn(async () => 1),
   scheduleRetry: vi.fn(async () => 1),
@@ -15,12 +24,25 @@ vi.mock('../queue', () => ({
 // ../providers auto-discovers by reading the directory and `require`-ing each
 // index.js, which only exists in compiled output — so it has to be mocked to be
 // importable from source at all, quite apart from controlling send() outcomes.
-const send = vi.fn(async () => ({ ok: true }) as { ok: boolean; error?: string });
+const send = vi.fn(
+  async () => ({ ok: true }) as { ok: boolean; error?: string; retryable?: boolean }
+);
 vi.mock('../providers', () => ({
   providers: {
     email: {
       name: 'email',
       templates: { welcome: 'provider-template-123' },
+      schema: { safeParse: () => ({ success: true, data: {} }) },
+      send,
+    },
+    // Mirrors the SMS shape: raw ids pass through, one named template carries a
+    // provider-owned body, and a named template with no id is the "DLT approval
+    // has not landed yet" placeholder.
+    sms: {
+      name: 'sms',
+      templates: { login_otp: 'DLT-1', pending_case: '', blank_body: 'DLT-2' },
+      bodies: { login_otp: '{{message}} is your OTP', blank_body: '' },
+      allowRawTemplateId: true,
       schema: { safeParse: () => ({ success: true, data: {} }) },
       send,
     },
@@ -53,6 +75,8 @@ describe('processJob — routing', () => {
       to: 'someone@example.com',
       template_id: 'provider-template-123',
       variables: {},
+      body: undefined,
+      job_id: 'job-1',
     });
   });
 
@@ -157,6 +181,138 @@ describe('processJob — backoff ladder on failure', () => {
         (c) => c[1],
       ),
     ).toEqual([5, 10, 20, 40]);
+    expect(queue.pushDLQ).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('processJob — body resolution (providers that cannot render)', () => {
+  it('prefers the body the provider owns for a template it names', async () => {
+    await processJob(job({ channel: 'sms', template_id: 'login_otp', body: 'caller text' }));
+
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({ template_id: 'DLT-1', body: '{{message}} is your OTP' })
+    );
+  });
+
+  it('falls back to the caller body for a raw pass-through id', async () => {
+    await processJob(job({ channel: 'sms', template_id: 'RAW-DLT-9', body: 'caller text' }));
+
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({ template_id: 'RAW-DLT-9', body: 'caller text' })
+    );
+  });
+
+  it('dead-letters a named template whose id is not configured yet', async () => {
+    await processJob(job({ channel: 'sms', template_id: 'pending_case' }));
+
+    expect(send).not.toHaveBeenCalled();
+    expect(queue.pushDLQ).toHaveBeenCalledTimes(1);
+    // Must not leak through as a raw id: the vendor would answer with a generic
+    // "invalid template" and hide that this is simply unapproved copy.
+    expect(queue.scheduleRetry).not.toHaveBeenCalled();
+  });
+});
+
+describe('processJob — permanent failures', () => {
+  it('dead-letters immediately when the provider says the failure is permanent', async () => {
+    send.mockResolvedValue({ ok: false, error: 'pinnacle EC1013', retryable: false });
+
+    await processJob(job());
+
+    expect(queue.pushDLQ).toHaveBeenCalledTimes(1);
+    expect(queue.scheduleRetry).not.toHaveBeenCalled();
+  });
+
+  it('still retries a failure that is not marked permanent', async () => {
+    send.mockResolvedValue({ ok: false, error: 'timeout', retryable: true });
+
+    await processJob(job());
+
+    expect(queue.scheduleRetry).toHaveBeenCalledTimes(1);
+    expect(queue.pushDLQ).not.toHaveBeenCalled();
+  });
+
+  it('keeps retrying when the provider expresses no opinion (back-compat)', async () => {
+    send.mockResolvedValue({ ok: false });
+
+    await processJob(job());
+
+    expect(queue.scheduleRetry).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('processJob — a blank body is a config gap, not a caller opening', () => {
+  // The security case: `bodies` declares that THIS service owns the template's
+  // text. If a declared-but-blank body fell back to the caller's `body`, any
+  // caller could put arbitrary text on the wire under a DLT-approved template
+  // id — a compliance break and a phishing primitive in one.
+  it('dead-letters rather than letting a caller body ride a named template', async () => {
+    await processJob(job({ channel: 'sms', template_id: 'blank_body', body: 'CLAIM YOUR PRIZE' }));
+
+    expect(send).not.toHaveBeenCalled();
+    expect(queue.pushDLQ).toHaveBeenCalledTimes(1);
+  });
+
+  it('records why the job was dead-lettered', async () => {
+    await processJob(job({ channel: 'sms', template_id: 'blank_body', body: 'x' }));
+
+    expect(incr).toHaveBeenCalledWith(
+      'ns_job_dlq_total',
+      expect.objectContaining({ reason: 'template_not_configured' })
+    );
+  });
+});
+
+describe('processJob — DLQ paths are observable', () => {
+  it.each([
+    ['unknown channel', { channel: 'carrier-pigeon' }, 'unknown_channel'],
+    ['unknown template', { template_id: 'no-such-template' }, 'unknown_template'],
+  ])('counts a %s dead-letter', async (_label, over, reason) => {
+    await processJob(job(over));
+
+    expect(incr).toHaveBeenCalledWith('ns_job_dlq_total', expect.objectContaining({ reason }));
+  });
+
+  it('counts a permanent-failure dead-letter', async () => {
+    send.mockResolvedValue({ ok: false, retryable: false });
+
+    await processJob(job());
+
+    expect(incr).toHaveBeenCalledWith(
+      'ns_job_dlq_total',
+      expect.objectContaining({ reason: 'permanent_failure' })
+    );
+  });
+
+  it('counts a max-retries dead-letter', async () => {
+    send.mockResolvedValue({ ok: false });
+
+    await processJob(job({ attempt: 4 }));
+
+    expect(incr).toHaveBeenCalledWith(
+      'ns_job_dlq_total',
+      expect.objectContaining({ reason: 'max_retries' })
+    );
+  });
+});
+
+describe('processJob — a provider that throws must not lose the job', () => {
+  it('retries instead of dropping the notification', async () => {
+    // The job is already popped and not yet in the DLQ, so an escaping throw
+    // would lose it with no record anywhere.
+    send.mockRejectedValue(new Error('boom'));
+
+    await processJob(job());
+
+    expect(queue.scheduleRetry).toHaveBeenCalledTimes(1);
+    expect(queue.pushDLQ).not.toHaveBeenCalled();
+  });
+
+  it('still dead-letters a thrower once the ladder is exhausted', async () => {
+    send.mockRejectedValue(new Error('boom'));
+
+    await processJob(job({ attempt: 4 }));
+
     expect(queue.pushDLQ).toHaveBeenCalledTimes(1);
   });
 });
