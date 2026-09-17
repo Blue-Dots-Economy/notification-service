@@ -1,0 +1,61 @@
+/**
+ * Body rendering for SMS providers that do NOT render server-side.
+ *
+ * MSG91's Flow API takes a flow id plus named variables and renders the
+ * DLT-approved text itself. Pinnacle does not: it takes final text and attaches
+ * DLT ids for the operator to match on. So for Pinnacle someone has to
+ * substitute the variables, and that someone is here.
+ */
+
+const TOKEN = /\{\{(\w+)\}\}/g;
+
+export class UnresolvedTemplateVariables extends Error {
+  constructor(public readonly missing: string[]) {
+    super(`unresolved template variables: ${missing.join(', ')}`);
+    this.name = 'UnresolvedTemplateVariables';
+  }
+}
+
+/**
+ * Substitute `{{token}}` placeholders in `body` from `variables`.
+ *
+ * Throws on any token with no value rather than leaving it in place. The
+ * lenient behaviour is right for the dev-preview log this mirrors in
+ * signalstack, and wrong here: an unsubstituted `{{name}}` would be delivered
+ * to a handset verbatim, and would also no longer match the DLT-approved text
+ * the operator checks against.
+ */
+export function renderBody(body: string, variables: Record<string, unknown>): string {
+  const missing: string[] = [];
+
+  const out = body.replace(TOKEN, (_match, name: string) => {
+    const value = variables?.[name];
+    if (value === undefined || value === null || value === '') {
+      missing.push(name);
+      return '';
+    }
+    return String(value);
+  });
+
+  if (missing.length) throw new UnresolvedTemplateVariables([...new Set(missing)]);
+  return out;
+}
+
+/**
+ * Pinnacle's `messagetype`: `TXT` for Latin-1 text, `UNI` for anything else.
+ * Getting this wrong does not fail the send — it garbles the message on the
+ * handset — and these deployments carry Hindi copy, so it is detected from the
+ * text rather than configured.
+ *
+ * Written with `\u` escapes rather than literal characters on purpose: a raw
+ * high byte here makes the whole file non-UTF-8 to git, which silently turns
+ * the one module deciding what text reaches a handset into an unreviewable
+ * binary blob in every diff.
+ */
+export function messageType(text: string): 'TXT' | 'UNI' {
+  // eslint-disable-next-line no-control-regex
+  return /[^\u0000-\u00ff]/.test(text) ? 'UNI' : 'TXT';
+}
+
+/** Per-message character ceiling Pinnacle documents, by message type. */
+export const MAX_LENGTH: Record<'TXT' | 'UNI', number> = { TXT: 2000, UNI: 750 };

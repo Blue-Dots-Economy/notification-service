@@ -18,6 +18,12 @@ export class RedisFake {
   lists = new Map<string, string[]>();
   zsets = new Map<string, ZEntry[]>();
   strings = new Map<string, { value: string; expiresAt?: number }>();
+  hashes = new Map<string, Map<string, string>>();
+
+  private hash(key: string): Map<string, string> {
+    if (!this.hashes.has(key)) this.hashes.set(key, new Map());
+    return this.hashes.get(key)!;
+  }
 
   private list(key: string): string[] {
     if (!this.lists.has(key)) this.lists.set(key, []);
@@ -160,6 +166,34 @@ export class RedisFake {
       z.filter((e) => !due.includes(e.member)),
     );
     return due;
+  }
+
+  /** HINCRBY — creates the field at 0 first. Returns the new value, as ioredis does. */
+  async hincrby(key: string, field: string, by: number): Promise<number> {
+    const h = this.hash(key);
+    const next = Number(h.get(field) ?? 0) + by;
+    h.set(field, String(next));
+    return next;
+  }
+
+  async hset(key: string, field: string, value: string): Promise<number> {
+    const h = this.hash(key);
+    const isNew = h.has(field) ? 0 : 1;
+    h.set(field, value);
+    return isNew;
+  }
+
+  /** HGETALL — ioredis returns a plain object, and `{}` for a missing key. */
+  async hgetall(key: string): Promise<Record<string, string>> {
+    return Object.fromEntries(this.hash(key));
+  }
+
+  async flushall(): Promise<'OK'> {
+    this.lists.clear();
+    this.zsets.clear();
+    this.strings.clear();
+    this.hashes.clear();
+    return 'OK';
   }
 
   /** MULTI — queues calls, then `exec()` resolves to ioredis's [err, result] pairs. */

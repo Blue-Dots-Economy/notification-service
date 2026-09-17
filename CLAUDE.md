@@ -110,6 +110,55 @@ z.string())` — an open map of named string variables (the DLT template's
 placeholders), rather than a fixed `z.object`. This carries the multi-variable
 flow (`name`, `link`, …) through to MSG91 as per-recipient vars.
 
+**Two SMS vendors, selected by `SMS_PROVIDER` (`msg91` default, or `pinnacle`).**
+`src/lib/providers/sms/index.ts` picks one at boot and throws on an unknown name
+rather than falling back — silently sending through the wrong vendor would use
+the wrong sender id and DLT entity. Both definitions declare `name: 'sms'`, so
+the channel key, the rate-limit key and every caller are identical either way.
+
+The two vendors are **not** the same shape, and this is the thing to understand
+before touching either file:
+
+| | MSG91 Flow | Pinnacle JSON |
+|---|---|---|
+| What you send | flow id + named variables | fully **rendered `text`** |
+| Who renders the body | **MSG91**, from the DLT template | **nobody** — you supply final text |
+| DLT metadata | hidden inside the flow | explicit `dltentityid` / `dlttempid` / `sender` |
+| `template_id` means | an MSG91-internal flow id | the **DLT template id itself** |
+| Errors | HTTP status | HTTP 200 + `code: EC1xxx` in the body |
+
+**`bodies` (provider-owned message text).** Because Pinnacle renders nothing,
+`ProviderDefinition.bodies` maps the same public keys as `templates` to their
+body text, and the worker resolves `provider.bodies[key] ?? job.body`. So a
+template the provider **names** (`login_otp`) carries its own body and needs no
+caller change — which is why the OTP callers (Keycloak, Signals guardian OTP)
+were untouched by the Pinnacle work. A **raw pass-through** id has no entry, so
+its body must come from the caller's optional `body` field on `/notify`.
+
+**`??`, never `||` — this one is load-bearing.** A *declared but blank* body
+(`bodies: { login_otp: '' }`, the state while a DLT approval is pending) is
+dead-lettered alongside a blank template id, and must never fall through to the
+caller's `body`. With `||` it did, which let any caller put arbitrary text on the
+wire under a DLT-approved template id: a compliance break and a phishing
+primitive in one. Declaring a template is this service claiming its text;
+blank means unconfigured, not "caller may supply it".
+
+The body must be **byte-identical to the DLT-approved text**. The operator
+matches on it; drift is scrubbed downstream rather than rejected upfront, so it
+fails silently. `src/lib/providers/sms/render.ts` substitutes `{{token}}` and
+**throws** on any unresolved or empty variable — the lenient behaviour that is
+right for signalstack's dev-preview log would put a literal `{{name}}` on a
+handset here.
+
+**`retryable` on the send result.** The worker's default is to retry every
+failure up to `MAX_RETRIES`, which is right for a timeout and wrong for "that
+template id does not exist". A provider that can tell the difference returns
+`retryable: false` and the worker dead-letters on the first attempt, so a
+permanent misconfiguration is diagnosable instead of buried under "max retries
+reached". Pinnacle classifies its `EC1xxx` codes this way — `EC1003`
+(insufficient balance), `EC1013` (invalid template), `EC1004` (invalid sender)
+are permanent; `EC1009`/`EC1010` and unrecognised codes still retry.
+
 ### Request Deduplication
 
 `/notify` deduplicates by a Redis `SET NX` key with a per-mode TTL (windows are
@@ -135,11 +184,13 @@ See README for the full request/response contract.
 - `docs.ts` — Scalar API reference and OpenAPI JSON
 - `notify.ts` — Enqueue notification endpoint
 - `providers.ts` — Provider discovery endpoints
-- `metrics.ts` — Queue metrics endpoint
+- `metrics.ts` — Queue metrics endpoint (HMAC-authed JSON) **and** `/metrics`,
+  the unauthenticated Prometheus scrape endpoint
 - `retry.ts` — Manual DLQ retry endpoint
 
 **Library** (`src/lib/`):
 - `queue.ts` — Redis queue and retry helpers
+- `metrics.ts` — Redis-backed Prometheus counters/gauges (see below)
 - `worker.ts` — Background job processor loop
 - `auth/secrets.ts` — Load signing secrets from the JSON file at `INTERNAL_SECRETS_JSON`
 - `providers/` — Provider implementations (auto-loaded)
@@ -181,7 +232,14 @@ Required for providers (varies by implementation):
   `SMTP_USER` unless `SMTP_FROM` says otherwise. Resolution lives in
   `src/lib/providers/email/sendMailCore.ts`; the README table is the
   operator-facing version.
+- `SMS_PROVIDER` — `msg91` (default) or `pinnacle`. Unknown values throw at boot.
 - `MSG91_AUTH_KEY` for SMS (MSG91 Flow API)
+- Pinnacle (`SMS_PROVIDER=pinnacle` only): `PINNACLE_API_KEY`,
+  `PINNACLE_SENDER_ID`, `PINNACLE_DLT_ENTITY_ID` are required; the send fails
+  **permanently** (no retries) if any is missing. `PINNACLE_DLT_HEADER_ID`,
+  `PINNACLE_DLT_TAG_ID`, `PINNACLE_TMID` are optional and omitted when unset.
+  `PINNACLE_LOGIN_OTP_TEMPLATE_ID` + `SMS_LOGIN_OTP_BODY` configure the one
+  named template; a blank id dead-letters with "named but not configured".
 - `SMS_LOGIN_OTP_TEMPLATE_ID` — MSG91 flow id for the legacy `login_otp` template.
   Read in `src/lib/providers/sms/msg91.ts`; optional, with a back-compat default of
   the previously-hardcoded id. Per-event DLT flow ids are sent raw and need no env
@@ -204,8 +262,9 @@ was fixed (#46).
   `require` condition, and `job_id` generation now uses `randomUUID` from `node:crypto`
   instead. Keep this setting; do not "simplify" it back to `moduleResolution: Node`.
 - **Path alias:** `src/*` → `./src/*`, declared without `baseUrl` (removed in TS 7). The
-  alias is load-bearing — `lib/worker.ts`, `lib/queue.ts` and `lib/providers/sms/gupshup.ts`
-  import through it.
+  alias is load-bearing — `lib/worker.ts` and `lib/queue.ts` import through it.
+  (`lib/providers/sms/gupshup.ts` also did, but it was a never-exported stub and
+  was deleted with the Pinnacle work.)
 - **Type roots:** `./node_modules/@types` only. There is no `src/types/fastify.d.ts` in this
   repo; `typeRoots` takes directories, and the old entry pointed at a file that never existed.
 - **Tests are excluded from the build** (`**/*.test.ts`, `src/**/__tests__/**`). They sit
@@ -215,8 +274,14 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 3, 33 tests across `queue` (17), `request-auth` (11) and `dedupe` (5). The whole suite
-runs in ~200ms because Redis is a **fake**, not a container.
+vitest 3, 164 tests across 13 files. The whole suite runs in well under a second because Redis
+is a **fake**, not a container.
+
+**Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
+connection on import and keeps the test process alive until vitest times out. `vi.mock` resolves
+its path relative to the *test* file, so from `src/lib/providers/sms/__tests__/` the mock target
+is `'../../../metrics'` — a wrong depth silently mocks nothing and every test in the file hangs
+for the full 5s timeout.
 
 `src/lib/__tests__/redis-fake.ts` implements only the commands this service uses, with
 ioredis's exact return shapes — the ones easy to get wrong: `set(..., 'NX')` → `'OK' | null`,
@@ -241,7 +306,55 @@ every retry sent eight times.
 
 **Deliberately not covered yet:**
 - `mainLoop`'s priority ordering (realtime → due retries → other) — it is an infinite loop.
-- Provider implementations (real SES/Twilio calls).
+- Provider implementations against the real vendors (SES/Twilio/MSG91/Pinnacle network calls).
+  The SMS adapters are covered at the request/response boundary with `fetch` stubbed.
+
+## Observability
+
+`GET /metrics` serves Prometheus text exposition. It is the **only unauthenticated route**,
+because Prometheus cannot produce this service's HMAC signature; that is acceptable only
+because the exposition carries counts and queue depths — never recipients, variables or message
+content. Keep it that way.
+
+Counters live in **Redis**, not process memory, because the worker that performs every send runs
+in a *separate process* from the API server that answers the scrape (`src/server.ts` forks it).
+An in-process registry would expose an API process that has sent nothing. Queue depths are read
+live at scrape time rather than counted, so they cannot drift.
+
+| Metric | Type | Labels |
+|---|---|---|
+| `ns_sms_send_total` | counter | `provider`, `result` (`ok`/`failed`) |
+| `ns_sms_provider_error_total` | counter | `provider`, `code` (`EC1003`, `HTTP_502`, `OTHER`) |
+| `ns_job_dlq_total` | counter | `channel`, `reason` |
+| `ns_provider_balance` | gauge | `provider` |
+| `ns_provider_balance_updated_at` | gauge | `provider` |
+| `ns_provider_balance_poll_failures_total` | counter | `provider`, `reason` |
+| `ns_queue_depth` | gauge | `queue` (`realtime`/`other`/`retry_count`/`dlq`) |
+| `ns_retry_eta_seconds` | gauge | — |
+
+Two constraints on this exposition that are easy to undo:
+
+- **Label values are sanitised and error codes are allowlisted** (`EC1\d{3}` /
+  `HTTP_\d{3}`, else `OTHER`). `|`, `,` and `=` delimit the Redis field
+  encoding, so an unsanitised vendor string round-trips as a different series —
+  or as a malformed name, and Prometheus rejects the **entire** scrape document
+  on one parse error. Codes come from vendor responses, so they are also an
+  unbounded-cardinality source into a hash with no TTL.
+- **`renderPrometheus` does not catch its Redis reads.** `incr` swallows because
+  it has a send in flight to protect; the scrape has none. Serving 200 with the
+  counters absent looks like a healthy service with no traffic, which is exactly
+  the reading under which no alert can fire. Let it fail and surface as `up==0`.
+
+`ns_provider_balance` exists because `EC1003 Insufficient Balance` is otherwise a silent
+killer: every send fails permanently and looks exactly like a bad template id from the outside.
+The worker polls Pinnacle's `/checkbalance` on `BALANCE_POLL_INTERVAL_MS` (default 15 min) and
+only when `SMS_PROVIDER=pinnacle`. Metric **writes** are best-effort and swallow their errors —
+a Redis hiccup while recording a send must never turn a delivered message into a retry.
+
+The balance gauge ships with `ns_provider_balance_updated_at` and a failure counter because the
+value alone cannot distinguish a healthy balance from a poller that died an hour ago, and the
+gauge has no TTL — a silent poller would report the last healthy number forever while every send
+dead-letters on EC1003. **Alert on staleness, not just on the number.**
 
 ## Known Issues
 
