@@ -431,6 +431,34 @@ SMS:
 
 ### SMS Templates & Variables
 
+**Two SMS vendors, selected per deployment by `SMS_PROVIDER`** — `msg91`
+(default) or `pinnacle` (#132). One is picked at boot and an unknown name throws
+rather than falling back, because sending through the wrong vendor would use the
+wrong sender id and DLT entity. Both declare `name: 'sms'`, so the channel key,
+the rate-limit key and every caller are identical either way.
+
+The two are not the same shape, and it changes what a `/notify` call must carry:
+
+| | MSG91 Flow | Pinnacle JSON |
+| --- | --- | --- |
+| What is sent | flow id + named variables | fully **rendered** message text |
+| Who renders the body | **MSG91**, from the DLT template | **nobody** — the text is supplied |
+| DLT metadata | hidden inside the flow | explicit `dltentityid` / `dlttempid` / `sender` |
+| `template_id` means | an MSG91-internal flow id | the **DLT template id itself** |
+| Errors | HTTP status | HTTP 200 with `code: EC1xxx` in the body |
+
+Because Pinnacle renders nothing, a provider definition also carries `bodies` —
+the same public keys as `templates`, mapped to their message text — and the
+worker resolves `provider.bodies[key] ?? job.body`. So a **named** template
+(`login_otp`) carries its own body and needs no caller change; the existing OTP
+callers were untouched by the Pinnacle work. A **raw pass-through** id has no
+entry, so under Pinnacle its body must come from the caller's optional `body`
+field on `/notify`. See `example.env` for the `PINNACLE_*` keys (three are
+required when `SMS_PROVIDER=pinnacle`, and a missing one fails the send
+permanently rather than retrying).
+
+The rest of this section describes the MSG91 path, which is the default.
+
 SMS is delivered through the MSG91 Flow API and accepts **raw provider-side
 template ids** (#86/#532/#535). Two ways to pass `template_id`:
 
