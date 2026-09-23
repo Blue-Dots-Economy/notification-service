@@ -1,12 +1,16 @@
 name: CI
 
-# This repo had no CI at all: the only workflow was the GHCR image build, which
-# runs on push to main (and a 'feature/**' glob that never matches the branch
-# literally named `feature`). Nothing validated a pull request, which is how a
-# tsconfig incompatible with TypeScript 7 reached main and broke the image build.
+# This repo had no CI at all: the only workflow was the GHCR image build, and
+# nothing validated a pull request, which is how a tsconfig incompatible with
+# TypeScript 7 reached main and broke the image build. That makes this workflow
+# the only thing standing between a bad commit and a broken release build, since
+# #756 left the image build with no branch or PR trigger at all.
+#
+# No `feature` push (#756): PRs into feature already run CI against the merge
+# commit, so the second post-merge run was a duplicate.
 on:
   push:
-    branches: [main, develop, feature]
+    branches: [main, develop]
   pull_request:
     branches: [main, develop, feature]
   workflow_dispatch:
@@ -81,3 +85,68 @@ jobs:
           REDIS_HOST: 127.0.0.1
           REDIS_PORT: 6379
           REDIS_PASSWORD: ''
+
+  # ── PR-path image smoke build (#756) ───────────────────────────────────────
+  # Restores the review-time Dockerfile check that notification-image-build.yaml
+  # used to provide on the PR path before #756 made it tag-and-manual only. That
+  # trigger built without pushing; this does the same.
+  #
+  # This repo needs it more than most: the two Docker gotchas in CLAUDE.md — a
+  # missing `COPY pnpm-workspace.yaml` failing with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH,
+  # and a global pnpm version drift breaking the build with no change on our side —
+  # both broke the image in ways the test suite could not see, and both are exactly
+  # what a PR-path build catches.
+  #
+  # BUILD ONLY — it does not boot the image. loadSecrets() throws unless
+  # INTERNAL_SECRETS_JSON points at a real file, and /metrics (the only
+  # unauthenticated route) reads Redis and deliberately does not catch its
+  # errors, so a boot probe would need a secrets fixture and a Redis service.
+  # Worth doing later; out of scope for restoring the check that was removed.
+  smoke-image:
+    name: smoke-image (PR-path Dockerfile build)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    # Job-level so the step `if:`s below can read it — the `secrets` context is
+    # not available in a step conditional, and a step's own `env:` is not in
+    # scope for its own `if:`.
+    env:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # The DHI bases live on dhi.io, which refuses anonymous pulls, so the build
+      # cannot reach the first FROM without this. GitHub withholds repo secrets
+      # from fork and Dependabot-raised pull_request runs, which is why the steps
+      # are gated on the token rather than failing: an ungated build would turn
+      # every dependency-bump PR red for a missing credential, not a real defect.
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        if: env.DOCKERHUB_TOKEN != ''
+        with:
+          registry: dhi.io
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # linux/amd64 only: this proves the Dockerfile builds, and the arm64 leg is
+      # exercised on the release path. A second architecture here would roughly
+      # double PR build time for no extra signal about the Dockerfile itself.
+      - name: Build the image (no push)
+        if: env.DOCKERHUB_TOKEN != ''
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          tags: notification-service:pr
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Explain the skip
+        if: env.DOCKERHUB_TOKEN == ''
+        run: |
+          echo "::warning::smoke-image skipped: no dhi.io credential on this run \
+          (fork or Dependabot PR). The image build is still covered on the \
+          release-tag path in notification-image-build.yaml."

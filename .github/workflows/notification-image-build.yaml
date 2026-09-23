@@ -1,14 +1,12 @@
 name: Build and Push Image to GHCR
 
 on:
+  # Release tags and manual runs ONLY (#756). The previous `push: branches:
+  # [main, feature]` published a mutable `:main` / `:feature` tag on every merge;
+  # nothing consumed them (deployments pin a release tag or an immutable sha- tag
+  # in bluedots-automation's global-images.yaml). The `pull_request` build-without-
+  # publish trigger is gone with them.
   push:
-    branches:
-      - main
-      # `feature`, not 'feature/**'. The glob requires a slash, so it never
-      # matched the integration branch every PR targets — across the last 20 runs
-      # this workflow had only ever run on main and a few test/* branches. The
-      # branch tag from docker/metadata-action is therefore `:feature`.
-      - feature
     tags:
       # Release tags only (was '**', which published an image on EVERY tag).
       # Matches the fleet standard (signals-dpg#570, aggregator-dpg#641,
@@ -18,26 +16,10 @@ on:
       #   20*-s*-rc*  sprint release    e.g. 202608-s1-rc1
       #               <YYYYMM>-s<sprint>-rc<candidate>. A fix for an issue found
       #               in -rc1 ships as -rc2, so every candidate is its own image.
-      #               Supersedes the dated GA-<date> scheme, no longer built here.
       # GitHub reads this workflow FROM THE TAGGED COMMIT, so a tag cut from a
       # commit predating this change won't pick the new pattern up.
-      # (type=ref,event=tag below already tags the image verbatim with the tag.)
       - 'v*.*.*'
       - '20*-s*-rc*'
-  # Build (without publishing) on PRs that touch the image inputs, so a broken
-  # Dockerfile is caught in review instead of on a shared branch. This is not
-  # hypothetical: moving pnpm `overrides` into pnpm-workspace.yaml broke the
-  # build with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH because the Dockerfile did not
-  # copy that file, and nothing ran the build to notice.
-  pull_request:
-    paths:
-      - Dockerfile
-      - package.json
-      - pnpm-lock.yaml
-      - pnpm-workspace.yaml
-      - tsconfig.json
-      - src/**
-      - .github/workflows/notification-image-build.yaml
   workflow_dispatch:
 
 env:
@@ -47,11 +29,6 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    # Fork PRs get no repository secrets/vars, so the dhi.io login step below
-    # throws `Password required` before it ever reaches `FROM` — a red build
-    # the contributor has no way to fix. Skip entirely rather than fail; push
-    # and same-repo pull_request runs are unaffected.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
     permissions:
       contents: read
       packages: write
@@ -70,10 +47,8 @@ jobs:
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       # The DHI base layers in the Dockerfile come from dhi.io, which refuses
-      # anonymous pulls even for the free Apache-2.0 catalog. Deliberately NOT
-      # gated on `github.event_name != 'pull_request'` like the GHCR login
-      # below: the PR path still BUILDS (it only skips the push), and the build
-      # fails at the first FROM without these credentials.
+      # anonymous pulls even for the free Apache-2.0 catalog. Without these
+      # credentials the build fails at the first FROM.
       - name: Log in to dhi.io
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -84,7 +59,6 @@ jobs:
       - name: Log in to GitHub Container Registry
         # Not needed on the PR path, which only builds. Skipping also keeps
         # Dependabot-raised PRs working, where GITHUB_TOKEN is read-only.
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
@@ -103,7 +77,9 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=sha,format=short
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
+              # `:latest` now follows RELEASES, not the main branch. The branch arm
+            # of this condition went with the branch trigger.
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
 
       - name: Build and push Docker image
         id: build
@@ -114,8 +90,8 @@ jobs:
           # Single platform on PRs: the arm64 leg is emulated through QEMU and
           # roughly doubles the run for a check whose job is only to prove the
           # image still builds. Pushes keep both.
-          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
-          push: ${{ github.event_name != 'pull_request' }}
+          platforms: linux/amd64,linux/arm64
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -130,15 +106,8 @@ jobs:
       # ("Blue-Dots-Economy"). docker/metadata-action lowercases that for its own tag
       # outputs, but an image reference we build by hand must be normalised too —
       # an uppercase path is an invalid reference and Trivy would reject it.
-      # Gated on the EVENT, not on `digest != ''`. Those look equivalent but are not:
-      # with the default docker driver, build-push-action populates `digest` from the
-      # locally-built image even when `push: false`, and Trivy would then resolve a
-      # digest for an image that is in no registry (MANIFEST_UNKNOWN). This job does
-      # configure buildx, where the output is empty on the PR path — but gating on
-      # the same condition that drives `push:` above does not depend on that detail.
       - name: Resolve scanned image ref
         id: scanref
-        if: github.event_name != 'pull_request'
         run: echo "ref=${IMAGE,,}@${DIGEST}" >> "$GITHUB_OUTPUT"
         env:
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -146,8 +115,8 @@ jobs:
 
       # Scanned by digest, not by tag: buildx pushes straight to the registry without
       # loading into the local docker image store, so the action's `imageid` output is
-      # not resolvable by Trivy. `scanref` is empty on the PR path (see above), so this
-      # step and the upload both skip there rather than failing on an absent image.
+      # not resolvable by Trivy. Every run of this workflow now pushes, so the digest
+      # always refers to something that exists in the registry.
       #
       # TRIVY_PLATFORM is pinned because pushes build a linux/amd64 + linux/arm64
       # manifest list; the digest therefore points at the list rather than one image,
