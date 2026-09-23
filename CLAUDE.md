@@ -373,14 +373,18 @@ Two design problems found while writing the tests, both filed rather than fixed:
 
 Two workflows:
 
-- **`ci.yaml`** — `pull_request` and `push` on `main`/`develop`/`feature`: frozen install,
-  `pnpm build` (which is `tsc`, so it is the type-check too), then `pnpm test`. Added in #46;
-  before that this repo had **no CI at all**, which is how a tsconfig incompatible with
-  TypeScript 7 reached `main` and broke image publishing for a week.
-- **`notification-image-build.yaml`** — builds and pushes the GHCR image on push to `main`,
-  push to `feature`, and tags; **builds without pushing** on PRs that touch the image inputs.
-  Note the branch list says `feature`, not `'feature/**'`: the glob needs a slash, so it never
-  matched the integration branch.
+- **`ci.yaml`** — `pull_request` on `main`/`develop`/`feature` and `push` on `main`/`develop`:
+  frozen install, `pnpm build` (which is `tsc`, so it is the type-check too), then `pnpm test`.
+  Added in #46; before that this repo had **no CI at all**, which is how a tsconfig incompatible
+  with TypeScript 7 reached `main` and broke image publishing for a week. Since #756 removed
+  every branch and PR trigger from the image build, this is now the **only** check standing
+  between a bad commit and a broken release build.
+- **`notification-image-build.yaml`** — builds and pushes the GHCR image on a **release tag**
+  (`v*.*.*`, `20*-s*-rc*`) or a **manual run** only (#756). It previously also published on
+  pushes to `main` and `feature` and built-without-pushing on PRs touching the image inputs;
+  all three triggers are gone. Consequence: nothing exercises the `Dockerfile` before a release
+  tag is cut, and the two Docker gotchas below are exactly the class of breakage that PR build
+  used to catch. `:latest` now follows releases rather than the `main` branch.
 
 **Two Docker gotchas**, both of which broke the image build in ways CI did not see:
 

@@ -1,12 +1,16 @@
 name: CI
 
-# This repo had no CI at all: the only workflow was the GHCR image build, which
-# runs on push to main (and a 'feature/**' glob that never matches the branch
-# literally named `feature`). Nothing validated a pull request, which is how a
-# tsconfig incompatible with TypeScript 7 reached main and broke the image build.
+# This repo had no CI at all: the only workflow was the GHCR image build, and
+# nothing validated a pull request, which is how a tsconfig incompatible with
+# TypeScript 7 reached main and broke the image build. That makes this workflow
+# the only thing standing between a bad commit and a broken release build, since
+# #756 left the image build with no branch or PR trigger at all.
+#
+# No `feature` push (#756): PRs into feature already run CI against the merge
+# commit, so the second post-merge run was a duplicate.
 on:
   push:
-    branches: [main, develop, feature]
+    branches: [main, develop]
   pull_request:
     branches: [main, develop, feature]
   workflow_dispatch:
