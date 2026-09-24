@@ -371,20 +371,52 @@ Two design problems found while writing the tests, both filed rather than fixed:
 
 ## CI
 
-Two workflows:
+Three workflows (plus `security.yml`). The split is load-bearing: **`ci.yaml` checks,
+`notification-image-build.yaml` publishes, and the two are connected by a gate rather than
+by `needs:`.**
 
-- **`ci.yaml`** — `pull_request` on `main`/`develop`/`feature` and `push` on `main`/`develop`:
-  frozen install, `pnpm build` (which is `tsc`, so it is the type-check too), then `pnpm test`.
-  Added in #46; before that this repo had **no CI at all**, which is how a tsconfig incompatible
-  with TypeScript 7 reached `main` and broke image publishing for a week. Since #756 removed
-  every branch and PR trigger from the image build, this is now the **only** check standing
-  between a bad commit and a broken release build.
+- **`ci.yaml`** — `pull_request` on `main`/`develop`/`feature` and `push` on `main`/`develop`.
+  The `ci` job does a frozen install, `pnpm build` (which is `tsc`, so it is the type-check
+  too), then `pnpm test` plus the integration suite against a real Redis service container.
+  Added in #46; before that this repo had **no CI at all**, which is how a tsconfig
+  incompatible with TypeScript 7 reached `main` and broke image publishing for a week. A
+  second job, `smoke-image`, builds the image on the PR path with `push: false` — that is the
+  only thing that exercises the `Dockerfile` before a release tag is cut, and the two Docker
+  gotchas below are exactly the class of breakage it catches. It is gated on `DOCKERHUB_TOKEN`
+  so fork and Dependabot PRs skip with a warning rather than failing on the absent dhi.io
+  credential.
 - **`notification-image-build.yaml`** — builds and pushes the GHCR image on a **release tag**
   (`v*.*.*`, `20*-s*-rc*`) or a **manual run** only (#756). It previously also published on
-  pushes to `main` and `feature` and built-without-pushing on PRs touching the image inputs;
-  all three triggers are gone. Consequence: nothing exercises the `Dockerfile` before a release
-  tag is cut, and the two Docker gotchas below are exactly the class of breakage that PR build
-  used to catch. `:latest` now follows releases rather than the `main` branch.
+  pushes to `main` and `feature`; those triggers are gone, and `:latest` now follows releases
+  rather than the `main` branch.
+- **`cut-release.yaml`** — the front door for cutting a release. Dispatch it with a tag name
+  and a base branch; it checks CI, creates the tag and the GitHub release with generated notes
+  in one API call, then dispatches the image build. `dry_run` previews the notes without
+  creating anything.
+
+**The CI gate (Blue-Dots-Economy/signals-dpg#765).** This repo never had one — the image build
+has always been a separate workflow from `ci.yaml` — so a release tag could publish an image
+built from a commit whose tests never ran. Both `notification-image-build.yaml`'s `verify-ci`
+job and `cut-release.yaml` now query `ci.yaml` runs for the commit and refuse unless one
+concluded `success`. Three things about it are deliberate and easy to undo by accident:
+
+- It reads **workflow runs**, not check runs, so it stays correct if the job names or the job
+  graph inside CI change.
+- It **fails closed when there are zero runs**. That is the realistic accident (a tag on a
+  commit CI never saw), not a tag on a commit CI rejected; a "did it fail?" test would pass it.
+- Both carry a `skip_ci_check` input for an emergency publish, which logs a warning naming the
+  commit so the bypass is visible.
+
+**Cut releases from `develop` or `main`, never `feature`.** Merges into `feature` run no CI —
+`pull_request` runs record the PR head, not the resulting merge commit — so the gate will
+refuse a tag cut there.
+
+**Two GitHub behaviours the release path depends on**, both of which look like bugs when you
+hit them: a tag pushed with `GITHUB_TOKEN` does **not** trigger `on: push: tags` (GitHub
+suppresses it to prevent recursion), which is why `cut-release.yaml` creates the tag through
+the REST API and then dispatches the build explicitly; and a workflow is **not dispatchable
+until it exists on the default branch**, so `cut-release.yaml` will not appear in the Actions
+tab while it sits on a side branch.
 
 **Two Docker gotchas**, both of which broke the image build in ways CI did not see:
 
