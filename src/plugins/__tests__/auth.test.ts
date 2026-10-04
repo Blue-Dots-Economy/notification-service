@@ -169,6 +169,7 @@ describe('authenticate — bearer', () => {
   it('rejects bearer when bearer auth is off', async () => {
     bearer.bearerConfig.mockReturnValueOnce(null as never);
     const res = await build().inject({ method: 'GET', url: '/providers', headers: { authorization: 'Bearer abc' } });
+    expect(res.statusCode).toBe(401);
     expect(res.json()).toEqual({ error: 'Bearer auth not enabled' });
   });
 
@@ -197,6 +198,27 @@ describe('raw JSON body parser', () => {
     const body = JSON.stringify({ data: 'x'.repeat(9 * 1024 * 1024) });
     const res = await build().inject({ method: 'POST', url: '/notify', payload: body, headers: { ...json, ...hmacHeaders({ method: 'POST', url: '/notify', body }) } });
     expect(res.statusCode).toBe(413);
+  });
+
+  it('answers 415 to a text/plain body, before authentication', async () => {
+    const body = 'hello';
+    const res = await build().inject({ method: 'POST', url: '/v1/notify', payload: body, headers: { 'content-type': 'text/plain', ...hmacHeaders({ method: 'POST', url: '/v1/notify', body }) } });
+    expect(res.statusCode).toBe(415);
+  });
+
+  it.each(['application/x-www-form-urlencoded', 'application/octet-stream', 'multipart/form-data; boundary=x'])('answers 415 to %s', async (type) => {
+    const res = await build().inject({ method: 'POST', url: '/v1/notify', payload: 'a=1', headers: { 'content-type': type, ...hmacHeaders({ method: 'POST', url: '/v1/notify', body: 'a=1' }) } });
+    expect(res.statusCode).toBe(415);
+  });
+
+  it('every accepted JSON body has rawBody set', async () => {
+    const app = Fastify();
+    registerRawJsonBody(app);
+    app.post('/raw', async (req) => ({ hasRaw: Buffer.isBuffer(req.rawBody) }));
+    for (const type of ['application/json', 'application/json; charset=utf-8', 'Application/JSON']) {
+      const res = await app.inject({ method: 'POST', url: '/raw', payload: '{}', headers: { 'content-type': type } });
+      expect(res.json()).toEqual({ hasRaw: true });
+    }
   });
 
   it('sets req.rawBody to the exact bytes', async () => {
