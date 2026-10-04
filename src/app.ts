@@ -1,4 +1,5 @@
 import Fastify from 'fastify';
+import { adminTemplateRoutes } from './routes/admin-templates';
 import { docsRoutes } from './routes/docs';
 import { metricsRoutes } from './routes/metrics';
 import { notifyRoutes } from './routes/notify';
@@ -11,6 +12,7 @@ import { retryRoutes } from './routes/retry';
 const app = Fastify({ logger: true });
 
 app.register(docsRoutes);
+app.register(adminTemplateRoutes);
 app.register(notifyRoutes);
 app.register(providerRoutes);
 app.register(metricsRoutes);
