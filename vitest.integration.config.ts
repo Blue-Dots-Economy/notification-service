@@ -18,6 +18,8 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     environment: 'node',
+    // Local integration runs use an unauthenticated dev Redis.
+    env: { REDIS_ALLOW_NO_AUTH: 'true' },
     include: ['src/**/*.integration.test.ts'],
     fileParallelism: false,
   },

@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { Job } from 'src/types';
 import redis from './redis';
 
@@ -7,6 +8,13 @@ const REALTIME_QUEUE = 'queue:realtime';
 const OTHER_QUEUE = 'queue:other';
 const RETRY_ZSET = 'queue:retry';
 const DLQ_QUEUE = 'queue:dlq';
+
+/**
+ * DLQ replays allowed per job. Attempts reset on replay (a replay is an
+ * operator saying "try again"), but replays themselves are counted and capped
+ * so one job cannot be cycled through the providers indefinitely.
+ */
+export const MAX_REPLAYS = 3;
 
 // Basic Queue Operations
 
@@ -59,6 +67,10 @@ async function requeueFailedJob(raw: string, priority: 'realtime' | 'other') {
     priority,
     attempt: 0,
     next_attempt_at: undefined,
+    replays: (job.replays ?? 0) + 1,
+    // A replay is a new delivery attempt: it gets its own attempt id so its
+    // status writes are not rejected as older than the stored failed attempt.
+    ...(job.audit ? { audit: { ...job.audit, attemptId: randomUUID() } } : {}),
   };
 
   if (priority === 'realtime') await pushRealtime(retryJob);
@@ -74,24 +86,39 @@ export async function retryFailedJobs({
 }: RetryFailedJobsOptions = {}) {
   const retried: string[] = [];
   const skipped: string[] = [];
+  const refused: string[] = [];
 
   if (jobId) {
     const failedJobs = await redis.lrange(DLQ_QUEUE, 0, -1);
     const raw = failedJobs.find((item) => parseJob(item)?.job_id === jobId);
 
-    if (!raw) return { retried, skipped, not_found: [jobId] };
+    if (!raw) return { retried, skipped, refused, not_found: [jobId] };
+
+    const parsed = parseJob(raw);
+    if (parsed && (parsed.replays ?? 0) >= MAX_REPLAYS) {
+      return { retried, skipped, refused: [jobId], not_found: [] };
+    }
 
     const removed = await redis.lrem(DLQ_QUEUE, 1, raw);
-    if (removed === 0) return { retried, skipped, not_found: [jobId] };
+    if (removed === 0) return { retried, skipped, refused, not_found: [jobId] };
 
     const job = await requeueFailedJob(raw, priority);
     if (job) retried.push(job.job_id);
     else skipped.push(raw);
 
-    return { retried, skipped, not_found: [] };
+    return { retried, skipped, refused, not_found: [] };
   }
 
   for (let i = 0; i < limit; i += 1) {
+    // Peek the oldest entry first so a capped job stays in the DLQ.
+    const oldest = await redis.lindex(DLQ_QUEUE, -1);
+    if (!oldest) break;
+    const parsed = parseJob(oldest);
+    if (parsed && (parsed.replays ?? 0) >= MAX_REPLAYS) {
+      refused.push(parsed.job_id);
+      break;
+    }
+
     const raw = await redis.rpop(DLQ_QUEUE);
     if (!raw) break;
 
@@ -100,7 +127,7 @@ export async function retryFailedJobs({
     else skipped.push(raw);
   }
 
-  return { retried, skipped, not_found: [] };
+  return { retried, skipped, refused, not_found: [] };
 }
 
 // Retry Scheduling

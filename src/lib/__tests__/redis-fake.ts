@@ -54,6 +54,13 @@ export class RedisFake {
     return l.length === 0 ? null : l.pop()!;
   }
 
+  /** LINDEX — `string | null`; a negative index counts from the tail. */
+  async lindex(key: string, index: number): Promise<string | null> {
+    const l = this.list(key);
+    const i = index < 0 ? l.length + index : index;
+    return l[i] ?? null;
+  }
+
   async lrange(key: string, start: number, stop: number): Promise<string[]> {
     const l = this.list(key);
     return stop === -1 ? l.slice(start) : l.slice(start, stop + 1);

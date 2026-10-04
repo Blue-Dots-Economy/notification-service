@@ -25,6 +25,7 @@ export async function retryRoutes(app: FastifyInstance) {
       return reply.code(404).send({
         retried: result.retried,
         skipped: result.skipped.length,
+        refused: result.refused,
         not_found: result.not_found,
       });
     }
@@ -33,6 +34,7 @@ export async function retryRoutes(app: FastifyInstance) {
       retried: result.retried,
       retried_count: result.retried.length,
       skipped: result.skipped.length,
+      refused: result.refused,
       not_found: result.not_found,
     });
   });

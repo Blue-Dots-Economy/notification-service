@@ -97,7 +97,7 @@ describe('dead-letter queue and manual retry', () => {
 
     const res = await queue.retryFailedJobs({ jobId: 'dead-1', priority: 'realtime' });
 
-    expect(res).toEqual({ retried: ['dead-1'], skipped: [], not_found: [] });
+    expect(res).toEqual({ retried: ['dead-1'], skipped: [], refused: [], not_found: [] });
     expect(await redis.llen('queue:dlq')).toBe(0);
 
     const requeued = JSON.parse((await queue.popRealtime())![1]);
@@ -197,5 +197,58 @@ describe('getQueueMetrics', () => {
     expect(m.retry_count).toBe(0);
     expect(m.retry_oldest).toBeNull();
     expect(m.retry_eta_seconds).toBeNull();
+  });
+});
+
+describe('retryFailedJobs replay accounting', () => {
+  it('increments replays and refuses past MAX_REPLAYS', async () => {
+    await queue.pushDLQ(job({ job_id: 'p', replays: queue.MAX_REPLAYS }));
+    const res = await queue.retryFailedJobs({ jobId: 'p' });
+    expect(res.refused).toEqual(['p']);
+    expect(res.retried).toEqual([]);
+    // Still in the DLQ, not lost.
+    expect(await redis.lrange('queue:dlq', 0, -1)).toHaveLength(1);
+  });
+
+  it('a replayed job carries replays + 1', async () => {
+    await queue.pushDLQ(job({ job_id: 'q', replays: 1 }));
+    await queue.retryFailedJobs({ jobId: 'q' });
+    const [raw] = await redis.lrange('queue:other', 0, -1);
+    expect(JSON.parse(raw).replays).toBe(2);
+  });
+
+  it('refuses a capped job in a drain, leaves it in place and stops', async () => {
+    // Oldest first: 'fresh' drains, then the capped entry is reached and left.
+    await queue.pushDLQ(job({ job_id: 'fresh' }));
+    await queue.pushDLQ(job({ job_id: 'capped', replays: queue.MAX_REPLAYS }));
+    const res = await queue.retryFailedJobs({ limit: 5 });
+    expect(res.retried).toEqual(['fresh']);
+    expect(res.refused).toEqual(['capped']);
+    expect(await redis.lrange('queue:dlq', 0, -1)).toHaveLength(1);
+  });
+
+  it('records a replay as a new delivery attempt, keeping the event identity', async () => {
+    const audit = {
+      eventId: 'ev-1',
+      attemptId: 'attempt-1',
+      createdAt: '2026-10-04T00:00:00.000Z',
+      correlationId: 'corr-1',
+    };
+    await queue.pushDLQ(job({ job_id: 'a', audit } as Partial<Job>));
+    await queue.retryFailedJobs({ jobId: 'a' });
+    const [raw] = await redis.lrange('queue:other', 0, -1);
+    const replayed = JSON.parse(raw);
+    expect(replayed.audit.attemptId).not.toBe('attempt-1');
+    expect(replayed.audit.attemptId).toEqual(expect.any(String));
+    expect(replayed.audit.eventId).toBe('ev-1');
+    expect(replayed.audit.createdAt).toBe(audit.createdAt);
+    expect(replayed.audit.correlationId).toBe('corr-1');
+  });
+
+  it('replays a job without audit without adding one', async () => {
+    await queue.pushDLQ(job({ job_id: 'n' }));
+    await queue.retryFailedJobs({ jobId: 'n' });
+    const [raw] = await redis.lrange('queue:other', 0, -1);
+    expect(JSON.parse(raw).audit).toBeUndefined();
   });
 });
