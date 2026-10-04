@@ -222,7 +222,7 @@ A missing scope is `403 {"error":"Insufficient scope","required":"<scope>"}`. `P
 ```json
 { "<keyId>": { "secret": "...", "scopes": ["notify:send", "templates:admin"] } }
 ```
-`scopes` is optional and defaults to `["notify:send"]`, so a key may send but administers nothing unless it is granted `templates:admin`. Unknown scopes (reported by index, `scopes[<i>] is not a known scope`, never by value), an empty list, a non-string `secret` or a non-object entry fail the boot. An entry whose `secret` is the **empty string** is skipped with a `console.warn` naming the key id only, and `getKey` returns `null` for it (`401 Invalid key` at request time): deployments render an unset secret as `""` (e.g. `"keycloak": {"secret": ""}` when the SMS plugin secret is unset), and throwing would stop the pod from booting. Each `loadSecrets()` replaces the whole key set.
+`scopes` is optional and defaults to `["notify:send"]`, so a key may send but administers nothing unless it is granted `templates:admin`. Unknown scopes (reported by index, `scopes[<i>] is not a known scope`, never by value), an empty list, a non-string `secret` or a non-object entry fail the boot. An entry whose `secret` is **empty or whitespace-only** is skipped with a `console.warn` naming the key id only, and `getKey` returns `null` for it (`401 Invalid key` at request time): deployments render an unset secret as `""` (e.g. `"keycloak": {"secret": ""}` when the SMS plugin secret is unset) and chart defaults use a placeholder space, and throwing would stop the pod from booting. Each `loadSecrets()` replaces the whole key set.
 
 **Bearer tokens** (`src/lib/auth/bearer.ts`). One Keycloak realm is shared by every service, so a token must carry `aud` = `NS_AUTH_AUDIENCE` **and** an `azp` on the `NS_AUTH_ALLOWED_AZP` allowlist. Signature, issuer and audience alone are not enough.
 - `typ` must be `Bearer`; `exp` and `sub` are required. Algorithms: RS256, PS256, ES256; 30 s clock tolerance.
@@ -636,7 +636,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 616 unit tests across 48 files, plus 119 integration tests across 15 files. The unit suite runs in about a second because Redis
+vitest 4, 619 unit tests across 48 files, plus 119 integration tests across 15 files. The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real

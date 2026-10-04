@@ -14,10 +14,10 @@ let KEYS = new Map<string, HmacKey>();
  * `scopes` defaults to ["notify:send"]: a key may send unless it is explicitly
  * granted administration.
  *
- * An entry whose `secret` is the empty string is skipped with a warning that
- * names the key id: deployments render an unset secret as `""`, and such a key
- * can never authenticate. Every other malformed entry throws so a bad file
- * fails the boot.
+ * An entry whose `secret` is empty or whitespace-only is skipped with a warning
+ * that names the key id: deployments render an unset secret as `""` (and chart
+ * defaults use a placeholder space), and such a key must never authenticate.
+ * Every other malformed entry throws so a bad file fails the boot.
  */
 export function parseSecrets(raw: unknown): Map<string, HmacKey> {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -44,8 +44,8 @@ export function parseSecrets(raw: unknown): Map<string, HmacKey> {
       });
       granted = scopes as Scope[];
     }
-    if (secret === '') {
-      console.warn(`internal secrets entry "${id}" has an empty "secret"; skipping it`);
+    if (secret.trim() === '') {
+      console.warn(`internal secrets entry "${id}" has a blank "secret"; skipping it`);
       continue;
     }
     keys.set(id, { secret, scopes: new Set(granted) });
