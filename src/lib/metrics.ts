@@ -89,6 +89,11 @@ const HELP: Record<string, [type: string, help: string]> = {
   ns_sms_send_total: ['counter', 'SMS sends attempted, by provider and outcome.'],
   ns_sms_provider_error_total: ['counter', 'SMS provider error responses, by provider and code.'],
   ns_job_dlq_total: ['counter', 'Jobs dead-lettered, by channel and reason.'],
+  ns_job_expired_total: ['counter', 'Jobs that passed their deadline and were never sent, by channel.'],
+  ns_job_dropped_total: [
+    'counter',
+    'Redacted (OTP) jobs that failed and were deliberately not dead-lettered, by channel and reason.',
+  ],
   ns_rate_limited_total: ['counter', 'Sends deferred because no vendor token was available, by channel and priority.'],
   ns_audit_write_failures_total: [
     'counter',

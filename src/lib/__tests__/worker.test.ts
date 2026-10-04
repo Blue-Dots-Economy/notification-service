@@ -485,3 +485,80 @@ describe('processJob attempt markers', () => {
     expect(markAttempt.mock.calls.map((c) => [c[1], c[2]])).toEqual([['failed', 1], ['failed', 1]]);
   });
 });
+
+describe('deadlines and redacted jobs', () => {
+  const smsJob = (over: Partial<Job> = {}) =>
+    job({ channel: 'sms', template_id: 'login_otp', to: '+910000000000', variables: { message: '1' }, ...over });
+
+  it('an expired job is not sent, ends expired, and is not dead-lettered', async () => {
+    await processJob(smsJob({ priority: 'realtime', deadline: Date.now() - 1 }));
+    expect(send).not.toHaveBeenCalled();
+    expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'expired' }));
+    expect(markAttempt).toHaveBeenCalledWith(expect.anything(), 'failed', expect.any(Number));
+    expect(incr).toHaveBeenCalledWith('ns_job_expired_total', { channel: 'sms' });
+    expect(queue.pushDLQ).not.toHaveBeenCalled();
+  });
+
+  it('retry past the deadline expires instead', async () => {
+    send.mockResolvedValueOnce({ ok: false, error: 'timeout' });
+    await processJob(smsJob({ priority: 'realtime', deadline: Date.now() + 1000 })); // first retry delay is 5s
+    expect(queue.scheduleRetryWithMarker).not.toHaveBeenCalled();
+    expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'expired' }));
+  });
+
+  it('redacted jobs are never dead-lettered', async () => {
+    send.mockResolvedValueOnce({ ok: false, error: 'bad template', retryable: false });
+    await processJob(smsJob({ priority: 'realtime' }));
+    expect(queue.pushDLQ).not.toHaveBeenCalled();
+    expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'failed' }));
+    expect(markAttempt).toHaveBeenCalledWith(expect.anything(), 'failed', 1);
+    expect(incr).toHaveBeenCalledWith('ns_job_dropped_total', { channel: 'sms', reason: 'permanent_failure' });
+    expect(incr).not.toHaveBeenCalledWith('ns_job_dlq_total', expect.anything());
+  });
+
+  it('redacted jobs exhausting retries are dropped, not dead-lettered', async () => {
+    send.mockResolvedValueOnce({ ok: false, error: 'timeout' });
+    await processJob(smsJob({ priority: 'realtime', attempt: 4 }));
+    expect(queue.pushDLQ).not.toHaveBeenCalled();
+    expect(incr).toHaveBeenCalledWith('ns_job_dropped_total', expect.objectContaining({ reason: 'max_retries' }));
+  });
+
+  it('non-redacted jobs still dead-letter', async () => {
+    send.mockResolvedValueOnce({ ok: false, error: 'bad template', retryable: false });
+    await processJob(smsJob({ priority: 'other' }));
+    expect(queue.pushDLQ).toHaveBeenCalled();
+    expect(incr).toHaveBeenCalledWith('ns_job_dlq_total', expect.objectContaining({ reason: 'permanent_failure' }));
+  });
+
+  it('an expired non-redacted job is not dead-lettered either', async () => {
+    await processJob(smsJob({ priority: 'other', deadline: Date.now() - 1 }));
+    expect(queue.pushDLQ).not.toHaveBeenCalled();
+    expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'expired' }));
+  });
+
+  it('a rate-limited job that would be deferred past its deadline expires instead', async () => {
+    acquireSendToken.mockResolvedValueOnce(false);
+    await processJob(smsJob({ priority: 'realtime', deadline: Date.now() + 10 })); // defer is 321ms
+    expect(queue.deferJob).not.toHaveBeenCalled();
+    expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'expired' }));
+  });
+
+  it('a token-check error past the deadline expires instead of deferring', async () => {
+    acquireSendToken.mockRejectedValueOnce(new Error('redis down'));
+    await processJob(smsJob({ priority: 'realtime', deadline: Date.now() + 10 }));
+    expect(queue.deferJob).not.toHaveBeenCalled();
+    expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'expired' }));
+  });
+
+  it('a deferral inside the deadline still defers', async () => {
+    acquireSendToken.mockResolvedValueOnce(false);
+    await processJob(smsJob({ priority: 'realtime', deadline: Date.now() + 60_000 }));
+    expect(queue.deferJob).toHaveBeenCalled();
+  });
+});
+
+describe('validateWorkerConfig — deadline', () => {
+  it('rejects a bad URGENT_DEFAULT_DEADLINE_S', () => {
+    expect(() => validateWorkerConfig({ URGENT_DEFAULT_DEADLINE_S: '-5' })).toThrow('URGENT_DEFAULT_DEADLINE_S');
+  });
+});
