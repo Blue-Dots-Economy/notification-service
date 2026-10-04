@@ -234,20 +234,7 @@ async function recoverBatch(p: {
       );
     }
 
-    // The events of every attempt stamped above, rolled up from all their
-    // attempts (a first_available/all event has siblings; writing the stamped
-    // attempt's status straight onto the event would overwrite them). Sorted,
-    // so two concurrent sweeps take the event row locks in the same order.
-    const touched = new Map<string, { eventId: string; createdAt: string }>();
-    for (const r of [...toMark.map((m) => m.row), ...toAbandon]) {
-      touched.set(`${r.notification_event_id}|${r.created_at}`, { eventId: r.notification_event_id, createdAt: r.created_at });
-    }
-    const exec = sqlExecutor(q);
-    for (const key of [...touched.keys()].sort()) {
-      const { eventId, createdAt } = touched.get(key)!;
-      await rollUpEvent(exec, eventId, createdAt);
-    }
-
+    let requeueJobs: Job[] = [];
     if (toRequeue.length > 0) {
       const { rows: bumped } = await q<{ id: string; attempt_no: number }>(
         `UPDATE delivery_attempt
@@ -257,10 +244,26 @@ async function recoverBatch(p: {
         [toRequeue.map((r) => r.id), toRequeue.map((r) => r.created_at)],
       );
       const attemptById = new Map(bumped.map((b) => [b.id, b.attempt_no]));
-      await pushManyToPriority(
-        toRequeue.map((r) => ({ ...r.job, attempt: (attemptById.get(r.id) ?? r.attempt_no + 1) - 1 })),
-      );
+      requeueJobs = toRequeue.map((r) => ({ ...r.job, attempt: (attemptById.get(r.id) ?? r.attempt_no + 1) - 1 }));
     }
+
+    // The events of every attempt written above (stamped, abandoned or
+    // re-queued), rolled up from all their attempts (a first_available/all
+    // event has siblings; writing one attempt's status straight onto the event
+    // would overwrite them). Sorted, so two concurrent sweeps take the event
+    // row locks in the same order.
+    const touched = new Map<string, { eventId: string; createdAt: string }>();
+    for (const r of [...toMark.map((m) => m.row), ...toAbandon, ...toRequeue]) {
+      touched.set(`${r.notification_event_id}|${r.created_at}`, { eventId: r.notification_event_id, createdAt: r.created_at });
+    }
+    const exec = sqlExecutor(q);
+    for (const key of [...touched.keys()].sort()) {
+      const { eventId, createdAt } = touched.get(key)!;
+      await rollUpEvent(exec, eventId, createdAt);
+    }
+
+    // Last, so a failed push rolls back every write of this batch.
+    if (requeueJobs.length > 0) await pushManyToPriority(requeueJobs);
 
     await client.query('COMMIT');
     const lastRow = rows[rows.length - 1];

@@ -82,6 +82,15 @@ describe('multi-delivery events', () => {
     expect((await eventStatus(a!)).status).toBe('dispatching');
   });
 
+  it('first_available: a1 sent, then a2 queued → the event stays sent', async () => {
+    const [a, b] = records(2, 'first_available');
+    await recordAcceptedMany([a!]);
+    for (const status of ['dispatching', 'sent'] as const) await upsertAttempt(a!, { status, attemptNo: 1 });
+    expect((await eventStatus(a!)).status).toBe('sent');
+    await upsertAttempt(b!, { status: 'queued', attemptNo: 1 });
+    expect((await eventStatus(a!)).status).toBe('sent');
+  });
+
   it('first_available: a late failure of the earlier attempt never moves a sent event back', async () => {
     const [a, b] = records(2, 'first_available');
     await recordAcceptedMany([a!]);
