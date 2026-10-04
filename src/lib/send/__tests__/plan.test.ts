@@ -101,4 +101,67 @@ describe('planSend', () => {
     expect((await planSend(req({ ...base, priority: 'urgent' }), now)).deadline).toBe(now + 600_000);
     expect((await planSend(req(base), now)).deadline).toBeUndefined();
   });
+
+  it('urgent is redacted even without sensitive variables; normal non-sensitive is not', async () => {
+    templates.resolveTemplate.mockResolvedValue({ template: smsT, renders: 'provider' });
+    const base = { template_key: 'apply_sms', channel: 'sms', to: { phone: '+919999999999' }, variables: { name: 'A' } };
+    expect((await planSend(req({ ...base, priority: 'urgent' }))).redact).toBe(true);
+    expect((await planSend(req(base))).redact).toBe(false);
+  });
+
+  it('when every candidate is skipped, the first remembered configuration error is thrown', async () => {
+    policy('first_available');
+    templates.resolveTemplate.mockImplementation(async (channel: string) => {
+      if (channel === 'sms') throw new TemplateError('vendor_mismatch', 'sms');
+      throw new TemplateError('not_found', 'email');
+    });
+    const e = await planSend(req({ event_type: 'apply', to: { phone: '+919999999999', email: 'a@b.co' } })).catch((x) => x);
+    expect(e).toMatchObject({ code: 'vendor_mismatch', kind: 'configuration' });
+  });
+
+  it('all: a configuration render error skips that channel while another succeeds', async () => {
+    policy('all');
+    const brokenSms = tpl({ channel: 'sms', templateKey: 'apply_sms', providerTemplateId: null, variables: [v('name')] });
+    templates.resolveTemplate.mockImplementation(async (channel: string) =>
+      channel === 'sms' ? { template: brokenSms, renders: 'provider' } : { template: emailT, renders: 'ns' });
+    const plan = await planSend(req({ event_type: 'apply', to: { phone: '+919999999999', email: 'a@b.co' }, variables: { name: 'A', link: 'https://x.org/' } }));
+    expect(plan.mode).toBe('all');
+    expect(plan.deliveries.map((d) => d.channel)).toEqual(['email']);
+  });
+
+  it('a caller error overrides an earlier skipped configuration error', async () => {
+    policy('first_available');
+    const brokenSms = tpl({ channel: 'sms', templateKey: 'apply_sms', providerTemplateId: null, variables: [v('name')] });
+    templates.resolveTemplate.mockImplementation(async (channel: string) =>
+      channel === 'sms' ? { template: brokenSms, renders: 'provider' } : { template: emailT, renders: 'ns' });
+    const e = await planSend(req({ event_type: 'apply', to: { phone: '+919999999999', email: 'a@b.co' }, variables: { name: 'A', link: 'javascript:x' } })).catch((x) => x);
+    expect(e).toMatchObject({ code: 'invalid_variable', kind: 'caller' });
+  });
+
+  it.each(['__proto__', 'constructor'])('a %s variable key is unknown_variable', async (key) => {
+    templates.resolveTemplate.mockResolvedValue({ template: smsT, renders: 'provider' });
+    // Zod's record drops a __proto__ key and Fastify rejects one in a JSON body;
+    // planSend must still refuse it if it ever arrives as an own property.
+    const variables = JSON.parse(`{"name":"A","${key}":"x"}`) as Record<string, unknown>;
+    const parsed = { ...req({ template_key: 'apply_sms', channel: 'sms', to: { phone: '+919999999999' } }), variables };
+    const e = await planSend(parsed).catch((x) => x);
+    expect(e).toMatchObject({ code: 'unknown_variable', kind: 'caller' });
+  });
+
+  it('deadline: the smallest default_deadline_s among planned templates wins', async () => {
+    const now = Date.parse('2026-10-04T00:00:00Z');
+    policy('all');
+    templates.resolveTemplate.mockImplementation(async (channel: string) =>
+      channel === 'sms'
+        ? { template: { ...smsT, defaultDeadlineS: 300 }, renders: 'provider' }
+        : { template: { ...emailT, defaultDeadlineS: 90 }, renders: 'ns' });
+    const plan = await planSend(req({ event_type: 'apply', to: { phone: '+919999999999', email: 'a@b.co' }, variables: { name: 'A', link: 'https://x.org/' } }), now);
+    expect(plan.deadline).toBe(now + 90_000);
+  });
+
+  it('variables are the validated (normalised) values the templates rendered with', async () => {
+    templates.resolveTemplate.mockResolvedValue({ template: emailT, renders: 'ns' });
+    const plan = await planSend(req({ template_key: 'apply_email', channel: 'email', to: { email: 'a@b.co' }, variables: { name: 'A', link: 'https://X.org' } }));
+    expect(plan.variables).toEqual({ name: 'A', link: 'https://x.org/' });
+  });
 });
