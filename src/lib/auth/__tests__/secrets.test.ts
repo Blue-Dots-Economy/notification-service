@@ -27,6 +27,14 @@ describe('parseSecrets', () => {
     expect(String(warn.mock.calls[0][0])).not.toContain('s2');
   });
 
+  it.each([' ', '\t\n '])('skips a whitespace-only secret %j like an empty one', (blank) => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const keys = parseSecrets({ placeholder: { secret: blank } });
+    expect(keys.has('placeholder')).toBe(false);
+    expect(String(warn.mock.calls[0][0])).toContain('"placeholder"');
+    warn.mockRestore();
+  });
+
   it.each([
     [{ a: { secret: 1 } }, /secret/],
     [{ a: {} }, /secret/],

@@ -217,6 +217,12 @@ describe('authenticate — rejection logging', () => {
     expect(rejected(lines)[0]).toMatchObject({ level: 40, status: 403, error: 'Insufficient scope', credential: 'bearer' });
   });
 
+  it('logs ambiguous credentials as credential "both"', async () => {
+    const lines: string[] = [];
+    await build(lines).inject({ method: 'GET', url: '/providers', headers: { authorization: 'Bearer abc', ...hmacHeaders({ method: 'GET', url: '/providers' }) } });
+    expect(rejected(lines)[0]).toMatchObject({ level: 40, status: 401, error: 'Ambiguous credentials', credential: 'both' });
+  });
+
   it('logs a 503 from the key set at error', async () => {
     const lines: string[] = [];
     bearer.verifyBearer.mockResolvedValueOnce({ ok: false, status: 503, error: 'Auth service unavailable' });

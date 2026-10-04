@@ -28,7 +28,8 @@ const errorBody = (description: string) => ({
 const unauthorized = () =>
   errorBody('Missing, malformed, expired or invalid credentials, or both credential types on one request');
 const AUTH_UNAVAILABLE = 'auth unavailable: the Keycloak key set could not be reached for a bearer token';
-const authUnavailable = () => errorBody(`Auth service unavailable, or the Keycloak key set could not be reached (${AUTH_UNAVAILABLE})`);
+const authUnavailable = () =>
+  errorBody('Auth service unavailable: the Keycloak key set could not be reached for a bearer token');
 const forbidden = (role: string) =>
   errorBody(`Insufficient scope: the credential lacks \`${role}\` ({"error":"Insufficient scope","required":"${role}"})`);
 
