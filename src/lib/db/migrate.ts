@@ -1,8 +1,9 @@
 import path from 'node:path';
-import type { Pool } from 'pg';
-import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
+import { Pool, type PoolConfig } from 'pg';
+import { drizzle, type NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
-import { closeDb, getDb, getPool } from './client';
+import { closeDb } from './client';
+import { loadDbConfig } from './config';
 
 /**
  * Advisory-lock key shared by every migration runner of this service.
@@ -45,10 +46,29 @@ export async function migrateWithLock(
   }
 }
 
-/** Apply pending migrations from MIGRATIONS_FOLDER under the lock. */
+/** loadDbConfig without statement/query timeouts; two connections (lock session + migrator). */
+export function migrationPoolConfig(env: NodeJS.ProcessEnv = process.env): PoolConfig {
+  const { statement_timeout: _s, query_timeout: _q, ...config } = loadDbConfig(env);
+  return { ...config, max: 2 };
+}
+
+/**
+ * Apply pending migrations from MIGRATIONS_FOLDER under the lock.
+ *
+ * Runs on a dedicated, short-lived pool with NO statement/query timeout: the
+ * service pool's 5s bounds would abort a long DDL (or partman's partition
+ * creation) half-way. The advisory-lock wait is therefore unbounded too, which
+ * is intended — a replica waits for the one migrating. Connect timeout stays.
+ */
 export async function runMigrations(): Promise<void> {
   console.log('Applying database migrations from', MIGRATIONS_FOLDER);
-  await migrateWithLock(getDb(), getPool(), MIGRATIONS_FOLDER);
+  const pool = new Pool(migrationPoolConfig());
+  pool.on('error', (err) => console.error('Postgres migration pool error:', err.message));
+  try {
+    await migrateWithLock(drizzle(pool), pool, MIGRATIONS_FOLDER);
+  } finally {
+    await pool.end();
+  }
   console.log('Database migrations applied');
 }
 
