@@ -244,15 +244,30 @@ describe('scheduleRetryWithMarker', () => {
   });
 });
 
-describe('pushOtherMany', () => {
-  it('pushes every job to the other queue in order', async () => {
-    await queue.pushOtherMany([job({ job_id: 'm1' }), job({ job_id: 'm2' })]);
+describe('pushManyToPriority', () => {
+  it('pushes each job to its own priority queue, in order', async () => {
+    await queue.pushManyToPriority([
+      job({ job_id: 'm1', priority: 'other' }),
+      job({ job_id: 'b1', priority: 'bulk' }),
+      job({ job_id: 'r1', priority: 'realtime' }),
+      job({ job_id: 'm2', priority: 'other' }),
+    ]);
     const popped = [await queue.popOther(), await queue.popOther()].map((p) => JSON.parse(p![1]).job_id);
     expect(popped).toEqual(['m1', 'm2']);
+    expect(JSON.parse((await redis.rpop('queue:bulk'))!).job_id).toBe('b1');
+    expect(JSON.parse((await redis.rpop('queue:realtime'))!).job_id).toBe('r1');
+  });
+
+  it('sends an unknown or inherited priority name to other', async () => {
+    await queue.pushManyToPriority([
+      job({ job_id: 'u1', priority: 'nope' as never }),
+      job({ job_id: 'u2', priority: 'toString' as never }),
+    ]);
+    expect(await redis.llen('queue:other')).toBe(2);
   });
 
   it('is a no-op for an empty batch', async () => {
-    await queue.pushOtherMany([]);
+    await queue.pushManyToPriority([]);
     expect(await redis.llen('queue:other')).toBe(0);
   });
 });

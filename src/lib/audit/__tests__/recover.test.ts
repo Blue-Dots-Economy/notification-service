@@ -11,7 +11,7 @@ vi.mock('../../redis', () => ({
   },
 }));
 vi.mock('../../metrics', () => ({ incr: vi.fn(async () => {}) }));
-vi.mock('../../queue', () => ({ pushOtherMany: vi.fn(async () => {}) }));
+vi.mock('../../queue', () => ({ pushManyToPriority: vi.fn(async () => {}) }));
 
 const release = vi.fn();
 const query = vi.fn();
