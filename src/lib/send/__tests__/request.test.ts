@@ -6,11 +6,11 @@ const parse = (b: unknown) => V1NotifySchema.safeParse(b);
 
 describe('V1NotifySchema', () => {
   it('accepts a policy-routed send and defaults priority and variables', () => {
-    const r = parse({ event_type: 'apply', to: { email: 'a@b.c' } });
+    const r = parse({ event_type: 'apply', to: { email: 'a@b.co' } });
     expect(r.success && r.data).toMatchObject({ priority: 'normal', variables: {} });
   });
   it('requires exactly one of event_type / template_key', () => {
-    expect(parse({ to: { email: 'a@b.c' } }).success).toBe(false);
+    expect(parse({ to: { email: 'a@b.co' } }).success).toBe(false);
     expect(parse({ ...ok, template_key: 'x', channel: 'sms' }).success).toBe(false);
   });
   it('template_key needs channel; event_type forbids it', () => {
@@ -24,13 +24,23 @@ describe('V1NotifySchema', () => {
     expect(parse({ ...ok, to: { email: 'not-an-email' } }).success).toBe(false);
   });
   it('rejects network, bodies, sender identity and unknown keys', () => {
-    for (const extra of [{ network: 'x' }, { body: 'hi' }, { fromEmail: 'a@b.c' }, { template_id: 'raw' }]) {
+    for (const extra of [{ network: 'x' }, { body: 'hi' }, { fromEmail: 'a@b.co' }, { template_id: 'raw' }]) {
       expect(parse({ ...ok, ...extra }).success).toBe(false);
     }
   });
   it('email extras with template_key need channel email', () => {
-    expect(parse({ template_key: 'k', channel: 'sms', to: { phone: '+919999999999' }, cc: ['c@d.e'] }).success).toBe(false);
-    expect(parse({ template_key: 'k', channel: 'email', to: { email: 'a@b.c' }, cc: ['c@d.e'], reply_to: 'r@b.c' }).success).toBe(true);
+    expect(parse({ template_key: 'k', channel: 'sms', to: { phone: '+919999999999' }, cc: ['c@d.co'] }).success).toBe(false);
+    expect(parse({ template_key: 'k', channel: 'email', to: { email: 'a@b.co' }, cc: ['c@d.co'], reply_to: 'r@b.co' }).success).toBe(true);
+  });
+  it('rejects email injection via comma in cc', () => {
+    expect(parse({ template_key: 'k', channel: 'email', to: { email: 'a@b.co' }, cc: ['x,evil@x.co'] }).success).toBe(false);
+  });
+  it('rejects display-name form in to.email', () => {
+    expect(parse({ event_type: 'apply', to: { email: 'Bob<a@b.co>' } }).success).toBe(false);
+  });
+  it('rejects 11 cc entries', () => {
+    const elevenCc = Array.from({ length: 11 }, (_, i) => `user${i}@example.co`);
+    expect(parse({ template_key: 'k', channel: 'email', to: { email: 'a@b.co' }, cc: elevenCc }).success).toBe(false);
   });
   it('maps public priorities', () => {
     expect(PRIORITY_MAP).toEqual({ urgent: 'realtime', normal: 'other', bulk: 'bulk' });
