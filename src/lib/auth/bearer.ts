@@ -12,12 +12,6 @@ export type BearerResult =
   | { ok: true; principal: Principal }
   | { ok: false; status: 401 | 503; error: string };
 
-/**
- * Bearer auth is on when NS_KEYCLOAK_ISSUER is set. The issuer must equal the
- * token's `iss` exactly (Keycloak: https://<host>/auth/realms/<realm>, no
- * trailing slash). Every service shares the realm, so the audience AND an
- * allowlisted `azp` are both required.
- */
 function assertHttpUrl(name: string, value: string): void {
   let protocol: string;
   try {
@@ -28,6 +22,12 @@ function assertHttpUrl(name: string, value: string): void {
   if (protocol !== 'http:' && protocol !== 'https:') throw new Error(`${name} must be an http(s) URL`);
 }
 
+/**
+ * Bearer auth is on when NS_KEYCLOAK_ISSUER is set. The issuer must equal the
+ * token's `iss` exactly (Keycloak: https://<host>/auth/realms/<realm>, no
+ * trailing slash). Every service shares the realm, so the audience AND an
+ * allowlisted `azp` are both required.
+ */
 export function bearerConfig(env: NodeJS.ProcessEnv = process.env): BearerConfig | null {
   const issuer = env.NS_KEYCLOAK_ISSUER?.trim();
   if (!issuer) return null;
