@@ -15,6 +15,20 @@
       "when": 1791125792521,
       "tag": "0001_templates_and_policies",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1791131814548,
+      "tag": "0002_event_delivery_mode",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1791131819132,
+      "tag": "0003_idempotency_key",
+      "breakpoints": true
     }
   ]
 }

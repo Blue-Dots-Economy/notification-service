@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { check, integer, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { check, integer, jsonb, pgTable, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 
 /**
  * Tables drizzle-kit manages (db:generate diffs this file).
@@ -102,3 +102,15 @@ export const notificationPolicy = pgTable(
 
 export type TemplateRow = typeof template.$inferSelect;
 export type PolicyRow = typeof notificationPolicy.$inferSelect;
+
+/** Send idempotency for normal/bulk priority (urgent uses Redis). Kept 90 days. */
+export const idempotencyKey = pgTable(
+  'idempotency_key',
+  {
+    network: text('network').notNull(),
+    key: text('key').notNull(),
+    response: jsonb('response'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [primaryKey({ columns: [t.network, t.key] })],
+);
