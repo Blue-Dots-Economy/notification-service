@@ -5,8 +5,6 @@ import { attachmentMaxFiles, attachmentMaxTotalBytes, totalAttachmentBytes } fro
 
 const Slug = (max: number) => z.string().regex(/^[a-z0-9_.-]+$/).max(max);
 const E164 = /^\+[1-9]\d{6,14}$/;
-// More lenient email regex that accepts test addresses like a@b.c
-const EmailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export const PRIORITY_MAP: Record<'urgent' | 'normal' | 'bulk', Priority> = {
   urgent: 'realtime',
@@ -21,7 +19,7 @@ export const V1NotifySchema = z
     channel: z.string().min(1).max(32).optional(),
     domain: Slug(64).optional(),
     to: z
-      .object({ email: z.string().regex(EmailRegex).max(254).optional(), phone: z.string().regex(E164).optional() })
+      .object({ email: z.email().max(254).optional(), phone: z.string().regex(E164).optional() })
       .strict()
       .refine((t) => Boolean(t.email || t.phone), { message: 'at least one contact point is required' }),
     locale: z.string().regex(/^[a-z]{2,3}(-[A-Z]{2})?$/).optional(),
@@ -29,8 +27,8 @@ export const V1NotifySchema = z
     priority: z.enum(['urgent', 'normal', 'bulk']).default('normal'),
     idempotency_key: z.string().min(1).max(128).optional(),
     deadline: z.string().datetime({ offset: true }).optional(),
-    cc: z.array(z.string().regex(EmailRegex)).max(10).optional(),
-    reply_to: z.string().regex(EmailRegex).optional(),
+    cc: z.array(z.email()).max(10).optional(),
+    reply_to: z.email().optional(),
     attachments: z.array(EmailAttachmentSchema).optional(),
   })
   .strict()
