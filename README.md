@@ -185,6 +185,74 @@ GET  /metrics/queue       # Queue depths and retry/DLQ metrics
 POST /failed/retry        # Requeue jobs from the DLQ
 ```
 
+The admin API under `/v1/admin/` is listed in [Admin API](#admin-api).
+
+## Admin API
+
+Templates and routing policies are managed over HTTP. Every route needs the usual signed
+headers **and** a key id listed in `NS_ADMIN_KEY_IDS` (otherwise `403 admin scope required`).
+`NS_NETWORK` must be set (otherwise `503 network_not_configured`). Request bodies are strict:
+unknown keys return `400`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/v1/admin/templates` | List (`channel`, `template_key`, `status` filters) |
+| POST | `/v1/admin/templates` | Create a draft (`201`) |
+| GET | `/v1/admin/templates/:id` | Fetch one |
+| PATCH | `/v1/admin/templates/:id` | Edit a draft |
+| POST | `/v1/admin/templates/:id/publish` | Validate, activate, retire the previous active version |
+| POST | `/v1/admin/templates/:id/retire` | Retire |
+| POST | `/v1/admin/templates/:id/preview` | Render with `{ "variables": {...} }`; any status, sends nothing |
+| GET | `/v1/admin/policies` | List (`domain`, `event_type`, `status` filters) |
+| POST | `/v1/admin/policies` | Create a draft (`201`) |
+| GET | `/v1/admin/policies/:id` | Fetch one |
+| PATCH | `/v1/admin/policies/:id` | Edit a draft |
+| POST | `/v1/admin/policies/:id/publish` | Activate (needs an active template per channel) |
+| POST | `/v1/admin/policies/:id/retire` | Retire |
+
+Errors: `404 not_found`, `409 invalid_state` (active and retired rows are immutable; create a new
+draft), `422` for any other rule violation (`error` holds the code, `message` names variables and
+never their values).
+
+Create, preview and publish an email template:
+
+```bash
+KEY_ID="admin-key"        # must be listed in NS_ADMIN_KEY_IDS
+SECRET="ns_admin_secret"
+BASE=http://localhost:3000
+
+# Signs METHOD + PATH + timestamp + nonce, as in "Signed cURL Example".
+ns_curl() {
+  local METHOD="$1" REQ_PATH="$2"; shift 2
+  local TS=$(date +%s) NONCE=$(openssl rand -hex 16)
+  local SIG="v1=$(printf "%s\n%s\n%s\n%s" "$METHOD" "$REQ_PATH" "$TS" "$NONCE" | \
+    openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')"
+  curl -sS -X "$METHOD" "$BASE$REQ_PATH" -H "Content-Type: application/json" \
+    -H "X-NS-Key: $KEY_ID" -H "X-NS-Timestamp: $TS" -H "X-NS-Nonce: $NONCE" \
+    -H "X-NS-Signature: $SIG" "$@"
+}
+
+ID=$(ns_curl POST /v1/admin/templates -d '{
+  "channel": "email",
+  "template_key": "welcome",
+  "subject": "Welcome, {{name}}",
+  "body_html": "<p>Hello {{name}}, <a href=\"{{link}}\">get started</a></p>",
+  "variables": [
+    { "name": "name" },
+    { "name": "link", "type": "url", "urlHosts": ["example.com"] }
+  ]
+}' | jq -r .id)
+
+ns_curl POST "/v1/admin/templates/$ID/preview" \
+  -d '{"variables": {"name": "Asha <b>", "link": "https://app.example.com/start"}}'
+
+ns_curl POST "/v1/admin/templates/$ID/publish"
+```
+
+Email variables are HTML-escaped unless declared `raw: true`. Variable `type` is `string`,
+`number` or `url`; a `url` must be `http(s)` and, with `urlHosts`, on an allowed host
+(subdomains match).
+
 ## Queue Model
 
 The service uses four Redis structures:
@@ -693,6 +761,11 @@ import { ProviderDefinition } from '../../../types/provider';
 
 export const pushProvider: ProviderDefinition = {
   name: 'push',
+
+  // The vendor behind this channel, and who renders templates: 'ns' renders the
+  // stored body here, 'provider' sends a template id plus variables.
+  vendor: 'fcm',
+  renders: 'provider',
 
   templates: {
     welcome: 'PUSH_TEMPLATE_1',
