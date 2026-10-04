@@ -1,0 +1,170 @@
+import { randomUUID } from 'node:crypto';
+import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { z } from 'zod';
+import type { Job } from 'src/types';
+import { recordAcceptedMany, type AcceptedRecord } from '../lib/audit/store';
+import { toAcceptedRecord } from '../lib/audit/redact';
+import { stamp } from '../lib/audit/stamp';
+import { correlationIdFrom } from '../lib/correlation';
+import { describeDbError } from '../lib/db/errors';
+import { dedupe, releaseDedupe } from '../lib/dedupe';
+import * as metrics from '../lib/metrics';
+import { currentNetwork, NetworkNotConfigured } from '../lib/network';
+import { notifyBodyLimitBytes } from '../lib/providers/email/attachments';
+import { pushToPriority } from '../lib/queue';
+import { SendError } from '../lib/send/errors';
+import { claimIdempotency, completeIdempotency, fallbackKey, releaseIdempotency } from '../lib/send/idempotency';
+import { planSend, type SendPlan } from '../lib/send/plan';
+import { PRIORITY_MAP, V1NotifySchema, type V1Request } from '../lib/send/request';
+import { requestAuth } from '../plugins/request-auth';
+
+
+const FALLBACK_TTL_S = 5;
+
+function buildJobs(req: V1Request, plan: SendPlan, correlationHeader: unknown): Job[] {
+  const eventId = randomUUID();
+  const createdAt = new Date().toISOString();
+  const correlationId = correlationIdFrom(correlationHeader, eventId);
+  const priority = PRIORITY_MAP[req.priority];
+  const email =
+    req.cc || req.reply_to || req.attachments
+      ? { cc: req.cc, replyTo: req.reply_to, attachments: req.attachments }
+      : undefined;
+  const make = (deliveries: SendPlan['deliveries']): Job => ({
+    job_id: randomUUID(),
+    channel: deliveries[0]!.channel,
+    priority,
+    to: deliveries[0]!.to,
+    template_id: deliveries[0]!.templateKey,
+    // Redacted sends carry no values anywhere the audit layer can see.
+    variables: plan.redact ? {} : plan.variables,
+    ...(plan.deadline !== undefined ? { deadline: plan.deadline } : {}),
+    v1: { mode: plan.mode, deliveries, index: 0, ...(email ? { email } : {}) },
+    audit: {
+      eventId,
+      attemptId: randomUUID(),
+      createdAt,
+      correlationId,
+      redactValues: plan.redact,
+      deliveryMode: plan.mode,
+    },
+  });
+  return plan.mode === 'all' ? plan.deliveries.map((d) => make([d])) : [make(plan.deliveries)];
+}
+
+/** Redacted records keep variable NAMES (from the plan) and nothing derived from values. */
+function toRecords(jobs: Job[], plan: SendPlan, source: string): AcceptedRecord[] {
+  return jobs.map((job) => {
+    const rec = toAcceptedRecord(job, source);
+    if (plan.redact) rec.payload = { ...rec.payload, variable_names: Object.keys(plan.variables) };
+    return rec;
+  });
+}
+
+export async function v1NotifyRoutes(app: FastifyInstance) {
+  app.route({
+    url: '/v1/notify',
+    method: 'POST',
+    preHandler: requestAuth,
+    bodyLimit: notifyBodyLimitBytes(),
+    handler: async (req: FastifyRequest, reply: FastifyReply) => {
+      const parsed = V1NotifySchema.safeParse(req.body);
+      if (!parsed.success) return reply.code(400).send(z.formatError(parsed.error));
+      const body = parsed.data;
+
+      let network: string;
+      try {
+        network = currentNetwork();
+      } catch (e) {
+        if (e instanceof NetworkNotConfigured) return reply.code(503).send({ error: 'network_not_configured' });
+        throw e;
+      }
+      const priority = PRIORITY_MAP[body.priority];
+
+      // Claim first, so a repeat never plans or sends twice.
+      let releaseOnce: () => Promise<void>;
+      if (body.idempotency_key) {
+        const claim = await claimIdempotency(network, body.idempotency_key, priority);
+        if (claim.status === 'replay') return reply.code(200).send(claim.response);
+        if (claim.status === 'in_progress') return reply.code(409).send({ error: 'idempotency_in_progress' });
+        releaseOnce = () => releaseIdempotency(network, body.idempotency_key!, priority);
+      } else {
+        const key = fallbackKey(body);
+        if (!(await dedupe(key, FALLBACK_TTL_S))) return reply.code(409).send({ error: 'duplicate-fallback' });
+        releaseOnce = () =>
+          releaseDedupe(key).catch((e) => req.log.error({ err: (e as Error)?.message ?? String(e) }, 'dedupe release failed'));
+      }
+      let released = false;
+      const release = async () => {
+        if (released) return;
+        released = true;
+        await releaseOnce();
+      };
+
+      try {
+        let plan: SendPlan;
+        try {
+          plan = await planSend(body);
+        } catch (e) {
+          await release();
+          if (e instanceof RangeError) return reply.code(400).send({ error: 'invalid_deadline', message: e.message });
+          if (e instanceof SendError) {
+            await metrics.incr('ns_send_rejected_total', { kind: e.kind, code: e.code });
+            return reply.code(422).send({
+              error: e.code,
+              kind: e.kind,
+              message: e.message,
+              ...(e.details ? { details: e.details } : {}),
+            });
+          }
+          throw e;
+        }
+
+        const jobs = buildJobs(body, plan, req.headers['x-correlation-id']);
+        const source = String(req.headers['x-ns-key'] ?? 'unknown');
+        const records = toRecords(jobs, plan, source);
+        const eventId = jobs[0]!.audit!.eventId;
+
+        if (priority === 'realtime') {
+          // Queue first: a slow or unavailable Postgres must never delay an OTP.
+          for (const job of jobs) await pushToPriority(job);
+          void recordAcceptedMany(records).catch((err) =>
+            req.log.error({ err: describeDbError(err), event: eventId }, 'v1 urgent audit insert failed'),
+          );
+        } else {
+          try {
+            await recordAcceptedMany(records);
+          } catch (err) {
+            req.log.error({ err: describeDbError(err), event: eventId }, 'v1 audit insert failed; refusing send');
+            await release();
+            return reply.code(503).send({ error: 'audit store unavailable' });
+          }
+          try {
+            for (const job of jobs) await pushToPriority(job);
+          } catch (err) {
+            for (const job of jobs) await stamp(job, { status: 'failed', attemptNo: 1, error: 'enqueue failed' });
+            throw err;
+          }
+        }
+
+        const response = {
+          notification_event_id: eventId,
+          correlation_id: jobs[0]!.audit!.correlationId,
+          status: 'accepted',
+          mode: plan.mode,
+          deliveries: plan.deliveries.map((d) => ({ channel: d.channel })),
+        };
+        if (body.idempotency_key) {
+          await completeIdempotency(network, body.idempotency_key, priority, response).catch((err) =>
+            req.log.error({ err: describeDbError(err), event: eventId }, 'idempotency completion failed'),
+          );
+        }
+        released = true; // accepted: the claim now stands
+        return reply.code(202).send(response);
+      } catch (err) {
+        await release(); // enqueue failure or any unexpected error: never strand the claim
+        throw err;
+      }
+    },
+  });
+}

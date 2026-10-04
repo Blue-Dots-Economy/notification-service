@@ -95,6 +95,7 @@ const HELP: Record<string, [type: string, help: string]> = {
     'Redacted (OTP) jobs that failed and were deliberately not dead-lettered, by channel and reason.',
   ],
   ns_rate_limited_total: ['counter', 'Sends deferred because no vendor token was available, by channel and priority.'],
+  ns_send_rejected_total: ['counter', 'POST /v1/notify sends refused at planning, by kind and code.'],
   ns_audit_write_failures_total: [
     'counter',
     'Best-effort audit status writes that failed, by stage (the status being written).',

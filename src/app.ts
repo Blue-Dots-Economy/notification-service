@@ -4,6 +4,7 @@ import { adminPolicyRoutes } from './routes/admin-policies';
 import { docsRoutes } from './routes/docs';
 import { metricsRoutes } from './routes/metrics';
 import { notifyRoutes } from './routes/notify';
+import { v1NotifyRoutes } from './routes/v1-notify';
 import { providerRoutes } from './routes/providers';
 import { retryRoutes } from './routes/retry';
 
@@ -16,6 +17,7 @@ app.register(docsRoutes);
 app.register(adminTemplateRoutes);
 app.register(adminPolicyRoutes);
 app.register(notifyRoutes);
+app.register(v1NotifyRoutes);
 app.register(providerRoutes);
 app.register(metricsRoutes);
 app.register(retryRoutes);

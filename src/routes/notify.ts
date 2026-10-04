@@ -11,6 +11,7 @@ import { stamp } from '../lib/audit/stamp';
 import { describeDbError } from '../lib/db/errors';
 import { urgentDefaultDeadlineS } from '../lib/deadline';
 import { requestAuth } from '../plugins/request-auth';
+import { correlationIdFrom, MAX_CORRELATION_ID_LENGTH } from '../lib/correlation';
 import { notifyBodyLimitBytes } from '../lib/providers/email/attachments';
 
 const NotifySchema = z.object({
@@ -31,13 +32,7 @@ const NotifySchema = z.object({
   body: z.string().max(2000).optional(),
 });
 
-/** Persisted on every event; bounded so a caller cannot write arbitrary-size values. */
-export const MAX_CORRELATION_ID_LENGTH = 128;
-
-function correlationIdFrom(header: unknown, fallback: string): string {
-  const value = typeof header === 'string' ? header.trim().slice(0, MAX_CORRELATION_ID_LENGTH) : '';
-  return value || fallback;
-}
+export { MAX_CORRELATION_ID_LENGTH };
 
 export async function notifyRoutes(app: FastifyInstance) {
   app.route({
