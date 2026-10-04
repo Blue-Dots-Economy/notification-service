@@ -43,6 +43,29 @@ describe('clock skew and expiry', () => {
     }
   });
 
+  it('two callers with skewed clocks cannot re-credit the same gap', async () => {
+    // 10/s, burst 10 (shared 8/s burst 8, reserve 2/s burst 2). Two pods whose
+    // clocks differ by 20ms alternate for 1s of simulated time: a rewinding ts
+    // would credit each 20ms gap twice.
+    const fast = { RATE_SMS_PER_SEC: '10', RATE_SMS_BURST: '10', RATE_URGENT_SHARE: '0.2' };
+    const base = Date.now();
+    let t = base;
+    const spy = vi.spyOn(Date, 'now');
+    let granted = 0;
+    try {
+      for (let i = 0; i < 200; i++) {
+        t = base + i * 5; // 200 steps x 5ms = 1s
+        const skew = i % 2 === 0 ? 0 : -20;
+        spy.mockReturnValue(t + skew);
+        if (await acquireSendToken('sms', 'msg91', 'realtime', fast)) granted++;
+      }
+    } finally {
+      spy.mockRestore();
+    }
+    const elapsedS = (t - base) / 1000;
+    expect(granted).toBeLessThanOrEqual(Math.floor(10 * elapsedS + 10));
+  });
+
   it('keeps a slow bucket past the 60s floor', async () => {
     await drain('bulk', 1);
     const ttl = await redis.pttl('rl:sms:msg91:shared');
