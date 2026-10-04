@@ -15,6 +15,9 @@ const OTHER_QUEUE = QUEUE_KEYS.other;
 const RETRY_ZSET = 'queue:retry';
 const DLQ_QUEUE = 'queue:dlq';
 
+/** Most due retries one moveDueRetries call claims; a full batch means more may be due. */
+export const RETRY_BATCH = 1000;
+
 /**
  * DLQ replays allowed per job. Attempts reset on replay (a replay is an
  * operator saying "try again"), but replays themselves are counted and capped
@@ -52,7 +55,26 @@ export async function popFrom(
   timeoutSeconds = 1,
 ): Promise<Job | null> {
   const res = await conn.brpop(QUEUE_KEYS[priority], timeoutSeconds);
-  return res ? (JSON.parse(res[1]) as Job) : null;
+  if (!res) return null;
+  const raw = res[1];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    parsed = undefined;
+  }
+  if (
+    typeof parsed !== 'object' ||
+    parsed === null ||
+    typeof (parsed as { job_id?: unknown }).job_id !== 'string'
+  ) {
+    // Never throw on a bad entry (it would be lost and crash-loop the pool) and
+    // never log its content: keep it raw in the DLQ for an operator.
+    await redis.lpush(DLQ_QUEUE, raw);
+    console.error(`popFrom: malformed ${priority} queue entry moved to DLQ`);
+    return null;
+  }
+  return parsed as Job;
 }
 
 /** Schedule a job without counting an attempt (rate-limit deferral). */
@@ -63,10 +85,10 @@ export async function deferJob(job: Job, delayMs: number): Promise<void> {
 // Claim every due retry and push it onto its own priority's queue in one atomic
 // step, so concurrent schedulers never move a member twice and a retry never
 // changes pool. A member that is not a JSON object with a string job_id goes to
-// the DLQ untouched rather than vanishing. Each call claims at most 1000 members
+// the DLQ untouched rather than vanishing. Each call claims at most RETRY_BATCH members (ARGV[2])
 // so one EVAL never blocks Redis for long; the caller simply calls again. Fixed script; keys and cutoff are passed as KEYS/ARGV.
 const MOVE_DUE_RETRIES = `
-local due = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'LIMIT', 0, 1000)
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'LIMIT', 0, ARGV[2])
 local moved = 0
 for _, raw in ipairs(due) do
   redis.call('ZREM', KEYS[1], raw)
@@ -84,7 +106,7 @@ end
 return moved
 `;
 
-/** Moves up to 1000 due retries per call; returns how many were routed to a priority queue. */
+/** Moves up to RETRY_BATCH due retries per call; returns how many were routed to a priority queue. */
 export async function moveDueRetries(now = Date.now()): Promise<number> {
   return (await redis.eval(
     MOVE_DUE_RETRIES,
@@ -95,6 +117,7 @@ export async function moveDueRetries(now = Date.now()): Promise<number> {
     QUEUE_KEYS.bulk,
     DLQ_QUEUE,
     String(now),
+    String(RETRY_BATCH),
   )) as number;
 }
 

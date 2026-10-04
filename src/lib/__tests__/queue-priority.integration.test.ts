@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import redis from '../redis';
 import { deferJob, moveDueRetries, popFrom, pushToPriority, QUEUE_KEYS } from '../queue';
 import type { Job } from 'src/types';
@@ -80,5 +80,25 @@ describe('priority queues', () => {
   it('an unknown priority is pushed to the other queue, even for inherited keys', async () => {
     await pushToPriority({ ...job('x', 'other'), priority: 'constructor' as never });
     expect(await redis.llen(QUEUE_KEYS.other)).toBe(1);
+  });
+});
+
+describe('popFrom malformed entries', () => {
+  it('moves a non-JSON or job_id-less entry raw to the DLQ and returns null', async () => {
+    const conn = redis.duplicate();
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (const raw of ['not json {SECRET', '{"no":"id"}', '[1]', '"str"']) {
+        await redis.lpush(QUEUE_KEYS.other, raw);
+        expect(await popFrom(conn, 'other', 1)).toBeNull();
+      }
+      expect(await redis.lrange('queue:dlq', 0, -1)).toEqual(['"str"', '[1]', '{"no":"id"}', 'not json {SECRET']);
+      expect(log.mock.calls.flat().join(' ')).not.toContain('SECRET');
+      await pushToPriority(job('ok', 'other'));
+      expect((await popFrom(conn, 'other', 1))?.job_id).toBe('ok');
+    } finally {
+      log.mockRestore();
+      conn.disconnect();
+    }
   });
 });

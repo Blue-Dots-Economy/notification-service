@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { ProviderDefinition, ProviderSendResult } from '../../../types/provider';
 import * as metrics from '../../metrics';
 import { isRetryableHttpStatus } from './http_status';
+import { isTimeoutError, providerTimeoutMs } from '../http';
 
 export async function sendSmsWithMsg91(
   to: string,
@@ -36,12 +37,13 @@ export async function sendSmsWithMsg91(
         // able to override the resolved recipient phone (SMS-redirect guard).
         recipients: [{ ...recipientVars, mobiles: phone }],
       }),
+      signal: AbortSignal.timeout(providerTimeoutMs()),
     });
   } catch (err) {
     await metrics.incr('ns_sms_send_total', { provider: 'msg91', result: 'failed' });
     return {
       ok: false,
-      error: err instanceof Error ? err.message : 'msg91 request failed',
+      error: isTimeoutError(err) ? 'provider timeout' : err instanceof Error ? err.message : 'msg91 request failed',
       retryable: true,
     };
   }

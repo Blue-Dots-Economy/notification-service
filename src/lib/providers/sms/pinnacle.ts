@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { ProviderDefinition, ProviderSendResult } from '../../../types/provider';
 import * as metrics from '../../metrics';
 import { isRetryableHttpStatus } from './http_status';
+import { isTimeoutError, providerTimeoutMs } from '../http';
 import { MAX_LENGTH, messageType, renderBody, UnresolvedTemplateVariables } from './render';
 
 /**
@@ -175,6 +176,7 @@ export async function sendSmsWithPinnacle(
       method: 'POST',
       headers: { 'Content-Type': 'application/json', apikey: config.apiKey },
       body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(providerTimeoutMs(env)),
     });
 
     if (!resp.ok) {
@@ -208,7 +210,7 @@ export async function sendSmsWithPinnacle(
     await metrics.incr('ns_sms_send_total', { provider: 'pinnacle', result: 'failed' });
     return {
       ok: false,
-      error: err instanceof Error ? err.message : 'pinnacle request failed',
+      error: isTimeoutError(err) ? 'provider timeout' : err instanceof Error ? err.message : 'pinnacle request failed',
       retryable: true,
     };
   }
@@ -243,6 +245,7 @@ export async function pollPinnacleBalance(env = process.env): Promise<number | n
   try {
     const resp = await fetch(`${config.baseUrl}/index.php/checkbalance`, {
       headers: { apikey: config.apiKey },
+      signal: AbortSignal.timeout(providerTimeoutMs(env)),
     });
     if (!resp.ok) return await failPoll('http_error', `HTTP ${resp.status}`);
 
