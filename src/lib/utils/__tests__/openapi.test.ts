@@ -2,6 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 vi.mock('../../providers', () => ({ providers: {} }));
 import { openApiDocument } from '../openapi';
 
+const SEND_SECURITY = [{ requestSignature: [] }, { bearerAuth: ['notify:send'] }];
+const ADMIN_SECURITY = [{ requestSignature: [] }, { bearerAuth: ['templates:admin'] }];
+
 describe('openApiDocument', () => {
   it('documents the admin API with an admin security requirement', () => {
     const doc = openApiDocument() as { paths: Record<string, Record<string, { security?: unknown[] }>> };
@@ -12,8 +15,38 @@ describe('openApiDocument', () => {
     ]) {
       expect(doc.paths[path], path).toBeDefined();
       for (const op of Object.values(doc.paths[path]!)) {
-        expect(op.security).toEqual([{ requestSignature: [], adminKey: [] }]);
+        expect(op.security).toEqual(ADMIN_SECURITY);
+        expect(op.responses['401'], path).toBeDefined();
+        expect(op.responses['403'], path).toBeDefined();
       }
+    }
+  });
+
+  it('declares the bearer and HMAC v2 security schemes, and no adminKey scheme', () => {
+    const doc = openApiDocument() as { openapi: string; components: { securitySchemes: Record<string, any> } };
+    const schemes = doc.components.securitySchemes;
+    expect(doc.openapi).toMatch(/^3\.1/);
+    expect(schemes.bearerAuth).toMatchObject({ type: 'http', scheme: 'bearer', bearerFormat: 'JWT' });
+    expect(schemes.requestSignature.description).toContain('v2');
+    expect(schemes.requestSignature.description).toContain('METHOD\\npath\\ntimestamp\\nnonce\\nsha256(body)');
+    expect(schemes.adminKey).toBeUndefined();
+    expect(JSON.stringify(doc)).not.toContain('NS_ADMIN_KEY_IDS');
+  });
+
+  it('requires templates:admin on POST /failed/retry and notify:send on both send routes', () => {
+    const doc = openApiDocument() as { paths: Record<string, any> };
+    expect(doc.paths['/failed/retry'].post.security).toEqual(ADMIN_SECURITY);
+    expect(doc.paths['/failed/retry'].post.responses['403']).toBeDefined();
+    for (const path of ['/v1/notify', '/notify']) {
+      const op = doc.paths[path].post;
+      expect(op.security).toEqual(SEND_SECURITY);
+      expect(op.responses['401'], path).toBeDefined();
+      expect(op.responses['403'], path).toBeDefined();
+    }
+    for (const path of ['/providers', '/providers/{name}', '/metrics/queue']) {
+      const op = doc.paths[path].get;
+      expect(op.security).toEqual([{ requestSignature: [] }, { bearerAuth: [] }]);
+      expect(op.responses['401'], path).toBeDefined();
     }
   });
 
@@ -21,12 +54,12 @@ describe('openApiDocument', () => {
     const doc = openApiDocument() as { paths: Record<string, any> };
     const op = doc.paths['/v1/notify']?.post;
     expect(op).toBeDefined();
-    expect(op.security).toEqual([{ requestSignature: [] }]);
+    expect(op.security).toEqual(SEND_SECURITY);
     const schema = op.requestBody.content['application/json'].schema;
     expect(schema.additionalProperties).toBe(false);
     for (const k of ['event_type', 'template_key', 'channel', 'to', 'priority']) expect(schema.properties[k], k).toBeDefined();
     expect(schema.properties.priority.enum).toEqual(['urgent', 'normal', 'bulk']);
-    for (const code of ['200', '202', '400', '401', '409', '422', '503']) expect(op.responses[code], code).toBeDefined();
+    for (const code of ['200', '202', '400', '401', '403', '409', '422', '503']) expect(op.responses[code], code).toBeDefined();
     expect(schema.properties.correlation_id.maxLength).toBe(128);
     expect(Object.keys(schema.properties.attachments.items.properties)).toEqual(['filename', 'contentType', 'data']);
     expect(op.responses['422'].content['application/json'].schema.properties.kind.enum).toEqual(['caller', 'configuration']);

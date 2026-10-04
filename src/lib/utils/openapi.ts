@@ -1,7 +1,12 @@
 import { providers } from '../providers';
 import { serializeProvider } from './provider-docs';
 
-const adminSecurity = [{ requestSignature: [], adminKey: [] }];
+// Either credential type authenticates a request (alternatives, not both at once).
+// Role names inside `bearerAuth` are valid because the document is OpenAPI 3.1.
+const sendSecurity = [{ requestSignature: [] }, { bearerAuth: ['notify:send'] }];
+const adminSecurity = [{ requestSignature: [] }, { bearerAuth: ['templates:admin'] }];
+const anySecurity = [{ requestSignature: [] }, { bearerAuth: [] }];
+
 
 const errorBody = (description: string) => ({
   description,
@@ -20,13 +25,18 @@ const errorBody = (description: string) => ({
   },
 });
 
+const unauthorized = () =>
+  errorBody('Missing, malformed, expired or invalid credentials, or both credential types on one request');
+const forbidden = (role: string) =>
+  errorBody(`Insufficient scope: the credential lacks \`${role}\` ({"error":"Insufficient scope","required":"${role}"})`);
+
 const adminErrors = {
   '400': {
     description: 'Validation error (Zod format): unknown keys, wrong types or a malformed id',
     content: { 'application/json': { schema: { type: 'object', additionalProperties: true } } },
   },
-  '401': { description: 'Missing or invalid request signature' },
-  '403': errorBody('The key id is not listed in NS_ADMIN_KEY_IDS ({"error":"admin scope required"})'),
+  '401': unauthorized(),
+  '403': forbidden('templates:admin'),
   '404': errorBody('not_found: no such template or policy'),
   '409': errorBody('invalid_state: the row is not in a state that allows this change'),
   '422': errorBody(
@@ -366,7 +376,7 @@ export function openApiDocument() {
           tags: ['send'],
           description:
             'Send by `event_type` (a policy picks the channels) or by `template_key` + `channel`. Content is rendered and validated before the request is accepted. `network` is server config and is never read from the request.',
-          security: [{ requestSignature: [] }],
+          security: sendSecurity,
           requestBody: jsonBody({
             type: 'object',
             additionalProperties: false,
@@ -427,7 +437,8 @@ export function openApiDocument() {
               content: { 'application/json': { schema: { $ref: '#/components/schemas/SendAccepted' } } },
             },
             '400': { description: 'Invalid request (Zod format), or `invalid_deadline`' },
-            '401': { description: 'Missing or invalid request signature' },
+            '401': unauthorized(),
+            '403': forbidden('notify:send'),
             '409': errorBody('idempotency_in_progress, or duplicate-fallback (a repeat without an idempotency_key within 5 seconds)'),
             '422': {
               description:
@@ -448,7 +459,7 @@ export function openApiDocument() {
               },
             },
             '503': errorBody(
-              'network_not_configured: NS_NETWORK is not set; template store unavailable: a template or policy not yet cached could not be read; audit store unavailable (normal and bulk sends)',
+              'network_not_configured: NS_NETWORK is not set; template store unavailable: a template or policy not yet cached could not be read; audit store unavailable (normal and bulk sends); auth unavailable: the Keycloak key set could not be reached for a bearer token',
             ),
           },
         },
@@ -456,7 +467,9 @@ export function openApiDocument() {
       '/notify': {
         post: {
           summary: 'Queue a notification',
-          security: [{ requestSignature: [] }],
+          description:
+            'Legacy send route, kept until the cutover release. Requires `notify:send`. Also accepts HMAC `v1` signatures (no body digest).',
+          security: sendSecurity,
           requestBody: {
             required: true,
             content: {
@@ -536,7 +549,8 @@ export function openApiDocument() {
               },
             },
             '400': { description: 'Invalid request or provider/template' },
-            '401': { description: 'Missing or invalid request signature' },
+            '401': unauthorized(),
+            '403': forbidden('notify:send'),
             '409': {
               description:
                 'Suppressed as a duplicate by the fallback content-hash key (no `dedupe_id` was supplied). Nothing was sent. Pass an explicit `dedupe_id` if the send is a deliberate retry.',
@@ -559,8 +573,9 @@ export function openApiDocument() {
       '/providers': {
         get: {
           summary: 'List providers and complete notify payloads',
-          security: [{ requestSignature: [] }],
+          security: anySecurity,
           responses: {
+            '401': unauthorized(),
             '200': {
               description: 'Provider metadata',
               content: {
@@ -575,7 +590,7 @@ export function openApiDocument() {
       '/providers/{name}': {
         get: {
           summary: 'Find a provider by name',
-          security: [{ requestSignature: [] }],
+          security: anySecurity,
           parameters: [
             {
               name: 'name',
@@ -594,6 +609,7 @@ export function openApiDocument() {
                 },
               },
             },
+            '401': unauthorized(),
             '404': { description: 'Provider not found' },
           },
         },
@@ -601,8 +617,9 @@ export function openApiDocument() {
       '/metrics/queue': {
         get: {
           summary: 'Read Redis queue metrics',
-          security: [{ requestSignature: [] }],
+          security: anySecurity,
           responses: {
+            '401': unauthorized(),
             '200': {
               description: 'Queue depths and retry timing',
               content: {
@@ -627,8 +644,7 @@ export function openApiDocument() {
       },
       '/openapi.json': {
         get: {
-          summary: 'OpenAPI document used by Scalar',
-          security: [{ requestSignature: [] }],
+          summary: 'OpenAPI document used by Scalar (served only when NS_DOCS_ENABLED=true)',
           responses: {
             '200': { description: 'OpenAPI 3.1 document' },
           },
@@ -637,7 +653,8 @@ export function openApiDocument() {
       '/failed/retry': {
         post: {
           summary: 'Manually retry failed jobs from the dead-letter queue',
-          security: [{ requestSignature: [] }],
+          description: 'Operator action: requires `templates:admin`. A credential holding only `notify:send` receives 403.',
+          security: adminSecurity,
           requestBody: {
             required: false,
             content: {
@@ -695,7 +712,8 @@ export function openApiDocument() {
               },
             },
             '400': { description: 'Invalid retry request' },
-            '401': { description: 'Missing or invalid request signature' },
+            '401': unauthorized(),
+            '403': forbidden('templates:admin'),
             '404': { description: 'Requested failed job was not found' },
           },
         },
@@ -704,19 +722,19 @@ export function openApiDocument() {
     components: {
       schemas: adminSchemas,
       securitySchemes: {
+        bearerAuth: {
+          type: 'http',
+          scheme: 'bearer',
+          bearerFormat: 'JWT',
+          description:
+            'Keycloak access token. Requires `aud` = `notification-service` and an allowlisted `azp`. Roles come from the `notification-service` client roles: `notify:send` and `templates:admin`. Do not send alongside the HMAC headers.',
+        },
         requestSignature: {
           type: 'apiKey',
           in: 'header',
           name: 'X-NS-Signature',
           description:
-            'Signed requests also require X-NS-Key, X-NS-Timestamp, and X-NS-Nonce.',
-        },
-        adminKey: {
-          type: 'apiKey',
-          in: 'header',
-          name: 'X-NS-Key',
-          description:
-            'Admin routes also require the signing key id to be listed in NS_ADMIN_KEY_IDS (comma-separated); otherwise 403.',
+            'HMAC v2. Send X-NS-Key (key id), X-NS-Timestamp (unix seconds, within 30 s of server time), X-NS-Nonce (unique per request) and X-NS-Signature: v2=<64 lowercase hex>. The signature is HMAC-SHA256 with the key secret over the canonical string METHOD\\npath\\ntimestamp\\nnonce\\nsha256(body), where path includes the query string and the digest is lowercase hex SHA-256 over the exact body bytes (the empty string when there is no body). v1 (METHOD\\npath\\ntimestamp\\nnonce) is accepted only on legacy /notify until the cutover release. Scopes come from the key\'s `scopes` entry in internal-secrets.json (default `notify:send`). Do not send alongside an Authorization header.',
         },
       },
     },
