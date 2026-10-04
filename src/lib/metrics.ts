@@ -89,6 +89,10 @@ const HELP: Record<string, [type: string, help: string]> = {
   ns_sms_send_total: ['counter', 'SMS sends attempted, by provider and outcome.'],
   ns_sms_provider_error_total: ['counter', 'SMS provider error responses, by provider and code.'],
   ns_job_dlq_total: ['counter', 'Jobs dead-lettered, by channel and reason.'],
+  ns_audit_write_failures_total: [
+    'counter',
+    'Best-effort audit status writes that failed, by stage (the status being written).',
+  ],
   ns_provider_balance: ['gauge', 'Provider account balance, where the provider exposes one.'],
   ns_provider_balance_updated_at: [
     'gauge',

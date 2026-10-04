@@ -13,6 +13,9 @@ vi.mock('../metrics', () => ({
   renderPrometheus: vi.fn(async () => ''),
 }));
 
+const { stamp } = vi.hoisted(() => ({ stamp: vi.fn(async () => {}) }));
+vi.mock('../audit/stamp', () => ({ stamp }));
+
 vi.mock('../queue', () => ({
   pushDLQ: vi.fn(async () => 1),
   scheduleRetry: vi.fn(async () => 1),
@@ -314,5 +317,46 @@ describe('processJob — a provider that throws must not lose the job', () => {
     await processJob(job({ attempt: 4 }));
 
     expect(queue.pushDLQ).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('processJob audit stamping', () => {
+  beforeEach(() => stamp.mockClear());
+
+  it('stamps dispatching then sent on success', async () => {
+    await processJob(job());
+    expect(stamp.mock.calls.map((c) => c[1])).toEqual([
+      { status: 'dispatching', attemptNo: 1 },
+      { status: 'sent', attemptNo: 1, providerMessageId: undefined },
+    ]);
+  });
+
+  it('stamps queued for the next attempt when a retry is scheduled', async () => {
+    send.mockResolvedValueOnce({ ok: false, error: 'timeout' });
+    await processJob(job());
+    expect(stamp.mock.calls.at(-1)?.[1]).toEqual({ status: 'queued', attemptNo: 2, error: 'timeout' });
+  });
+
+  it('stamps failed when dead-lettered', async () => {
+    send.mockResolvedValueOnce({ ok: false, error: 'bad template', retryable: false });
+    await processJob(job());
+    expect(stamp.mock.calls.at(-1)?.[1]).toEqual({ status: 'failed', attemptNo: 1, error: 'bad template' });
+  });
+
+  it('stamps failed with max_retries when the ladder is exhausted', async () => {
+    send.mockResolvedValueOnce({ ok: false });
+    await processJob(job({ attempt: 4 }));
+    expect(stamp.mock.calls.at(-1)?.[1]).toEqual({ status: 'failed', attemptNo: 5, error: 'max_retries' });
+  });
+
+  it('stamps failed for each pre-send dead-letter, without dispatching', async () => {
+    await processJob(job({ channel: 'nope' }));
+    await processJob(job({ channel: 'sms', template_id: 'pending_case' }));
+    await processJob(job({ template_id: 'not-a-template' }));
+    expect(stamp.mock.calls.map((c) => c[1])).toEqual([
+      { status: 'failed', attemptNo: 1, error: 'unknown_channel' },
+      { status: 'failed', attemptNo: 1, error: 'template_not_configured' },
+      { status: 'failed', attemptNo: 1, error: 'unknown_template' },
+    ]);
   });
 });

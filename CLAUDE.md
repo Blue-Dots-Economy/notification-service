@@ -326,6 +326,7 @@ live at scrape time rather than counted, so they cannot drift.
 | `ns_sms_send_total` | counter | `provider`, `result` (`ok`/`failed`) |
 | `ns_sms_provider_error_total` | counter | `provider`, `code` (`EC1003`, `HTTP_502`, `OTHER`) |
 | `ns_job_dlq_total` | counter | `channel`, `reason` |
+| `ns_audit_write_failures_total` | counter | `stage` (`dispatching`/`sent`/`queued`/`failed`) |
 | `ns_provider_balance` | gauge | `provider` |
 | `ns_provider_balance_updated_at` | gauge | `provider` |
 | `ns_provider_balance_poll_failures_total` | counter | `provider`, `reason` |
