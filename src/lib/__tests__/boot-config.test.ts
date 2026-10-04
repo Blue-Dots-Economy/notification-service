@@ -24,6 +24,7 @@ describe('validateBootConfig (API boot, before listen)', () => {
     ['WORKER_BULK_CONCURRENCY', '1.5'],
     ['URGENT_DEFAULT_DEADLINE_S', 'soon'],
     ['RECOVERY_MAX_AGE_HOURS', '-1'],
+    ['NS_RESOLVE_CACHE_TTL_MS', 'soon'],
   ])('throws naming %s on a bad value', (key, value) => {
     expect(() => validateBootConfig({ [key]: value })).toThrow(key);
   });

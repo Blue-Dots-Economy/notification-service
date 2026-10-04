@@ -5,6 +5,7 @@ vi.mock('../../policies/repo', () => policies);
 vi.mock('../../templates/repo', () => templates);
 
 import { planSend } from '../plan';
+import { clearResolveCache } from '../resolver-cache';
 import { SendError } from '../errors';
 import { TemplateError } from '../../templates/errors';
 import { V1NotifySchema } from '../request';
@@ -19,7 +20,12 @@ const tpl = (over: Record<string, unknown>) => ({
 const req = (b: Record<string, unknown>) => V1NotifySchema.parse(b);
 async function codeOf(p: Promise<unknown>) { try { await p; return undefined; } catch (e) { return (e as SendError).code ?? (e as Error).message; } }
 
-beforeEach(() => { policies.resolvePolicy.mockReset(); templates.resolveTemplate.mockReset(); });
+beforeEach(() => {
+  process.env.NS_NETWORK = 'n';
+  policies.resolvePolicy.mockReset();
+  templates.resolveTemplate.mockReset();
+  clearResolveCache();
+});
 
 const smsT = tpl({ channel: 'sms', templateKey: 'apply_sms', variables: [v('name')] });
 const emailT = tpl({ channel: 'email', templateKey: 'apply_email', provider: 'smtp', providerTemplateId: null, subject: 'Hi {{name}}', bodyHtml: '<p>{{name}} {{link}}</p>', variables: [v('name'), v('link', { type: 'url' })] });
@@ -91,6 +97,7 @@ describe('planSend', () => {
     expect((await planSend(req({ ...base, deadline: '2026-10-04T00:05:00Z' }), now)).deadline).toBe(now + 300_000);
     expect((await planSend(req(base), now)).deadline).toBe(now + 120_000);
     templates.resolveTemplate.mockResolvedValue({ template: tpl({ templateKey: 'k' }), renders: 'provider' });
+    clearResolveCache(); // the template changed under the same key
     expect((await planSend(req({ ...base, priority: 'urgent' }), now)).deadline).toBe(now + 600_000);
     expect((await planSend(req(base), now)).deadline).toBeUndefined();
   });

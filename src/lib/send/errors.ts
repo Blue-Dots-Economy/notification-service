@@ -13,3 +13,11 @@ export class SendError extends Error {
     this.kind = classify(code);
   }
 }
+
+/** The template/policy store could not be read and nothing usable was cached (answered 503). */
+export class StoreUnavailable extends Error {
+  constructor() {
+    super('template store unavailable');
+    this.name = 'StoreUnavailable';
+  }
+}

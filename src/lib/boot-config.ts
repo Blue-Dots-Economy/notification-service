@@ -1,6 +1,7 @@
 import { recoveryMaxAgeHours } from './audit/recover';
 import { urgentDefaultDeadlineS } from './deadline';
 import { poolConfig } from './pools';
+import { resolveCacheTtlMs } from './send/resolver-cache';
 import { validateWorkerConfig } from './worker';
 
 /**
@@ -13,5 +14,6 @@ export function validateBootConfig(env: NodeJS.ProcessEnv = process.env): void {
   recoveryMaxAgeHours(env);
   urgentDefaultDeadlineS(env);
   poolConfig(env);
+  resolveCacheTtlMs(env);
   validateWorkerConfig(env);
 }

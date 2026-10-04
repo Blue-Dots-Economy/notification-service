@@ -2,13 +2,12 @@ import type { DeliveryMode } from '../db/partitioned';
 import type { TemplateRow } from '../db/schema';
 import { urgentDefaultDeadlineS } from '../deadline';
 import { CHANNEL_CONTACT, planDelivery } from '../policies/plan';
-import { resolvePolicy } from '../policies/repo';
 import { TemplateError } from '../templates/errors';
 import { validateVariables } from '../templates/contract';
 import { renderTemplate, type Rendered } from '../templates/render';
-import { resolveTemplate } from '../templates/repo';
 import { classify, SendError } from './errors';
 import { parseDeadline, type V1Request } from './request';
+import { cachedResolvePolicy, cachedResolveTemplate } from './resolver-cache';
 
 export interface PlannedDelivery {
   channel: string;
@@ -53,7 +52,7 @@ export async function planSend(req: V1Request, now = Date.now()): Promise<SendPl
     mode = 'single';
     candidates = [{ channel: req.channel!, template_key: req.template_key }];
   } else {
-    const policy = await resolvePolicy(req.domain, req.event_type);
+    const policy = await cachedResolvePolicy(req.domain, req.event_type);
     if (!policy) throw new SendError('no_policy', `no active policy for ${req.event_type}`);
     candidates = planDelivery(policy, contacts).candidates;
     if (candidates.length === 0) throw new SendError('no_reachable_channel', 'no channel in the policy matches the supplied contact points');
@@ -69,7 +68,7 @@ export async function planSend(req: V1Request, now = Date.now()): Promise<SendPl
   const resolved: { channel: string; key: string; template: TemplateRow; renders: 'ns' | 'provider' }[] = [];
   for (const c of candidates) {
     try {
-      const { template, renders } = await resolveTemplate(c.channel, c.template_key, req.locale);
+      const { template, renders } = await cachedResolveTemplate(c.channel, c.template_key, req.locale);
       resolved.push({ channel: c.channel, key: c.template_key, template, renders });
     } catch (e) {
       if (!(e instanceof TemplateError)) throw e;

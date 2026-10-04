@@ -6,6 +6,8 @@ const repo = vi.hoisted(() => ({
   retireTemplate: vi.fn(), getTemplate: vi.fn(), listTemplates: vi.fn(),
 }));
 vi.mock('../../lib/templates/repo', () => repo);
+const cache = vi.hoisted(() => ({ clearResolveCache: vi.fn() }));
+vi.mock('../../lib/send/resolver-cache', () => cache);
 vi.mock('../../lib/templates/vendors', () => ({
   channelVendor: (c: string) => (c === 'email' ? { vendor: 'smtp', renders: 'ns' } : undefined),
 }));
@@ -37,6 +39,7 @@ const admin = { 'x-ns-key': 'ns-admin' };
 beforeEach(() => {
   process.env.NS_ADMIN_KEY_IDS = 'ns-admin';
   Object.values(repo).forEach((f) => f.mockReset());
+  cache.clearResolveCache.mockClear();
 });
 
 describe('admin template routes', () => {
@@ -123,5 +126,18 @@ describe('admin template routes', () => {
     const res = await (await build()).inject({ method: 'POST', url: `/v1/admin/templates/${ID}/preview`, headers: admin, payload: { variables: {} } });
     expect(res.statusCode).toBe(422);
     expect(res.json().error).toBe('missing_variable');
+  });
+
+  it('publish and retire clear the send-path resolver cache; a failed publish does not', async () => {
+    const app = await build();
+    repo.publishTemplate.mockRejectedValueOnce(new TemplateError('invalid_state', 'x'));
+    await app.inject({ method: 'POST', url: `/v1/admin/templates/${ID}/publish`, headers: admin });
+    expect(cache.clearResolveCache).not.toHaveBeenCalled();
+    repo.publishTemplate.mockResolvedValue({ ...row, status: 'active' });
+    expect((await app.inject({ method: 'POST', url: `/v1/admin/templates/${ID}/publish`, headers: admin })).statusCode).toBe(200);
+    expect(cache.clearResolveCache).toHaveBeenCalledTimes(1);
+    repo.retireTemplate.mockResolvedValue({ ...row, status: 'retired' });
+    expect((await app.inject({ method: 'POST', url: `/v1/admin/templates/${ID}/retire`, headers: admin })).statusCode).toBe(200);
+    expect(cache.clearResolveCache).toHaveBeenCalledTimes(2);
   });
 });

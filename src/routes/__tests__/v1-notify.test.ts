@@ -17,7 +17,7 @@ vi.mock('../../lib/dedupe', () => dd);
 
 const Fastify = (await import('fastify')).default;
 const { v1NotifyRoutes } = await import('../v1-notify');
-const { SendError } = await import('../../lib/send/errors');
+const { SendError, StoreUnavailable } = await import('../../lib/send/errors');
 
 const delivery = (channel: string) => ({ channel, to: channel === 'email' ? 'a@b.co' : '+919999999999', templateKey: `k_${channel}`, provider: 'msg91', providerTemplateId: 'f', rendered: { mode: 'provider', channel, providerTemplateId: 'f', variables: { name: 'A' } }, dlt: { senderId: null, dltEntityId: null, dltHeaderId: null, dltTagId: null } });
 
@@ -180,5 +180,17 @@ describe('POST /v1/notify', () => {
     const job = queue.pushManyToPriority.mock.calls[0]![0][0];
     expect(job.variables).toEqual({});
     expect(job.audit.redactValues).toBe(true);
+  });
+
+  it('a cold template store miss with Postgres down is 503 and releases the claim', async () => {
+    plan.planSend.mockRejectedValue(new StoreUnavailable());
+    const res = await post({ ...body, priority: 'urgent', idempotency_key: 'k' });
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toEqual({ error: 'template store unavailable' });
+    expect(idem.releaseIdempotency).toHaveBeenCalledTimes(1);
+    expect(queue.pushManyToPriority).not.toHaveBeenCalled();
+    plan.planSend.mockRejectedValue(new StoreUnavailable());
+    await post(body);
+    expect(dd.releaseDedupe).toHaveBeenCalledTimes(1);
   });
 });
