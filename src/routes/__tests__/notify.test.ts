@@ -70,10 +70,10 @@ const body = (variables: Record<string, unknown> = {}) => ({
   },
 });
 
-const post = async (payload: unknown) => {
+const post = async (payload: unknown, headers: Record<string, string> = {}) => {
   const app = await buildApp();
   try {
-    return await app.inject({ method: 'POST', url: '/notify', payload: payload as object });
+    return await app.inject({ method: 'POST', url: '/notify', payload: payload as object, headers });
   } finally {
     await app.close();
   }
@@ -242,6 +242,16 @@ describe('/notify audit', () => {
     const [job, update] = stamp.mock.calls[0]!;
     expect(update).toEqual({ status: 'failed', attemptNo: 1, error: 'enqueue failed' });
     expect((job as { audit: { attemptId: string } }).audit.attemptId).toEqual(expect.any(String));
+  });
+
+  it('caps x-correlation-id at 128 chars and falls back to job_id when blank', async () => {
+    await post(body(), { 'x-correlation-id': 'c'.repeat(500) });
+    await post(body({ subject: 'two' }), { 'x-correlation-id': '   ' });
+    await post(body({ subject: 'three' }), { 'x-correlation-id': ' corr-7 ' });
+    const audits = pushOther.mock.calls.map((c) => (c as unknown as [{ job_id: string; audit: { correlationId: string } }])[0]);
+    expect(audits[0]!.audit.correlationId).toBe('c'.repeat(128));
+    expect(audits[1]!.audit.correlationId).toBe(audits[1]!.job_id);
+    expect(audits[2]!.audit.correlationId).toBe('corr-7');
   });
 
   it('still answers 503 when releasing the claim fails', async () => {

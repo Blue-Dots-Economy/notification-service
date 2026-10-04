@@ -30,6 +30,14 @@ const NotifySchema = z.object({
   body: z.string().max(2000).optional(),
 });
 
+/** Persisted on every event; bounded so a caller cannot write arbitrary-size values. */
+export const MAX_CORRELATION_ID_LENGTH = 128;
+
+function correlationIdFrom(header: unknown, fallback: string): string {
+  const value = typeof header === 'string' ? header.trim().slice(0, MAX_CORRELATION_ID_LENGTH) : '';
+  return value || fallback;
+}
+
 export async function notifyRoutes(app: FastifyInstance) {
   app.route({
     url: '/notify',
@@ -80,7 +88,6 @@ export async function notifyRoutes(app: FastifyInstance) {
           : reply.code(409).send({ job_id, enqueued: false, reason: 'duplicate-fallback' });
       }
 
-      const correlation = req.headers['x-correlation-id'];
       const job = {
         job_id,
         ...body,
@@ -89,7 +96,7 @@ export async function notifyRoutes(app: FastifyInstance) {
           eventId: randomUUID(),
           attemptId: randomUUID(),
           createdAt: new Date().toISOString(),
-          correlationId: typeof correlation === 'string' && correlation ? correlation : job_id,
+          correlationId: correlationIdFrom(req.headers['x-correlation-id'], job_id),
           // Sticky: decided by the priority the caller sent, never re-derived.
           redactValues: priority === 'realtime',
         },
