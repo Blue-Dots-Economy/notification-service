@@ -493,6 +493,27 @@ describe('deadlines and redacted jobs', () => {
     expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'expired' }));
   });
 
+  it('expiry after a failed attempt keeps the provider error', async () => {
+    send.mockResolvedValueOnce({ ok: false, error: 'vendor 503' });
+    await processJob(smsJob({ priority: 'realtime', deadline: Date.now() + 1000 }));
+    expect(stamp).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.objectContaining({ status: 'expired', error: 'deadline passed: vendor 503' }),
+    );
+  });
+
+  it('log lines say dropped for redacted jobs and DLQ otherwise, without values', async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    send.mockResolvedValue({ ok: false, retryable: false, error: 'bad template' });
+    await processJob(smsJob({ priority: 'realtime' }));
+    await processJob(smsJob({ priority: 'other' }));
+    const lines = log.mock.calls.map((c) => c.join(' '));
+    log.mockRestore();
+    expect(lines.some((l) => l.includes('dropped (redacted, no DLQ)'))).toBe(true);
+    expect(lines.some((l) => l.includes('→ DLQ'))).toBe(true);
+    expect(lines.filter((l) => l.includes('dropped')).every((l) => !l.includes('DLQ:'))).toBe(true);
+  });
+
   it('redacted jobs are never dead-lettered', async () => {
     send.mockResolvedValueOnce({ ok: false, error: 'bad template', retryable: false });
     await processJob(smsJob({ priority: 'realtime' }));

@@ -14,10 +14,15 @@ import { isExpired, isRedacted, urgentDefaultDeadlineS, wouldExpire } from './de
 const MAX_RETRIES = 5;
 
 /** Past its deadline: never sent. Terminal, and never dead-lettered. */
-async function expire(job: Job, attemptNo: number) {
+async function expire(job: Job, attemptNo: number, cause?: string) {
   await metrics.incr('ns_job_expired_total', { channel: job.channel });
   await markAttempt(job, 'failed', attemptNo);
-  await stamp(job, { status: 'expired', attemptNo, error: 'deadline passed' });
+  await stamp(job, { status: 'expired', attemptNo, error: cause ? `deadline passed: ${cause}` : 'deadline passed' });
+}
+
+/** Log wording that matches what dropOrDeadLetter will do with the job. */
+function fate(job: Job): string {
+  return isRedacted(job) ? 'dropped (redacted, no DLQ)' : '→ DLQ';
 }
 
 /**
@@ -78,7 +83,7 @@ export async function processJob(job: Job) {
   job.attempt = (job.attempt ?? 0) + 1;
 
   if (!provider) {
-    console.log('Unknown provider, sending to DLQ:', job.job_id, job.channel);
+    console.log(`Unknown provider, ${fate(job)}:`, job.job_id, job.channel);
     return dropOrDeadLetter(job, 'unknown_channel');
   }
 
@@ -99,7 +104,7 @@ export async function processJob(job: Job) {
   if (named === '' || namedBody === '') {
     console.log(
       `Template '${job.template_id}' is named but not fully configured for the active provider ` +
-        `(id=${named === '' ? 'missing' : 'ok'}, body=${namedBody === '' ? 'missing' : 'ok'}), sending to DLQ:`,
+        `(id=${named === '' ? 'missing' : 'ok'}, body=${namedBody === '' ? 'missing' : 'ok'}), ${fate(job)}:`,
       job.job_id
     );
     return dropOrDeadLetter(job, 'template_not_configured');
@@ -107,7 +112,7 @@ export async function processJob(job: Job) {
 
   const templateId = named ?? (provider.allowRawTemplateId ? job.template_id : undefined);
   if (!templateId) {
-    console.log('Unknown provider template, sending to DLQ:', job.job_id);
+    console.log(`Unknown provider template, ${fate(job)}:`, job.job_id);
     return dropOrDeadLetter(job, 'unknown_template');
   }
 
@@ -145,19 +150,19 @@ export async function processJob(job: Job) {
     // rejected sender id — will fail identically four more times. Retrying it
     // only delays the diagnosis and buries the cause under "max retries".
     if (res.retryable === false) {
-      console.log(`Permanent failure → DLQ: ${job.job_id}${res.error ? ` (${res.error})` : ''}`);
+      console.log(`Permanent failure ${fate(job)}: ${job.job_id}${res.error ? ` (${res.error})` : ''}`);
       return dropOrDeadLetter(job, 'permanent_failure', res.error);
     }
 
     if (job.attempt >= MAX_RETRIES) {
       console.log(
-        `Max retries reached → DLQ: ${job.job_id}${res.error ? ` (${res.error})` : ''}`
+        `Max retries reached ${fate(job)}: ${job.job_id}${res.error ? ` (${res.error})` : ''}`
       );
       return dropOrDeadLetter(job, 'max_retries', res.error);
     }
 
     const delay = 5 * Math.pow(2, job.attempt - 1);
-    if (wouldExpire(job, delay * 1000)) return expire(job, job.attempt);
+    if (wouldExpire(job, delay * 1000)) return expire(job, job.attempt, res.error);
     console.log(`Retry scheduled in ${delay}s:`, job.job_id);
 
     // Stamp, then the retry ZADD and the `retry` marker in one MULTI: the
