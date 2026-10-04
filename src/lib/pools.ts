@@ -31,22 +31,43 @@ export function poolConfig(env: NodeJS.ProcessEnv = process.env): PoolConfig {
   return out;
 }
 
-/** One pop + handle. A handler throw is contained: one bad job never ends its loop. */
+/** What processJob returns when it deferred a job instead of attempting it. */
+export interface Deferred {
+  deferredMs: number;
+}
+
+function deferredMs(result: unknown): number | undefined {
+  if (typeof result !== 'object' || result === null) return undefined;
+  const ms = (result as Partial<Deferred>).deferredMs;
+  return typeof ms === 'number' && Number.isFinite(ms) && ms > 0 ? ms : undefined;
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * One pop + handle. A handler throw is contained: one bad job never ends its
+ * loop. A deferred job (rate limit) makes the loop wait out the deferral before
+ * its next pop, rather than spinning on the same denial.
+ */
 export async function runPoolIteration(
   conn: Redis,
   priority: Priority,
   handle: (job: Job) => Promise<unknown>,
+  wait: (ms: number) => Promise<void> = sleep,
 ): Promise<boolean> {
   const job = await popFrom(conn, priority, 1);
   if (!job) return false;
+  let result: unknown;
   try {
-    await handle(job);
+    result = await handle(job);
   } catch (err) {
     console.error(
       `pool ${priority}: job ${job.job_id} failed outside processJob:`,
       err instanceof Error ? err.message : String(err),
     );
   }
+  const backoff = deferredMs(result);
+  if (backoff !== undefined) await wait(backoff);
   return true;
 }
 

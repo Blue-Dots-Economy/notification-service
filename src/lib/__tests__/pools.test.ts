@@ -49,6 +49,54 @@ describe('runPoolIteration', () => {
   });
 });
 
+describe('deferral backoff', () => {
+  it('waits out a deferral before returning to pop again', async () => {
+    vi.mocked(popFrom).mockResolvedValueOnce(job as never);
+    const wait = vi.fn(async () => {});
+    await runPoolIteration({} as never, 'bulk', async () => ({ deferredMs: 300 }), wait);
+    expect(wait).toHaveBeenCalledWith(300);
+  });
+
+  it('does not wait after a send, a throw, or an empty pop', async () => {
+    const wait = vi.fn(async () => {});
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(popFrom).mockResolvedValueOnce(job as never);
+    await runPoolIteration({} as never, 'bulk', async () => undefined, wait);
+    vi.mocked(popFrom).mockResolvedValueOnce(job as never);
+    await runPoolIteration({} as never, 'bulk', async () => 1, wait);
+    vi.mocked(popFrom).mockResolvedValueOnce(job as never);
+    await runPoolIteration({} as never, 'bulk', async () => { throw new Error('x'); }, wait);
+    vi.mocked(popFrom).mockResolvedValueOnce(null);
+    await runPoolIteration({} as never, 'bulk', async () => ({ deferredMs: 300 }), wait);
+    expect(wait).not.toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+
+  it('a pool loop does not pop again until the deferral has elapsed', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(popFrom).mockReset().mockResolvedValue(job as never);
+      const connect = () => Object.assign(new EventEmitter(), { disconnect: vi.fn() }) as never;
+      const handle = vi.fn(async () => ({ deferredMs: 300 }));
+      const pools = startPools({ realtime: 0, other: 0, bulk: 1 }, { connect, handle });
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(popFrom).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(299);
+      expect(popFrom).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(popFrom).toHaveBeenCalledTimes(2);
+
+      const stopped = pools.stop();
+      await vi.advanceTimersByTimeAsync(1000);
+      await stopped;
+    } finally {
+      vi.mocked(popFrom).mockReset();
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe('startPools redis error listener', () => {
   afterEach(() => vi.restoreAllMocks());
 

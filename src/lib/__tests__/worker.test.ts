@@ -158,7 +158,7 @@ describe('processJob — rate limit', () => {
     acquireSendToken.mockRejectedValueOnce(new Error('redis down'));
     const j = job({ attempt: 1 });
 
-    await processJob(j);
+    expect(await processJob(j)).toEqual({ deferredMs: 321 });
 
     expect(queue.deferJob).toHaveBeenCalledWith(j, 321);
     expect(j.attempt).toBe(1);
@@ -175,7 +175,7 @@ describe('processJob — rate limit', () => {
     acquireSendToken.mockResolvedValueOnce(false);
     const j = job({ attempt: 2, priority: 'bulk' });
 
-    await processJob(j);
+    expect(await processJob(j)).toEqual({ deferredMs: 321 });
 
     expect(queue.deferJob).toHaveBeenCalledWith(j, 321);
     expect(j.attempt).toBe(2);
@@ -189,7 +189,7 @@ describe('processJob — rate limit', () => {
   it('proceeds as before when a token is granted', async () => {
     const j = job({ priority: 'realtime' });
 
-    await processJob(j);
+    expect(await processJob(j)).toBeUndefined(); // not a deferral
 
     expect(acquireSendToken).toHaveBeenCalledWith('email', 'smtp', 'realtime');
     expect(queue.deferJob).not.toHaveBeenCalled();
