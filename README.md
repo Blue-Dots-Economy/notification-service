@@ -104,6 +104,9 @@ is for local runs only).
 | `RATE_LIMIT_DEFER_MS` | `250` | Wait before a rate-limited job is retried (plus up to 50% jitter); the attempt is not counted |
 | `PROVIDER_TIMEOUT_MS` | `10000` | Cap on every vendor call; a timeout is a retryable failure |
 | `URGENT_DEFAULT_DEADLINE_S` | `600` | An urgent job older than this is expired unsent, never dead-lettered |
+| `EMAIL_FROM_ADDRESS` | — | Sender address for `/v1/notify` email; unset, every v1 email delivery fails permanently with `email sender not configured` |
+| `EMAIL_FROM_NAME` | `EMAIL_FROM_ADDRESS` | Sender display name for `/v1/notify` email |
+| `NS_RESOLVE_CACHE_TTL_MS` | `60000` | Age after which a cached template/policy is refreshed in the background; positive integer |
 
 An invalid value in any of these exits the worker at boot rather than dropping jobs later. Urgent
 sends take the shared quota first, then the reserved share; normal and bulk use the shared quota only.
@@ -378,16 +381,18 @@ keys return `400`.
 | `priority` | `urgent`, `normal` (default) or `bulk` |
 | `idempotency_key` | 1-128 chars. A repeat returns `200` with the original response |
 | `deadline` | ISO-8601 with offset, in the future, at most 24 h ahead |
-| `cc`, `reply_to`, `attachments` | Email only |
+| `cc`, `reply_to`, `attachments` | Email only. `attachments` items are `{filename, contentType, data}` (base64), with the `/notify` limits |
+| `correlation_id` | Optional, trimmed, at most 128 chars. Wins over the `x-correlation-id` header; blank falls back to the header, then the event id |
 
 | Status | Meaning |
 |---|---|
 | `200` | Repeat of an `idempotency_key`: the original response |
 | `202` | Accepted; delivery is asynchronous |
 | `400` | Invalid request or `invalid_deadline` |
+| `401` | Missing or invalid request signature |
 | `409` | `idempotency_in_progress`, or `duplicate-fallback` (same content within 5 s and no key) |
 | `422` | `{ error, kind, message, details? }`; `kind` is `caller` or `configuration` |
-| `503` | `network_not_configured`, or `audit store unavailable` (normal/bulk) |
+| `503` | `network_not_configured`; `template store unavailable` (a template or policy not yet cached could not be read); or `audit store unavailable` (normal/bulk) |
 
 `422` codes. `caller`: `missing_variable`, `unknown_variable`, `invalid_variable`,
 `no_reachable_channel`. `configuration`: `not_found`, `vendor_mismatch`, `incomplete_template`,
