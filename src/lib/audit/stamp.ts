@@ -1,5 +1,6 @@
 import type { Job } from 'src/types';
 import * as metrics from '../metrics';
+import { describeDbError } from '../db/errors';
 import { toAcceptedRecord } from './redact';
 import { upsertAttempt, type AttemptUpdate } from './store';
 
@@ -34,7 +35,7 @@ async function write_(job: Job, update: AttemptUpdate): Promise<void> {
   } catch (err) {
     try {
       await metrics.incr('ns_audit_write_failures_total', { stage: update.status });
-      console.log(`Audit write failed for ${job.job_id} (${update.status}):`, err instanceof Error ? err.message : err);
+      console.log(`Audit write failed for ${job.job_id} (${update.status}):`, describeDbError(err));
     } catch {
       /* best-effort */
     }

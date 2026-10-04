@@ -1,5 +1,6 @@
 import type { Pool } from 'pg';
 import { getPool } from './client';
+import { describeDbError } from './errors';
 
 /**
  * pg_partman maintenance, driven by NS rather than pg_partman's background
@@ -35,7 +36,7 @@ export function startPartitionMaintenance(
 ): NodeJS.Timeout {
   const tick = () =>
     runPartitionMaintenance().catch((err) =>
-      console.error('Partition maintenance failed:', err instanceof Error ? err.message : err),
+      console.error('Partition maintenance failed:', describeDbError(err)),
     );
   void tick();
   return setInterval(tick, intervalMs).unref();

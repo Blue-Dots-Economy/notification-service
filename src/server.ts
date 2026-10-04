@@ -4,6 +4,7 @@ import { spawnWorker } from './lib/worker.js';
 import { runMigrations } from './lib/db/migrate.js';
 import { startPartitionMaintenance } from './lib/db/maintenance.js';
 import { recoverLostJobs } from './lib/audit/recover.js';
+import { describeDbError } from './lib/db/errors.js';
 
 const PORT = process.env.SERVER_PORT || `3000`;
 
@@ -20,7 +21,7 @@ async function main() {
   spawnWorker();
   // Periodic stale-dispatch sweep; a failure is logged, never thrown.
   setInterval(() => {
-    recoverLostJobs().catch((err) => console.error('Recovery sweep failed:', err instanceof Error ? err.message : err));
+    recoverLostJobs().catch((err) => console.error('Recovery sweep failed:', describeDbError(err)));
   }, 5 * 60 * 1000).unref();
   console.log(`API running on worker ${process.pid}`);
 }

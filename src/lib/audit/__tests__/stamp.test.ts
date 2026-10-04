@@ -60,4 +60,17 @@ describe('stamp', () => {
     incr.mockRejectedValueOnce(new Error('redis down'));
     await expect(stamp(job, { status: 'sent', attemptNo: 1 })).resolves.toBeUndefined();
   });
+
+  it('logs a summary, never the query parameters a DrizzleQueryError carries', async () => {
+    const { DrizzleQueryError } = await import('drizzle-orm/errors');
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    upsertAttempt.mockRejectedValueOnce(
+      new DrizzleQueryError('INSERT ...', ['asha@example.com'], Object.assign(new Error('timeout'), { code: '57014' })),
+    );
+    await stamp(job, { status: 'sent', attemptNo: 1 });
+    const logged = log.mock.calls.flat().join(' ');
+    log.mockRestore();
+    expect(logged).toContain('[57014] timeout');
+    expect(logged).not.toContain('asha@example.com');
+  });
 });

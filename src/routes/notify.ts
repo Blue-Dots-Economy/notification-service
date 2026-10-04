@@ -7,6 +7,7 @@ import { providers } from '../lib/providers';
 import * as queue from '../lib/queue';
 import { recordAccepted } from '../lib/audit/store';
 import { toAcceptedRecord } from '../lib/audit/redact';
+import { describeDbError } from '../lib/db/errors';
 import { requestAuth } from '../plugins/request-auth';
 import { notifyBodyLimitBytes } from '../lib/providers/email/attachments';
 
@@ -99,7 +100,7 @@ export async function notifyRoutes(app: FastifyInstance) {
         // Queue first: a slow or unavailable Postgres must never delay an OTP.
         await queue.pushRealtime(job);
         void recordAccepted(record).catch((err) =>
-          req.log.error({ err: (err as Error)?.message ?? String(err), job_id }, 'realtime audit insert failed'),
+          req.log.error({ err: describeDbError(err), job_id }, 'realtime audit insert failed'),
         );
         return reply.send({ job_id, enqueued: true });
       }
@@ -110,7 +111,7 @@ export async function notifyRoutes(app: FastifyInstance) {
       try {
         await recordAccepted(record);
       } catch (err) {
-        req.log.error({ err: (err as Error).message, job_id }, 'audit insert failed; refusing send');
+        req.log.error({ err: describeDbError(err), job_id }, 'audit insert failed; refusing send');
         // Release the claim so a retry is not suppressed as a duplicate of a
         // send that was never queued. Best-effort: never changes the 503.
         await releaseDedupe(key).catch((e) =>
