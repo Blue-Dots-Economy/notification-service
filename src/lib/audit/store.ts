@@ -1,4 +1,5 @@
 import { sql } from 'drizzle-orm';
+import type { Priority } from 'src/types';
 import { getDb } from '../db/client';
 import type { AttemptStatus } from '../db/partitioned';
 import { ATTEMPT_RANK, eventStatusFor } from './status';
@@ -22,7 +23,7 @@ export interface AcceptedRecord {
   ids: AuditIds;
   network: string;
   source: string;
-  priority: 'realtime' | 'other';
+  priority: Priority;
   channel: string;
   templateId: string;
   traceId?: string;

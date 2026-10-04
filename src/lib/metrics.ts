@@ -152,7 +152,7 @@ export async function renderPrometheus(
   }
 
   // Queue depths are read live, so a scrape always reflects the real backlog.
-  for (const q of ['realtime', 'other', 'retry_count', 'dlq'] as const) {
+  for (const q of ['realtime', 'other', 'bulk', 'retry_count', 'dlq'] as const) {
     const value = queue[q];
     if (typeof value === 'number') {
       push('ns_queue_depth', formatSeries('ns_queue_depth', { queue: q }, value));
