@@ -50,6 +50,26 @@ describe('sendRendered', () => {
     expect(res).toMatchObject({ ok: false, retryable: false, error: 'email sender not configured' });
   });
 
+  it('email sends a text-only body', async () => {
+    const res = await emailProvider.sendRendered!({
+      to: 'a@b.c', providerTemplateId: null,
+      rendered: { mode: 'ns', channel: 'email', subject: 'Hi', html: null, text: 'plain' },
+    });
+    expect(res.ok).toBe(true);
+    const arg = sendMail.mock.calls[0]![0] as Record<string, unknown>;
+    expect(arg.text).toBe('plain');
+    expect(arg.html).toBeUndefined();
+  });
+
+  it('email with neither html nor text fails permanently', async () => {
+    const res = await emailProvider.sendRendered!({
+      to: 'a@b.c', providerTemplateId: null,
+      rendered: { mode: 'ns', channel: 'email', subject: 'Hi', html: '', text: null },
+    });
+    expect(res).toMatchObject({ ok: false, retryable: false, error: 'email has no body' });
+    expect(sendMail).not.toHaveBeenCalled();
+  });
+
   it('email refuses provider-mode content', async () => {
     const res = await emailProvider.sendRendered!({
       to: 'a@b.c', providerTemplateId: 'x',
@@ -69,6 +89,18 @@ describe('sendRendered', () => {
     expect(body.message[0].text).toBe('OTP 12{{message}}34');
     expect(body.dlttempid).toBe('1107');
     expect(body.sender).toBe('TPLSND');
+    expect(body.dltentityid).toBe('ENVENT');
+  });
+
+  it('pinnacle ignores blank DLT overrides and uses env values', async () => {
+    const res = await pinnacleSmsProvider.sendRendered!({
+      to: '+919999999999', providerTemplateId: '1107',
+      rendered: { mode: 'ns', channel: 'sms', text: 'hello', messageType: 'TXT' },
+      dlt: { senderId: '', dltEntityId: '  ' },
+    });
+    expect(res.ok).toBe(true);
+    const body = JSON.parse((vi.mocked(fetch).mock.calls[0]![1] as RequestInit).body as string);
+    expect(body.sender).toBe('ENVSND');
     expect(body.dltentityid).toBe('ENVENT');
   });
 

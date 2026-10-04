@@ -168,6 +168,14 @@ export async function sendPinnacleText(
     return { ok: false, error: config.error, retryable: false };
   }
 
+  // Blank or whitespace-only overrides count as absent: only a real value wins.
+  const pick = (v: string | null | undefined, fallback: string | undefined) =>
+    v && v.trim() ? v.trim() : fallback;
+  const sender = pick(overrides.senderId, config.sender)!;
+  const dltEntityId = pick(overrides.dltEntityId, config.dltEntityId)!;
+  const dltHeaderId = pick(overrides.dltHeaderId, config.dltHeaderId);
+  const dltTagId = pick(overrides.dltTagId, config.dltTagId);
+
   const messagetype = messageType(text);
   if (text.length > MAX_LENGTH[messagetype]) {
     await metrics.incr('ns_sms_send_total', { provider: 'pinnacle', result: 'failed' });
@@ -179,16 +187,12 @@ export async function sendPinnacleText(
   }
 
   const payload = {
-    sender: overrides.senderId ?? config.sender,
+    sender,
     messagetype,
-    dltentityid: overrides.dltEntityId ?? config.dltEntityId,
+    dltentityid: dltEntityId,
     dlttempid: dltTemplateId,
-    ...((overrides.dltHeaderId ?? config.dltHeaderId)
-      ? { dltheaderid: (overrides.dltHeaderId ?? config.dltHeaderId)! }
-      : {}),
-    ...((overrides.dltTagId ?? config.dltTagId)
-      ? { dlttagid: (overrides.dltTagId ?? config.dltTagId)! }
-      : {}),
+    ...(dltHeaderId ? { dltheaderid: dltHeaderId } : {}),
+    ...(dltTagId ? { dlttagid: dltTagId } : {}),
     ...(config.tmid ? { tmid: config.tmid } : {}),
     message: [
       {
