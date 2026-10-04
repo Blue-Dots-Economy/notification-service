@@ -21,6 +21,12 @@ export interface AuditIds {
   deliveryMode?: DeliveryMode;
   /** Variable NAMES of a redacted send (its job carries no values). */
   variableNames?: string[];
+  /**
+   * Send API v1: every contact point the request supplied ({email, phone}).
+   * The event payload records this rather than the one channel's address of
+   * the first job. Recipients only, never variable values.
+   */
+  recipients?: Record<string, string>;
 }
 
 export interface AcceptedRecord {

@@ -193,4 +193,51 @@ describe('POST /v1/notify', () => {
     await post(body);
     expect(dd.releaseDedupe).toHaveBeenCalledTimes(1);
   });
+
+  it('retries a failed idempotency completion once; the send still stands', async () => {
+    idem.completeIdempotency.mockRejectedValueOnce(new Error('db blip'));
+    const res = await post({ ...body, idempotency_key: 'k' });
+    expect(res.statusCode).toBe(202);
+    expect(idem.completeIdempotency).toHaveBeenCalledTimes(2);
+    idem.completeIdempotency.mockClear();
+    idem.completeIdempotency.mockRejectedValueOnce(new Error('db down')).mockRejectedValueOnce(new Error('db down'));
+    const again = await post({ ...body, idempotency_key: 'k2' });
+    expect(again.statusCode).toBe(202);
+    expect(idem.completeIdempotency).toHaveBeenCalledTimes(2);
+    expect(idem.releaseIdempotency).not.toHaveBeenCalled();
+  });
+
+  it('a body correlation_id wins over the header, trimmed; longer than 128 is a 400', async () => {
+    const a = await app();
+    const send = (payload: unknown, id?: string) =>
+      a.inject({ method: 'POST', url: '/v1/notify', payload, headers: { 'x-ns-key': 'signals', ...(id ? { 'x-correlation-id': id } : {}) } });
+    expect((await send({ ...body, correlation_id: '  body-1 ' }, 'hdr-1')).json().correlation_id).toBe('body-1');
+    expect((await send({ ...body, correlation_id: '   ' }, 'hdr-1')).json().correlation_id).toBe('hdr-1');
+    expect((await send({ ...body, correlation_id: 'x'.repeat(129) })).statusCode).toBe(400);
+  });
+
+  it('email extras ride only on jobs that can deliver by email', async () => {
+    plan.planSend.mockResolvedValue({ mode: 'all', deliveries: [delivery('sms'), delivery('email')], redact: false, variables: {} });
+    await post({ ...body, cc: ['c@b.co'], reply_to: 'r@b.co' });
+    const [smsJob, emailJob] = queue.pushManyToPriority.mock.calls[0]![0];
+    expect(smsJob.v1.email).toBeUndefined();
+    expect(emailJob.v1.email).toEqual({ cc: ['c@b.co'], replyTo: 'r@b.co', attachments: undefined });
+    queue.pushManyToPriority.mockClear();
+    plan.planSend.mockResolvedValue({ mode: 'first_available', deliveries: [delivery('sms'), delivery('email')], redact: false, variables: {} });
+    await post({ ...body, cc: ['c@b.co'] });
+    expect(queue.pushManyToPriority.mock.calls[0]![0][0].v1.email).toMatchObject({ cc: ['c@b.co'] });
+    queue.pushManyToPriority.mockClear();
+    plan.planSend.mockResolvedValue({ mode: 'first_available', deliveries: [delivery('sms')], redact: false, variables: {} });
+    await post({ ...body, cc: ['c@b.co'] });
+    expect(queue.pushManyToPriority.mock.calls[0]![0][0].v1.email).toBeUndefined();
+  });
+
+  it('the event payload records every contact point the request supplied, also when redacted', async () => {
+    plan.planSend.mockResolvedValue({ mode: 'all', deliveries: [delivery('sms'), delivery('email')], redact: true, variables: { message: '123456' } });
+    await post({ ...body, priority: 'urgent' });
+    await new Promise((r) => setImmediate(r));
+    const recs = store.recordAcceptedMany.mock.calls[0]![0] as any[];
+    for (const r of recs) expect(r.payload.to).toEqual({ phone: '+919999999999', email: 'a@b.co' });
+    expect(JSON.stringify(recs)).not.toContain('123456');
+  });
 });

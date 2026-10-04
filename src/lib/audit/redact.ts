@@ -52,6 +52,7 @@ export function toAcceptedRecord(job: Job, source: string): AcceptedRecord {
   if (!job.audit) throw new Error(`job ${job.job_id} has no audit ids`);
   const realtime =
     (job.audit.redactValues ?? job.priority === 'realtime') || isOtpTemplate(job.template_id);
+  const to = job.audit.recipients ?? job.to;
   return {
     ids: job.audit,
     network: process.env.NS_NETWORK ?? 'unknown',
@@ -60,9 +61,9 @@ export function toAcceptedRecord(job: Job, source: string): AcceptedRecord {
     channel: job.channel,
     templateId: job.template_id,
     payload: realtime
-      ? { to: job.to, variable_names: job.audit.variableNames ?? Object.keys(job.variables ?? {}) }
+      ? { to, variable_names: job.audit.variableNames ?? Object.keys(job.variables ?? {}) }
       : {
-          to: job.to,
+          to,
           variables: withoutAttachmentBodies(job.channel, job.variables),
           ...(job.body ? { body: job.body } : {}),
         },
