@@ -223,6 +223,10 @@ export class RedisFake {
   multi() {
     const queued: Array<() => Promise<unknown>> = [];
     const chain = {
+      lpush: (key: string, value: string) => {
+        queued.push(() => this.lpush(key, value));
+        return chain;
+      },
       llen: (key: string) => {
         queued.push(() => this.llen(key));
         return chain;

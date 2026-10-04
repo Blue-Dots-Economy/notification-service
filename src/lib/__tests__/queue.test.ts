@@ -201,6 +201,19 @@ describe('getQueueMetrics', () => {
   });
 });
 
+describe('pushOtherMany', () => {
+  it('pushes every job to the other queue in order', async () => {
+    await queue.pushOtherMany([job({ job_id: 'm1' }), job({ job_id: 'm2' })]);
+    const popped = [await queue.popOther(), await queue.popOther()].map((p) => JSON.parse(p![1]).job_id);
+    expect(popped).toEqual(['m1', 'm2']);
+  });
+
+  it('is a no-op for an empty batch', async () => {
+    await queue.pushOtherMany([]);
+    expect(await redis.llen('queue:other')).toBe(0);
+  });
+});
+
 describe('retryFailedJobs replay accounting', () => {
   it('increments replays and refuses past MAX_REPLAYS', async () => {
     await queue.pushDLQ(job({ job_id: 'p', replays: queue.MAX_REPLAYS }));

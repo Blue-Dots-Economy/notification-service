@@ -28,6 +28,20 @@ export async function pushOther(job: Job) {
   return redis.lpush(OTHER_QUEUE, JSON.stringify(job));
 }
 
+/**
+ * Enqueue many fallback jobs in one MULTI round trip (recovery). Throws if
+ * any push failed, so the caller can roll back what it recorded.
+ */
+export async function pushOtherMany(jobs: Job[]): Promise<void> {
+  if (jobs.length === 0) return;
+  const tx = redis.multi();
+  for (const job of jobs) tx.lpush(OTHER_QUEUE, JSON.stringify(job));
+  const results = await tx.exec();
+  if (!results) throw new Error('Redis MULTI aborted while re-queueing');
+  const failed = results.find(([err]) => err);
+  if (failed) throw failed[0];
+}
+
 /** Pop from REALTIME queue. Timeout prevents starving lower-priority work. */
 export async function popRealtime(timeoutSeconds = 1) {
   return redis.brpop(REALTIME_QUEUE, timeoutSeconds);

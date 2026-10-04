@@ -2,28 +2,29 @@ import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const pushed: unknown[] = [];
-vi.mock('../../queue', () => ({ pushOther: vi.fn(async (j: unknown) => { pushed.push(j); return 1; }) }));
+vi.mock('../../queue', () => ({ pushOtherMany: vi.fn(async (jobs: unknown[]) => { pushed.push(...jobs); }) }));
 
 import redis from '../../redis';
-import { pushOther } from '../../queue';
+import { pushOtherMany } from '../../queue';
 import { closeDb, getPool } from '../../db/client';
 import { runMigrations } from '../../db/migrate';
 import { recordAccepted, upsertAttempt, type AcceptedRecord } from '../store';
-import { recoverLostJobs, REDIS_EPOCH_KEY, REDIS_RECOVERY_LOCK_KEY } from '../recover';
+import { ABANDONED_ERROR, recoverLostJobs, REDIS_EPOCH_KEY, REDIS_RECOVERY_LOCK_KEY } from '../recover';
+import { attemptMarkerKey } from '../marker';
 
 beforeAll(async () => { await runMigrations(); });
 afterAll(async () => { await closeDb(); redis.disconnect(); });
 beforeEach(async () => {
   pushed.length = 0;
-  vi.mocked(pushOther).mockClear();
+  vi.mocked(pushOtherMany).mockClear();
   await redis.del(REDIS_RECOVERY_LOCK_KEY);
   await getPool().query(`DELETE FROM delivery_attempt; DELETE FROM notification_event;`);
 });
 
-function rec(priority: 'realtime' | 'other'): AcceptedRecord {
+function rec(priority: 'realtime' | 'other', createdAt = new Date()): AcceptedRecord {
   const jobId = randomUUID();
   return {
-    ids: { eventId: randomUUID(), attemptId: randomUUID(), createdAt: new Date().toISOString(), correlationId: jobId },
+    ids: { eventId: randomUUID(), attemptId: randomUUID(), createdAt: createdAt.toISOString(), correlationId: jobId },
     network: 'n', source: 's', priority, channel: 'email', templateId: 't',
     payload: {}, recoverable: priority === 'other',
     job: priority === 'other' ? { job_id: jobId, channel: 'email', priority, to: 'x', template_id: 't', variables: {} } : undefined,
@@ -51,7 +52,7 @@ describe('recoverLostJobs', () => {
   it('does nothing when the epoch is present and nothing is stale', async () => {
     await recordAccepted(rec('other'));
     await redis.set(REDIS_EPOCH_KEY, 'x');
-    expect(await recoverLostJobs()).toEqual({ epochLost: false, requeued: 0 });
+    expect(await recoverLostJobs()).toMatchObject({ epochLost: false, requeued: 0 });
   });
 
   it('does not requeue realtime', async () => {
@@ -82,7 +83,7 @@ describe('recoverLostJobs', () => {
     const r = rec('other');
     await recordAccepted(r); // updated_at = now, newer than Redis start
     await redis.del(REDIS_EPOCH_KEY);
-    expect(await recoverLostJobs()).toEqual({ epochLost: true, requeued: 0 });
+    expect(await recoverLostJobs()).toMatchObject({ epochLost: true, requeued: 0 });
     expect(await redis.get(REDIS_EPOCH_KEY)).not.toBeNull();
   });
 
@@ -104,7 +105,7 @@ describe('recoverLostJobs', () => {
     await upsertAttempt(r, { status: 'dispatching', attemptNo: 1 });
     await backdate(r, '1 hour');
     await redis.set(REDIS_EPOCH_KEY, 'x');
-    vi.mocked(pushOther).mockRejectedValueOnce(new Error('redis down'));
+    vi.mocked(pushOtherMany).mockRejectedValueOnce(new Error('redis down'));
     await expect(recoverLostJobs({ staleDispatchMs: 60_000 })).rejects.toThrow('redis down');
     const { rows } = await getPool().query(`SELECT attempt_no, status FROM delivery_attempt WHERE id = $1`, [r.ids.attemptId]);
     expect(rows[0]).toMatchObject({ attempt_no: 1, status: 'dispatching' });
@@ -117,9 +118,148 @@ describe('recoverLostJobs', () => {
     await recordAccepted(r);
     await backdate(r);
     await redis.del(REDIS_EPOCH_KEY);
-    vi.mocked(pushOther).mockRejectedValueOnce(new Error('redis down'));
+    vi.mocked(pushOtherMany).mockRejectedValueOnce(new Error('redis down'));
     await expect(recoverLostJobs()).rejects.toThrow();
     expect(await redis.get(REDIS_EPOCH_KEY)).toBeNull();
-    expect(await recoverLostJobs()).toEqual({ epochLost: true, requeued: 1 });
+    expect(await recoverLostJobs()).toMatchObject({ epochLost: true, requeued: 1 });
+  });
+
+  /** A row stuck in `dispatching` at attempt `attemptNo`, past the stale threshold. */
+  async function staleDispatching(attemptNo = 1, createdAt = new Date()) {
+    const r = rec('other', createdAt);
+    await recordAccepted(r);
+    await upsertAttempt(r, { status: 'dispatching', attemptNo });
+    await backdate(r, '1 hour');
+    return r;
+  }
+  const row = async (r: AcceptedRecord) =>
+    (await getPool().query(`SELECT attempt_no, status, error, completed_at FROM delivery_attempt WHERE id = $1`, [r.ids.attemptId])).rows[0];
+  const event = async (r: AcceptedRecord) =>
+    (await getPool().query(`SELECT status FROM notification_event WHERE id = $1`, [r.ids.eventId])).rows[0];
+
+  describe('attempt markers', () => {
+    beforeEach(async () => { await redis.set(REDIS_EPOCH_KEY, 'x'); });
+
+    it('marks a stale dispatching row sent when its marker says sent, and does not push it', async () => {
+      const r = await staleDispatching(1);
+      await redis.set(attemptMarkerKey(r.ids.attemptId), 'sent:1', 'EX', 60);
+      expect(await recoverLostJobs({ staleDispatchMs: 60_000 })).toMatchObject({ requeued: 0, marked: 1 });
+      expect(pushed).toHaveLength(0);
+      expect(await row(r)).toMatchObject({ status: 'sent', attempt_no: 1 });
+      expect(await event(r)).toMatchObject({ status: 'sent' });
+    });
+
+    it('marks a stale dispatching row failed when its marker says failed', async () => {
+      const r = await staleDispatching(2);
+      await redis.set(attemptMarkerKey(r.ids.attemptId), 'failed:2', 'EX', 60);
+      expect(await recoverLostJobs({ staleDispatchMs: 60_000 })).toMatchObject({ requeued: 0, marked: 1 });
+      expect(pushed).toHaveLength(0);
+      expect(await row(r)).toMatchObject({ status: 'failed', attempt_no: 2 });
+      expect((await row(r)).completed_at).not.toBeNull();
+      expect(await event(r)).toMatchObject({ status: 'failed' });
+    });
+
+    it('leaves a stale dispatching row alone when its marker says retry (job is in the retry set)', async () => {
+      const r = await staleDispatching(1);
+      await redis.set(attemptMarkerKey(r.ids.attemptId), 'retry:2', 'EX', 60);
+      expect(await recoverLostJobs({ staleDispatchMs: 60_000 })).toMatchObject({ requeued: 0, marked: 0 });
+      expect(pushed).toHaveLength(0);
+      expect(await row(r)).toMatchObject({ status: 'dispatching', attempt_no: 1 });
+    });
+
+    it('pushes a stale dispatching row with no marker', async () => {
+      const r = await staleDispatching(1);
+      expect(await recoverLostJobs({ staleDispatchMs: 60_000 })).toMatchObject({ requeued: 1, marked: 0 });
+      expect(pushed).toHaveLength(1);
+      expect(await row(r)).toMatchObject({ status: 'queued', attempt_no: 2 });
+    });
+
+    it('ignores a retry marker left by an earlier attempt when a later attempt crashed', async () => {
+      // retry:2 was written by attempt 1; attempt 2 then stamped dispatching and died.
+      const r = await staleDispatching(2);
+      await redis.set(attemptMarkerKey(r.ids.attemptId), 'retry:2', 'EX', 60);
+      expect(await recoverLostJobs({ staleDispatchMs: 60_000 })).toMatchObject({ requeued: 1 });
+      expect(pushed).toHaveLength(1);
+    });
+  });
+
+  describe('recovery window (RECOVERY_MAX_AGE_HOURS)', () => {
+    const abandonedCount = async () => Number((await redis.hget('metrics:counters', 'ns_recovery_abandoned_total')) ?? 0);
+
+    it('abandons a stale row older than the window instead of re-sending it, and counts it', async () => {
+      await redis.set(REDIS_EPOCH_KEY, 'x');
+      const before = await abandonedCount();
+      const old = await staleDispatching(1, new Date(Date.now() - 48 * 3600_000));
+      const fresh = await staleDispatching(1);
+      expect(await recoverLostJobs({ staleDispatchMs: 60_000, maxAgeHours: 24 })).toMatchObject({ requeued: 1, abandoned: 1 });
+      expect(pushed).toHaveLength(1);
+      expect((pushed[0] as { job_id: string }).job_id).toBe((fresh.job as { job_id: string }).job_id);
+      expect(await row(old)).toMatchObject({ status: 'failed', error: ABANDONED_ERROR });
+      expect(await event(old)).toMatchObject({ status: 'failed' });
+      expect(await abandonedCount()).toBe(before + 1);
+    });
+
+    it('abandons old rows on the epoch-lost path too', async () => {
+      const old = rec('other', new Date(Date.now() - 48 * 3600_000));
+      await recordAccepted(old);
+      await backdate(old);
+      await redis.del(REDIS_EPOCH_KEY);
+      expect(await recoverLostJobs({ maxAgeHours: 24 })).toMatchObject({ epochLost: true, requeued: 0, abandoned: 1 });
+      expect(pushed).toHaveLength(0);
+      expect(await row(old)).toMatchObject({ status: 'failed', error: ABANDONED_ERROR });
+    });
+
+    it('reads the window from RECOVERY_MAX_AGE_HOURS', async () => {
+      await redis.set(REDIS_EPOCH_KEY, 'x');
+      const r = await staleDispatching(1, new Date(Date.now() - 3 * 3600_000));
+      process.env.RECOVERY_MAX_AGE_HOURS = '2';
+      try {
+        expect(await recoverLostJobs({ staleDispatchMs: 60_000 })).toMatchObject({ abandoned: 1, requeued: 0 });
+      } finally {
+        delete process.env.RECOVERY_MAX_AGE_HOURS;
+      }
+      expect(await row(r)).toMatchObject({ status: 'failed' });
+    });
+  });
+
+  describe('batching', () => {
+    it('recovers more than one batch of rows, one push per batch', async () => {
+      await redis.set(REDIS_EPOCH_KEY, 'x');
+      await getPool().query(
+        `INSERT INTO delivery_attempt
+           (id, created_at, updated_at, notification_event_id, channel, template_id, attempt_no,
+            status, status_rank, recoverable, job)
+         SELECT gen_random_uuid(), now() - interval '2 hours', now() - interval '1 hour', gen_random_uuid(),
+                'email', 't', 1, 'dispatching', 1, true,
+                jsonb_build_object('job_id', 'bulk-' || g, 'channel', 'email', 'priority', 'other',
+                                   'to', 'x', 'template_id', 't', 'variables', '{}'::jsonb)
+           FROM generate_series(1, 1201) g`,
+      );
+      const res = await recoverLostJobs({ staleDispatchMs: 60_000 });
+      expect(res.requeued).toBe(1201);
+      expect(pushed).toHaveLength(1201);
+      expect(new Set(pushed.map((j) => (j as { job_id: string }).job_id)).size).toBe(1201);
+      expect(vi.mocked(pushOtherMany)).toHaveBeenCalledTimes(3);
+      const { rows } = await getPool().query(`SELECT count(*)::int AS n FROM delivery_attempt WHERE status = 'queued'`);
+      expect(rows[0].n).toBe(1201);
+    });
+
+    it('a failure in a later batch keeps earlier batches committed and leaves the epoch unset', async () => {
+      for (let i = 0; i < 3; i++) {
+        const r = rec('other');
+        await recordAccepted(r);
+        await backdate(r);
+      }
+      await redis.del(REDIS_EPOCH_KEY);
+      vi.mocked(pushOtherMany)
+        .mockImplementationOnce(async (jobs) => { pushed.push(...jobs); })
+        .mockRejectedValueOnce(new Error('redis down'));
+      await expect(recoverLostJobs({ batchSize: 2 })).rejects.toThrow('redis down');
+      expect(await redis.get(REDIS_EPOCH_KEY)).toBeNull();
+      const { rows } = await getPool().query(`SELECT count(*)::int AS n FROM delivery_attempt WHERE status = 'queued' AND attempt_no = 2`);
+      expect(rows[0].n).toBe(2);
+      // The committed rows are newer than Redis now, so the retry picks up only the third.
+      expect(await recoverLostJobs({ batchSize: 2 })).toMatchObject({ epochLost: true, requeued: 1 });
+    });
   });
 });
