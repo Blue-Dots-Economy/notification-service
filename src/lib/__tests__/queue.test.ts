@@ -256,6 +256,40 @@ describe('scheduleRetryWithMarker', () => {
   });
 });
 
+describe('pushToPriorityWithMarker', () => {
+  const marker = { key: 'ns:attempt:a1', value: 'failed:1', ttlSeconds: 604800 };
+
+  it('pushes the job and writes the marker in one MULTI', async () => {
+    const multi = vi.spyOn(redis, 'multi');
+    try {
+      await queue.pushToPriorityWithMarker(job({ job_id: 'f1', priority: 'realtime' }), marker);
+      expect(multi).toHaveBeenCalledTimes(1);
+    } finally {
+      multi.mockRestore();
+    }
+    expect(await redis.llen('queue:realtime')).toBe(1);
+    expect(await redis.get('ns:attempt:a1')).toBe('failed:1');
+  });
+
+  it('leaves neither the job nor the marker when the MULTI fails', async () => {
+    const multi = vi.spyOn(redis, 'multi').mockImplementationOnce(() => {
+      const chain = {
+        lpush: () => chain,
+        set: () => chain,
+        exec: async () => { throw new Error('connection lost'); },
+      };
+      return chain as never;
+    });
+    try {
+      await expect(queue.pushToPriorityWithMarker(job({ job_id: 'f2' }), marker)).rejects.toThrow('connection lost');
+    } finally {
+      multi.mockRestore();
+    }
+    expect(await redis.get('ns:attempt:a1')).toBeNull();
+    expect(await redis.llen('queue:other')).toBe(0);
+  });
+});
+
 describe('pushManyToPriority', () => {
   it('pushes each job to its own priority queue, in order', async () => {
     await queue.pushManyToPriority([

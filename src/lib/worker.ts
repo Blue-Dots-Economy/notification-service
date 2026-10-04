@@ -1,6 +1,6 @@
 import { fork } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { deferJob, pushDLQ, pushToPriority, scheduleRetryWithMarker } from './queue';
+import { deferJob, pushDLQ, pushToPriorityWithMarker, scheduleRetryWithMarker } from './queue';
 import { acquireSendToken, bucketsFor, rateLimitDeferMs } from './rate_limit';
 import { providerTimeoutMs } from './providers/http';
 import { poolConfig, startPools, type Deferred } from './pools';
@@ -235,7 +235,14 @@ function nextDelivery(job: Job): PlannedDelivery | undefined {
  * ADVANCED job (index + 1), so recovery resends the right delivery. Everything
  * else on `audit` (deliveryMode, redactValues, variableNames) is kept.
  */
-async function fallThrough(job: Job, next: PlannedDelivery): Promise<void> {
+/**
+ * Close attempt a1 (`job`) as failed and start the next delivery as a new
+ * attempt a2. Order, like scheduleRetryWithMarker: stamp a2 `queued` → one
+ * MULTI {LPUSH a2, SET a1 marker failed:n} → stamp a1 `failed`. The a1 marker
+ * therefore exists iff a2 is queued: a crash before the MULTI leaves a1 open
+ * with no marker, so recovery re-queues a1 rather than losing the event.
+ */
+async function fallThrough(job: Job, next: PlannedDelivery, attemptNo: number, error: string): Promise<void> {
   const v1 = job.v1!;
   const from = job.channel;
   const advanced: Job = {
@@ -250,13 +257,16 @@ async function fallThrough(job: Job, next: PlannedDelivery): Promise<void> {
   // Record before queue, as on /notify: the row exists before the job can be popped.
   await stamp(advanced, { status: 'queued', attemptNo: 1 });
   try {
-    await pushToPriority(advanced);
+    await pushToPriorityWithMarker(advanced, attemptMarker(job, 'failed', attemptNo));
   } catch (err) {
-    // Close the new attempt so it is not left `queued` with nothing behind it.
+    // Close both attempts so neither is left open with nothing behind it.
     await markAttempt(advanced, 'failed', 1);
     await stamp(advanced, { status: 'failed', attemptNo: 1, error: 'enqueue failed' });
+    await markAttempt(job, 'failed', attemptNo);
+    await stamp(job, { status: 'failed', attemptNo, error });
     throw err;
   }
+  await stamp(job, { status: 'failed', attemptNo, error });
   await metrics.incr('ns_send_fallthrough_total', { from, to: next.channel });
   console.log(`Falling through ${job.job_id}: ${from} → ${next.channel}`);
 }
@@ -276,9 +286,7 @@ async function failDelivery(job: Job, reason: string, error?: string) {
   }
   const attemptNo = job.attempt ?? 1;
   if (isExpired(job)) return expire(job, attemptNo, error ?? reason);
-  await markAttempt(job, 'failed', attemptNo);
-  await stamp(job, { status: 'failed', attemptNo, error: error ?? reason });
-  return fallThrough(job, next);
+  return fallThrough(job, next, attemptNo, error ?? reason);
 }
 
 /**
