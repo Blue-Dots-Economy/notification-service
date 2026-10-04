@@ -6,8 +6,9 @@ const idem = vi.hoisted(() => ({ claimIdempotency: vi.fn(), completeIdempotency:
 vi.mock('../../lib/send/idempotency', () => idem);
 const store = vi.hoisted(() => ({ recordAccepted: vi.fn(async () => {}), recordAcceptedMany: vi.fn(async () => {}) }));
 vi.mock('../../lib/audit/store', () => store);
-vi.mock('../../lib/audit/stamp', () => ({ stamp: vi.fn(async () => {}) }));
-const queue = vi.hoisted(() => ({ pushToPriority: vi.fn(async () => {}) }));
+const st = vi.hoisted(() => ({ stamp: vi.fn(async () => {}) }));
+vi.mock('../../lib/audit/stamp', () => st);
+const queue = vi.hoisted(() => ({ pushManyToPriority: vi.fn(async () => {}) }));
 vi.mock('../../lib/queue', () => queue);
 const met = vi.hoisted(() => ({ incr: vi.fn(async () => {}) }));
 vi.mock('../../lib/metrics', () => met);
@@ -30,8 +31,10 @@ beforeEach(() => {
   idem.releaseIdempotency.mockClear();
   idem.completeIdempotency.mockClear();
   met.incr.mockClear();
+  st.stamp.mockClear();
+  dd.releaseDedupe.mockClear();
   store.recordAcceptedMany.mockResolvedValue(undefined);
-  queue.pushToPriority.mockResolvedValue(undefined);
+  queue.pushManyToPriority.mockResolvedValue(undefined);
   idem.claimIdempotency.mockResolvedValue({ status: 'fresh' });
   dd.dedupe.mockResolvedValue(true);
   plan.planSend.mockResolvedValue({ mode: 'first_available', deliveries: [delivery('sms'), delivery('email')], redact: false, variables: { name: 'A' } });
@@ -42,9 +45,9 @@ describe('POST /v1/notify', () => {
     const res = await post(body);
     expect(res.statusCode).toBe(202);
     expect(res.json()).toMatchObject({ status: 'accepted', mode: 'first_available', deliveries: [{ channel: 'sms' }, { channel: 'email' }] });
-    expect(queue.pushToPriority).toHaveBeenCalledTimes(1);
-    expect(store.recordAcceptedMany.mock.invocationCallOrder[0]).toBeLessThan(queue.pushToPriority.mock.invocationCallOrder[0]!);
-    const job = queue.pushToPriority.mock.calls[0]![0];
+    expect(queue.pushManyToPriority).toHaveBeenCalledTimes(1);
+    expect(store.recordAcceptedMany.mock.invocationCallOrder[0]).toBeLessThan(queue.pushManyToPriority.mock.invocationCallOrder[0]!);
+    const job = queue.pushManyToPriority.mock.calls[0]![0][0];
     expect(job).toMatchObject({ priority: 'other', channel: 'sms', v1: { mode: 'first_available', index: 0 } });
     expect(job.audit).toMatchObject({ deliveryMode: 'first_available', redactValues: false });
   });
@@ -52,8 +55,9 @@ describe('POST /v1/notify', () => {
   it('fans out one job per delivery for all, under one event', async () => {
     plan.planSend.mockResolvedValue({ mode: 'all', deliveries: [delivery('sms'), delivery('email')], redact: false, variables: {} });
     await post(body);
-    expect(queue.pushToPriority).toHaveBeenCalledTimes(2);
-    const [a, b] = queue.pushToPriority.mock.calls.map((c) => c[0]);
+    expect(queue.pushManyToPriority).toHaveBeenCalledTimes(1);
+    const [a, b] = queue.pushManyToPriority.mock.calls[0]![0];
+    expect(queue.pushManyToPriority.mock.calls[0]![0]).toHaveLength(2);
     expect(a.audit.eventId).toBe(b.audit.eventId);
     expect(a.audit.attemptId).not.toBe(b.audit.attemptId);
   });
@@ -62,14 +66,15 @@ describe('POST /v1/notify', () => {
     store.recordAcceptedMany.mockRejectedValue(new Error('db down'));
     const res = await post({ ...body, priority: 'urgent' });
     expect(res.statusCode).toBe(202);
-    expect(queue.pushToPriority.mock.calls[0]![0].priority).toBe('realtime');
+    expect(queue.pushManyToPriority.mock.calls[0]![0][0].priority).toBe('realtime');
+    expect(queue.pushManyToPriority.mock.invocationCallOrder[0]).toBeLessThan(store.recordAcceptedMany.mock.invocationCallOrder[0]!);
   });
 
   it('normal sends are refused with 503 when the record fails, and the claim is released', async () => {
     store.recordAcceptedMany.mockRejectedValue(new Error('db down'));
     const res = await post({ ...body, idempotency_key: 'k' });
     expect(res.statusCode).toBe(503);
-    expect(queue.pushToPriority).not.toHaveBeenCalled();
+    expect(queue.pushManyToPriority).not.toHaveBeenCalled();
     expect(idem.releaseIdempotency).toHaveBeenCalled();
   });
 
@@ -119,11 +124,34 @@ describe('POST /v1/notify', () => {
   });
 
   it('an enqueue failure stamps failed, releases once, and does not complete the claim', async () => {
-    queue.pushToPriority.mockRejectedValue(new Error('redis down'));
+    queue.pushManyToPriority.mockRejectedValue(new Error('redis down'));
     const res = await post({ ...body, idempotency_key: 'k' });
     expect(res.statusCode).toBe(500);
     expect(idem.releaseIdempotency).toHaveBeenCalledTimes(1);
     expect(idem.completeIdempotency).not.toHaveBeenCalled();
+    expect(st.stamp).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ status: 'failed', error: 'enqueue failed' }));
+  });
+
+  it('all mode: a failed enqueue stamps every job failed and releases once', async () => {
+    plan.planSend.mockResolvedValue({ mode: 'all', deliveries: [delivery('sms'), delivery('email')], redact: false, variables: {} });
+    queue.pushManyToPriority.mockRejectedValue(new Error('redis down'));
+    await post({ ...body, idempotency_key: 'k' });
+    expect(queue.pushManyToPriority).toHaveBeenCalledTimes(1);
+    expect(st.stamp).toHaveBeenCalledTimes(2);
+    expect(idem.releaseIdempotency).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases the content guard on a refusal without a key', async () => {
+    plan.planSend.mockRejectedValue(new SendError('missing_variable', 'x'));
+    await post(body);
+    expect(dd.releaseDedupe).toHaveBeenCalledTimes(1);
+  });
+
+  it('passes x-correlation-id through, cut to 128 characters', async () => {
+    const a = await app();
+    const send = (id: string) => a.inject({ method: 'POST', url: '/v1/notify', payload: body, headers: { 'x-ns-key': 'signals', 'x-correlation-id': id } });
+    expect((await send('trace-1')).json().correlation_id).toBe('trace-1');
+    expect((await send('x'.repeat(300))).json().correlation_id).toBe('x'.repeat(128));
   });
 
   it('a successful send completes the claim and does not release it', async () => {
@@ -149,7 +177,7 @@ describe('POST /v1/notify', () => {
   it('redacted sends carry no variable values on the job', async () => {
     plan.planSend.mockResolvedValue({ mode: 'single', deliveries: [delivery('sms')], redact: true, variables: { message: '123456' } });
     await post({ template_key: 'login_otp', channel: 'sms', to: { phone: '+919999999999' }, variables: { message: '123456' } });
-    const job = queue.pushToPriority.mock.calls[0]![0];
+    const job = queue.pushManyToPriority.mock.calls[0]![0][0];
     expect(job.variables).toEqual({});
     expect(job.audit.redactValues).toBe(true);
   });

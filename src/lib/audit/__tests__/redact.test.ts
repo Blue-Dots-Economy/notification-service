@@ -17,6 +17,14 @@ describe('toAcceptedRecord', () => {
     expect(rec.recoverable).toBe(false);
   });
 
+  it('prefers variable names carried on the job audit ids', () => {
+    const job: Job = {
+      job_id: 'j', channel: 'sms', priority: 'realtime', to: '+919999999999',
+      template_id: 't', variables: {}, audit: { ...ids, redactValues: true, variableNames: ['message'] },
+    };
+    expect(toAcceptedRecord(job, 's').payload).toEqual({ to: '+919999999999', variable_names: ['message'] });
+  });
+
   it('keeps the full job for a normal job so it can be recovered', () => {
     const job: Job = {
       job_id: 'j', channel: 'email', priority: 'other', to: 'a@b.c',
