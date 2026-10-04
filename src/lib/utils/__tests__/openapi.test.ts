@@ -26,7 +26,9 @@ describe('openApiDocument', () => {
     expect(schema.additionalProperties).toBe(false);
     for (const k of ['event_type', 'template_key', 'channel', 'to', 'priority']) expect(schema.properties[k], k).toBeDefined();
     expect(schema.properties.priority.enum).toEqual(['urgent', 'normal', 'bulk']);
-    for (const code of ['200', '202', '400', '409', '422', '503']) expect(op.responses[code], code).toBeDefined();
+    for (const code of ['200', '202', '400', '401', '409', '422', '503']) expect(op.responses[code], code).toBeDefined();
+    expect(schema.properties.correlation_id.maxLength).toBe(128);
+    expect(Object.keys(schema.properties.attachments.items.properties)).toEqual(['filename', 'contentType', 'data']);
     expect(op.responses['422'].content['application/json'].schema.properties.kind.enum).toEqual(['caller', 'configuration']);
   });
 });

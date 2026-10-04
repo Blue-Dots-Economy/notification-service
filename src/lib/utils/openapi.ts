@@ -397,7 +397,24 @@ export function openApiDocument() {
               },
               cc: { type: 'array', maxItems: 10, items: { type: 'string', format: 'email' }, description: 'Email deliveries only.' },
               reply_to: { type: 'string', format: 'email', description: 'Email deliveries only.' },
-              attachments: { type: 'array', items: { type: 'object', additionalProperties: true }, description: 'Email deliveries only.' },
+              attachments: {
+                type: 'array',
+                description: 'Email deliveries only. Count and total size limits as on `/notify`.',
+                items: {
+                  type: 'object',
+                  required: ['filename', 'contentType', 'data'],
+                  properties: {
+                    filename: { type: 'string', minLength: 1, maxLength: 255 },
+                    contentType: { type: 'string', minLength: 1, maxLength: 127, example: 'application/pdf' },
+                    data: { type: 'string', format: 'byte', description: 'Base64 file content, no `data:` prefix.' },
+                  },
+                },
+              },
+              correlation_id: {
+                type: 'string',
+                maxLength: 128,
+                description: 'Trimmed. Wins over the `x-correlation-id` header; blank falls back to the header, then the event id.',
+              },
             },
           }),
           responses: {
@@ -430,7 +447,9 @@ export function openApiDocument() {
                 },
               },
             },
-            '503': errorBody('network_not_configured: NS_NETWORK is not set; audit store unavailable (normal and bulk sends)'),
+            '503': errorBody(
+              'network_not_configured: NS_NETWORK is not set; template store unavailable: a template or policy not yet cached could not be read; audit store unavailable (normal and bulk sends)',
+            ),
           },
         },
       },

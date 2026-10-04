@@ -135,7 +135,8 @@ turns a delivered message into a retry; it is counted in `ns_audit_write_failure
 
 **Attempt markers.** The worker writes `ns:attempt:<attemptId>` = `<sent|retry|failed|expired>:<attemptNo>`
 (TTL 7 days). `sent`/`failed`/`expired` are written right after the fate is decided and **before** the stamp
-(best-effort). `retry` is written in the **same MULTI** as the retry-set ZADD
+(best-effort); a v1 fall-through's `failed` marker rides in the MULTI that queues the next delivery.
+`retry` is written in the **same MULTI** as the retry-set ZADD
 (`queue.scheduleRetryWithMarker`), so the marker exists iff the retry is scheduled, and the
 `queued` stamp comes **after** that MULTI: the row stays `dispatching` until the retry is in Redis,
 so a crash before (or a failed) MULTI leaves a `dispatching` row with no marker, which the
@@ -165,6 +166,8 @@ else the latest attempt (open first, then most recently completed: attempts shar
   recovery run fails while the epoch is missing (**including the first deploy**), so lost work is
   never recovered.
 - Stale `dispatching` rows (> 10 min) are re-queued: at-least-once by design.
+- Every event whose attempt recovery writes (stamped from a marker, abandoned or re-queued) is
+  rolled up by `rollUpEvent` in the same transaction, in sorted order.
 - Every candidate (recoverable, with a job copy) is resolved in order: its **attempt marker**
   (`sent`/`failed`/`expired` → that state is stamped and the event rolled up, `retry` → left alone, the job is in the retry set);
   then **age** — created more than `RECOVERY_MAX_AGE_HOURS` (default 24) ago → marked `failed`
@@ -416,7 +419,8 @@ skipped when `NS_NETWORK` is unset; a template that fails publish validation is 
 
 ## Send API v1
 
-Code: `src/routes/v1-notify.ts`, `src/lib/send/` (`request`, `plan`, `errors`, `idempotency`), and the
+Code: `src/routes/v1-notify.ts`, `src/lib/send/` (`request`, `plan`, `errors`, `idempotency`,
+`resolver-cache`), and the
 `job.v1` branch of `src/lib/worker.ts` (`processV1Job`, `failDelivery`, `fallThrough`). Legacy `/notify`
 is unchanged and stays until the cutover release.
 
@@ -425,7 +429,7 @@ picks the channels) or `template_key`; `template_key` requires `channel`, `event
 `to` carries `email` and/or E.164 `phone` (at least one). `priority` is `urgent | normal | bulk`
 (default `normal`), mapped to `realtime | other | bulk` by `PRIORITY_MAP`. `cc`, `reply_to` and
 `attachments` are email-only: with `template_key` they require `channel: 'email'`, with `event_type`
-they apply to the email deliveries. `network` is never request input: it is `currentNetwork()`, and
+they apply to the email deliveries (they ride only on jobs that hold an email delivery). `network` is never request input: it is `currentNetwork()`, and
 unset answers `503 network_not_configured` on `/v1/notify` only. Free-text bodies and sender
 identity are not accepted; the sender is server config (`EMAIL_FROM_ADDRESS`, `EMAIL_FROM_NAME`).
 Without `EMAIL_FROM_ADDRESS` an email delivery fails permanently with `email sender not configured`.
@@ -441,6 +445,18 @@ With `template_key` a configuration problem fails the request. With a policy, a 
 template cannot resolve or render is skipped while another can carry the message; if none can, the
 first configuration error is returned. Messages name variables and keys, never values.
 
+**Resolver cache** (`resolver-cache.ts`). `planSend` resolves templates and policies through an
+in-process stale-while-revalidate cache keyed by network and the resolver arguments (channel, key,
+locale; domain, event type), so a send for a template or policy this pod has already resolved makes
+**no Postgres read**. Only positive results are cached: a missing policy or a template error
+(`not_found`, `vendor_mismatch`, ...) re-queries every time. An entry older than
+`NS_RESOLVE_CACHE_TTL_MS` (default 60 s, validated at boot) is still served, and one single-flight
+background refresh per key replaces it; a refresh that fails on the database keeps the stale entry
+(logged through `describeDbError`), one that finds nothing active drops it. A **cold miss** does read
+Postgres; if that read fails the send is refused `503 {"error":"template store unavailable"}` and the
+claim released. Bounded to 1000 keys, oldest first. Admin publish/retire clears this pod's cache;
+other pods pick the change up within the TTL, so a newly published version can lag up to 60 s.
+
 **Modes and event status.** `single` (template_key), `first_available` and `all` (policy). A request's
 jobs are enqueued in one MULTI (`pushManyToPriority`): `all` is one job per delivery,
 the others one job carrying every candidate. Event status: `single` mirrors its attempt; `all` is a
@@ -451,7 +467,10 @@ event row lock.
 
 **Fallthrough** is synchronous only. A `first_available` delivery that fails permanently or exhausts
 its retries is closed `failed` and the next candidate starts as a **new attempt row** (fresh attempt
-id, attempt counter reset; `ns_send_fallthrough_total{from,to}`). If the deadline has passed the event
+id, attempt counter reset; `ns_send_fallthrough_total{from,to}`). Order, like a retry: stamp the new
+attempt `queued` → one MULTI {LPUSH it, SET the old attempt's `failed` marker}
+(`queue.pushToPriorityWithMarker`) → stamp the old attempt `failed`, so the old marker exists iff the
+next delivery is queued. If the deadline has passed the event
 expires instead. The `expired` fate is recorded by marker (`markAttempt`). Async bounces after a
 vendor accepted a message are out of scope (Stage 2.5/3). The last delivery takes the legacy fate
 (`dropOrDeadLetter`). `sendRendered` sends the content rendered at accept and never re-renders; a
@@ -460,20 +479,29 @@ vendor change since accept (`vendor_changed`) fails the delivery.
 **Redaction.** A send is redacted when its priority is `urgent` **or** any planned template declares
 a `sensitive` variable. A redacted send persists only the variable **names** (`audit.variableNames`),
 keeps no job copy, is not recoverable, and is never dead-lettered (`ns_job_dropped_total`). Urgent
-sends enqueue first and write the audit row afterwards, so a slow Postgres never delays an OTP;
-normal and bulk record first and answer `503 audit store unavailable` if they cannot.
+sends enqueue first and write the audit row afterwards, so the audit write never delays an OTP (planning
+reads Postgres only on a resolver-cache miss);
+normal and bulk record first and answer `503 audit store unavailable` if they cannot. The event
+payload records every contact point the request supplied (`to: {email, phone}`, via
+`audit.recipients`), recipients only, for redacted sends too.
 
 **Deadline**, in order: request `deadline` (ISO-8601 with offset, in the future, at most 24 h ahead,
 else `400 invalid_deadline`) → the smallest `default_deadline_s` among the planned templates → for
 `urgent`, `URGENT_DEFAULT_DEADLINE_S`. DLQ replay clears the deadline (an explicit operator action).
 
 **Idempotency** (`idempotency.ts`). `idempotency_key` is 1-128 chars and is claimed before planning.
-`urgent` claims live in Redis (`idem:<network>:<key>`, 15-minute window) so an OTP makes no Postgres
-round trip; `normal` and `bulk` use the Postgres `idempotency_key` table, pruned after 90 days. A
-repeat returns `200` with the original response; a repeat while the first is in flight is `409
-idempotency_in_progress`. A Postgres claim with no response older than 15 minutes is reclaimable
-(Redis expires by TTL). Any refusal after a claim releases it. Without a key, a 5-second content
-guard answers a repeat with `409 duplicate-fallback`.
+`urgent` claims live in Redis (`idem:<network>:<key>`, 15-minute window) so the claim makes no
+Postgres round trip (with the resolver cache warm, neither does planning); `normal` and `bulk` use the
+Postgres `idempotency_key` table, pruned after 90 days. A repeat returns `200` with the original
+response; a repeat while the first is in flight is `409 idempotency_in_progress`. **Urgent replays
+expire with the Redis window**: after 15 minutes the same key is a new send. A Postgres claim with no
+response older than 15 minutes is reclaimable (Redis expires by TTL). Completing the claim is retried
+once; if both tries fail the send still stands and the claim stays pending, so a repeat answers `409`
+until the 15-minute window makes it reclaimable. Any refusal after a claim releases it. Without a key,
+a 5-second content guard answers a repeat with `409 duplicate-fallback`.
+
+**Correlation id.** The body's `correlation_id` (trimmed, at most 128, else `400`) wins over the
+`x-correlation-id` header; blank falls back to the header, then the event id.
 
 **Response:** `202 {notification_event_id, correlation_id, status: "accepted", mode, deliveries:
 [{channel}]}`. See README for examples.
@@ -544,6 +572,8 @@ Required for persistence and Redis:
 - `NS_DEFAULT_LOCALE` — optional, default `en`; the last step of the template locale chain.
 - `NS_ADMIN_KEY_IDS` — comma-separated HMAC key ids allowed to use `/v1/admin/*`. Unset means
   nobody can.
+- `NS_RESOLVE_CACHE_TTL_MS` — optional, default 60000, positive integer (invalid fails boot). See
+  Resolver cache.
 - `PARTITION_MAINTENANCE_INTERVAL_MS` — optional, default 6h.
 - `RECOVERY_MAX_AGE_HOURS` — optional, default 24, positive integer (invalid fails boot). Open
   recoverable sends older than this are marked failed by recovery instead of sent late.
@@ -603,7 +633,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 514 unit tests across 43 files (plus the integration suite). The unit suite runs in about a second because Redis
+vitest 4, 545 unit tests across 44 files, plus 119 integration tests across 15 files. The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
