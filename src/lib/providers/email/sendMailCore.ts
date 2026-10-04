@@ -18,7 +18,9 @@ interface Email_request {
   replyTo?: string;
   to: string;
   subject: string;
-  html: string;
+  /** At least one of `html` / `text` is required. */
+  html?: string;
+  text?: string;
   activationUrl?: string;
   cc?: string;
   attachments?: Email_attachment[];
@@ -125,6 +127,7 @@ export async function sendMail({
   to,
   subject,
   html,
+  text,
   activationUrl,
   cc,
   attachments,
@@ -141,6 +144,8 @@ export async function sendMail({
       );
     }
   }
+
+  if (!html && !text) throw new Error('sendMail needs html or text');
 
   await initTransporter();
 
@@ -162,8 +167,8 @@ export async function sendMail({
       // legitimate unescaped `>` from visible copy — "Score > 90" became
       // "Score  90" and "A => B" became "A = B" — which silently corrupts the
       // plain-text body of ordinary mail. See the mailer test.
-      text: html.replace(/<[^>]+>/g, '').replace(/</g, ''),
-      html,
+      text: text ?? (html ? html.replace(/<[^>]+>/g, '').replace(/</g, '') : undefined),
+      ...(html ? { html } : {}),
       // Decoded here rather than passing `encoding: 'base64'` so nodemailer
       // handles the transfer encoding itself for whatever transport is active
       // (the SES transport re-encodes into raw MIME).

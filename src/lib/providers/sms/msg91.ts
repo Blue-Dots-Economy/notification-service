@@ -107,4 +107,11 @@ export const smsProvider: ProviderDefinition = {
   async send({ to, template_id, variables }) {
     return await sendSmsWithMsg91(to, template_id, variables);
   },
+
+  async sendRendered({ to, rendered, providerTemplateId }) {
+    if (rendered.mode !== 'provider' || !providerTemplateId) {
+      return { ok: false, retryable: false, error: 'rendered mode not supported by msg91' };
+    }
+    return sendSmsWithMsg91(to, providerTemplateId, rendered.variables);
+  },
 };

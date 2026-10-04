@@ -143,6 +143,31 @@ export async function sendSmsWithPinnacle(
     };
   }
 
+  return sendPinnacleText(to, template_id, text, {}, job_id, env);
+}
+
+export interface PinnacleDltOverrides {
+  senderId?: string | null;
+  dltEntityId?: string | null;
+  dltHeaderId?: string | null;
+  dltTagId?: string | null;
+}
+
+/** The post-render half of a Pinnacle send: `text` goes out verbatim. */
+export async function sendPinnacleText(
+  to: string,
+  dltTemplateId: string,
+  text: string,
+  overrides: PinnacleDltOverrides,
+  job_id: string | undefined,
+  env = process.env
+): Promise<ProviderSendResult> {
+  const config = loadPinnacleConfig(env);
+  if ('error' in config) {
+    await metrics.incr('ns_sms_send_total', { provider: 'pinnacle', result: 'failed' });
+    return { ok: false, error: config.error, retryable: false };
+  }
+
   const messagetype = messageType(text);
   if (text.length > MAX_LENGTH[messagetype]) {
     await metrics.incr('ns_sms_send_total', { provider: 'pinnacle', result: 'failed' });
@@ -154,12 +179,16 @@ export async function sendSmsWithPinnacle(
   }
 
   const payload = {
-    sender: config.sender,
+    sender: overrides.senderId ?? config.sender,
     messagetype,
-    dltentityid: config.dltEntityId,
-    dlttempid: template_id,
-    ...(config.dltHeaderId ? { dltheaderid: config.dltHeaderId } : {}),
-    ...(config.dltTagId ? { dlttagid: config.dltTagId } : {}),
+    dltentityid: overrides.dltEntityId ?? config.dltEntityId,
+    dlttempid: dltTemplateId,
+    ...((overrides.dltHeaderId ?? config.dltHeaderId)
+      ? { dltheaderid: (overrides.dltHeaderId ?? config.dltHeaderId)! }
+      : {}),
+    ...((overrides.dltTagId ?? config.dltTagId)
+      ? { dlttagid: (overrides.dltTagId ?? config.dltTagId)! }
+      : {}),
     ...(config.tmid ? { tmid: config.tmid } : {}),
     message: [
       {
@@ -304,5 +333,12 @@ export const pinnacleSmsProvider: ProviderDefinition = {
 
   async send({ to, template_id, variables, body, job_id }) {
     return await sendSmsWithPinnacle(to, template_id, variables, body, job_id);
+  },
+
+  async sendRendered({ to, rendered, providerTemplateId, dlt, job_id }) {
+    if (rendered.mode !== 'ns' || rendered.channel !== 'sms' || !providerTemplateId) {
+      return { ok: false, retryable: false, error: 'rendered mode not supported by pinnacle' };
+    }
+    return sendPinnacleText(to, providerTemplateId, rendered.text, dlt ?? {}, job_id);
   },
 };
