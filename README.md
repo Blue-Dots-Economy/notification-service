@@ -333,8 +333,11 @@ METHOD\npath\ntimestamp\nnonce\nsha256(body)
 - JSON (`application/json`) is the only accepted body type; any other content type is `415`.
   Every accepted body is covered by the signature.
 - A nonce is accepted once; a correctly signed repeat is `401 Replay detected`.
+- A bodyless POST (publish, retire, `POST /failed/retry`) sends no `Content-Type` header, or
+  sends the body `{}` with `Content-Type: application/json`. An empty body declared as JSON is `400`.
 
-Node example (a JSON body; `fetch` sends the same bytes that were signed):
+Node example (a JSON body; `fetch` sends the same bytes that were signed, and no
+`Content-Type` when there is no payload):
 
 ```js
 import crypto from 'node:crypto';
@@ -353,7 +356,7 @@ async function signedRequest(method, path, payload) {
   return fetch(BASE + path, {
     method,
     headers: {
-      'Content-Type': 'application/json',
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
       'X-NS-Key': KEY_ID,
       'X-NS-Timestamp': ts,
       'X-NS-Nonce': nonce,
@@ -378,7 +381,8 @@ no body digest) until the cutover release removes that route. Every other route 
 }
 ```
 
-`scopes` is optional and defaults to `["notify:send"]`.
+`scopes` is optional and defaults to `["notify:send"]`. An entry whose `secret` is the empty
+string is skipped with a boot warning naming its key id; any other malformed entry fails the boot.
 
 | Scope | Routes |
 |---|---|

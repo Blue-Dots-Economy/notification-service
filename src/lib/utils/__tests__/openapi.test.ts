@@ -64,4 +64,18 @@ describe('openApiDocument', () => {
     expect(Object.keys(schema.properties.attachments.items.properties)).toEqual(['filename', 'contentType', 'data']);
     expect(op.responses['422'].content['application/json'].schema.properties.kind.enum).toEqual(['caller', 'configuration']);
   });
+
+  it('every bearer-capable operation documents the 503 for an unreachable Keycloak key set', () => {
+    const doc = openApiDocument() as { paths: Record<string, Record<string, any>>; components: { securitySchemes: Record<string, any> } };
+    let checked = 0;
+    for (const [path, ops] of Object.entries(doc.paths)) {
+      for (const op of Object.values(ops)) {
+        if (!op.security?.some((s: Record<string, unknown>) => 'bearerAuth' in s)) continue;
+        expect(op.responses['503']?.description, path).toMatch(/Keycloak key set could not be reached/);
+        checked += 1;
+      }
+    }
+    expect(checked).toBeGreaterThan(10);
+    expect(doc.components.securitySchemes.bearerAuth.description).toContain('the configured audience (default `notification-service`)');
+  });
 });

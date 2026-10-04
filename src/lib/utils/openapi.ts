@@ -27,6 +27,8 @@ const errorBody = (description: string) => ({
 
 const unauthorized = () =>
   errorBody('Missing, malformed, expired or invalid credentials, or both credential types on one request');
+const AUTH_UNAVAILABLE = 'auth unavailable: the Keycloak key set could not be reached for a bearer token';
+const authUnavailable = () => errorBody(`Auth service unavailable, or the Keycloak key set could not be reached (${AUTH_UNAVAILABLE})`);
 const forbidden = (role: string) =>
   errorBody(`Insufficient scope: the credential lacks \`${role}\` ({"error":"Insufficient scope","required":"${role}"})`);
 
@@ -42,7 +44,9 @@ const adminErrors = {
   '422': errorBody(
     'A template or policy rule was violated (vendor_mismatch, incomplete_template, undeclared_token, unused_variable, body_too_long, invalid_contract, unknown_channel, missing_variable, unknown_variable, invalid_variable)'
   ),
-  '503': errorBody('network_not_configured: NS_NETWORK is not set; database_unavailable: the template/policy store could not be reached'),
+  '503': errorBody(
+    `network_not_configured: NS_NETWORK is not set; database_unavailable: the template/policy store could not be reached; ${AUTH_UNAVAILABLE}`,
+  ),
 };
 
 const jsonBody = (schema: unknown) => ({
@@ -459,7 +463,7 @@ export function openApiDocument() {
               },
             },
             '503': errorBody(
-              'network_not_configured: NS_NETWORK is not set; template store unavailable: a template or policy not yet cached could not be read; audit store unavailable (normal and bulk sends); auth unavailable: the Keycloak key set could not be reached for a bearer token',
+              `network_not_configured: NS_NETWORK is not set; template store unavailable: a template or policy not yet cached could not be read; audit store unavailable (normal and bulk sends); ${AUTH_UNAVAILABLE}`,
             ),
           },
         },
@@ -551,6 +555,7 @@ export function openApiDocument() {
             '400': { description: 'Invalid request or provider/template' },
             '401': unauthorized(),
             '403': forbidden('notify:send'),
+            '503': authUnavailable(),
             '409': {
               description:
                 'Suppressed as a duplicate by the fallback content-hash key (no `dedupe_id` was supplied). Nothing was sent. Pass an explicit `dedupe_id` if the send is a deliberate retry.',
@@ -576,6 +581,7 @@ export function openApiDocument() {
           security: anySecurity,
           responses: {
             '401': unauthorized(),
+            '503': authUnavailable(),
             '200': {
               description: 'Provider metadata',
               content: {
@@ -611,6 +617,7 @@ export function openApiDocument() {
             },
             '401': unauthorized(),
             '404': { description: 'Provider not found' },
+            '503': authUnavailable(),
           },
         },
       },
@@ -620,6 +627,7 @@ export function openApiDocument() {
           security: anySecurity,
           responses: {
             '401': unauthorized(),
+            '503': authUnavailable(),
             '200': {
               description: 'Queue depths and retry timing',
               content: {
@@ -715,6 +723,7 @@ export function openApiDocument() {
             '401': unauthorized(),
             '403': forbidden('templates:admin'),
             '404': { description: 'Requested failed job was not found' },
+            '503': authUnavailable(),
           },
         },
       },
@@ -727,7 +736,7 @@ export function openApiDocument() {
           scheme: 'bearer',
           bearerFormat: 'JWT',
           description:
-            'Keycloak access token. Requires `aud` = `notification-service` and an allowlisted `azp`. Roles come from the `notification-service` client roles: `notify:send` and `templates:admin`. Do not send alongside the HMAC headers.',
+            'Keycloak access token. Requires `aud` = the configured audience (default `notification-service`) and an allowlisted `azp`. Roles come from the `notification-service` client roles: `notify:send` and `templates:admin`. Do not send alongside the HMAC headers.',
         },
         requestSignature: {
           type: 'apiKey',
