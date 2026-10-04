@@ -30,8 +30,10 @@ beforeAll(() => {
   loadSecrets();
 });
 
-function build() {
-  const app = Fastify();
+function build(logLines?: string[]) {
+  const app = logLines
+    ? Fastify({ logger: { level: 'warn', stream: { write: (line: string) => void logLines.push(line) } } })
+    : Fastify();
   registerRawJsonBody(app);
   const echo = async (req: any) => ({ principal: { kind: req.principal.kind, id: req.principal.id } });
   app.post('/notify', { preHandler: authenticate({ scope: 'notify:send', legacyHmacV1: true }), bodyLimit: 8 * 1024 * 1024 }, echo);
@@ -181,7 +183,56 @@ describe('authenticate — bearer', () => {
   });
 });
 
+describe('authenticate — rejection logging', () => {
+  beforeEach(() => bearer.verifyBearer.mockReset());
+  const rejected = (lines: string[]) => lines.map((l) => JSON.parse(l)).filter((l) => l.msg === 'auth rejected');
+
+  it('logs an HMAC failure at warn with status, error and credential, and no header values', async () => {
+    const lines: string[] = [];
+    const headers = hmacHeaders({ method: 'POST', url: '/v1/notify', body: '{}', secret: 'wrong-secret' });
+    const res = await build(lines).inject({ method: 'POST', url: '/v1/notify', payload: '{}', headers: { ...json, ...headers } });
+    expect(res.statusCode).toBe(401);
+    const [entry] = rejected(lines);
+    expect(entry).toMatchObject({ level: 40, status: 401, error: 'Invalid signature', credential: 'hmac' });
+    const raw = lines.join('\n');
+    for (const value of [headers['x-ns-signature'], headers['x-ns-nonce'], 'send-secret', 'wrong-secret']) {
+      expect(raw).not.toContain(value);
+    }
+  });
+
+  it('logs a bearer failure without the token or Authorization header', async () => {
+    const lines: string[] = [];
+    bearer.verifyBearer.mockResolvedValueOnce({ ok: false, status: 401, error: 'Invalid token' });
+    const token = 'eyJ.secret-token-value.sig';
+    await build(lines).inject({ method: 'GET', url: '/providers', headers: { authorization: `Bearer ${token}` } });
+    const [entry] = rejected(lines);
+    expect(entry).toMatchObject({ level: 40, status: 401, error: 'Invalid token', credential: 'bearer' });
+    expect(lines.join('\n')).not.toContain('secret-token-value');
+  });
+
+  it('logs a 403 for a missing scope', async () => {
+    const lines: string[] = [];
+    bearer.verifyBearer.mockResolvedValueOnce({ ok: true, principal: { kind: 'bearer', id: 'signals-api', scopes: new Set() } });
+    await build(lines).inject({ method: 'POST', url: '/v1/notify', payload: '{}', headers: { ...json, authorization: 'Bearer abc' } });
+    expect(rejected(lines)[0]).toMatchObject({ level: 40, status: 403, error: 'Insufficient scope', credential: 'bearer' });
+  });
+
+  it('logs a 503 from the key set at error', async () => {
+    const lines: string[] = [];
+    bearer.verifyBearer.mockResolvedValueOnce({ ok: false, status: 503, error: 'Auth service unavailable' });
+    await build(lines).inject({ method: 'GET', url: '/providers', headers: { authorization: 'Bearer abc' } });
+    expect(rejected(lines)[0]).toMatchObject({ level: 50, status: 503, credential: 'bearer' });
+  });
+});
+
 describe('raw JSON body parser', () => {
+  it('a bodyless POST authenticates without a Content-Type, and is 400 with an empty JSON body', async () => {
+    const bare = await build().inject({ method: 'POST', url: '/v1/notify', headers: hmacHeaders({ method: 'POST', url: '/v1/notify' }) });
+    expect(bare.statusCode).toBe(200);
+    const empty = await build().inject({ method: 'POST', url: '/v1/notify', headers: { ...json, ...hmacHeaders({ method: 'POST', url: '/v1/notify' }) } });
+    expect(empty.statusCode).toBe(400);
+  });
+
   it('keeps Fastify prototype-poisoning protection (__proto__ body -> 400)', async () => {
     const body = '{"__proto__":{"polluted":true}}';
     const res = await build().inject({ method: 'POST', url: '/v1/notify', payload: body, headers: { ...json, ...hmacHeaders({ method: 'POST', url: '/v1/notify', body }) } });

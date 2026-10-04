@@ -55,6 +55,20 @@ async function fromHmac(req: FastifyRequest, opts: AuthOptions): Promise<Outcome
   return { principal: { kind: 'hmac', id: keyId, scopes: key.scopes } };
 }
 
+type Credential = 'bearer' | 'hmac' | 'both';
+
+/**
+ * Logs a refused request: status, error text and credential kind only. The
+ * token, signature, key secret and Authorization header are never logged.
+ * A 503 (the Keycloak key set could not be reached) logs at error.
+ */
+function reject(req: FastifyRequest, reply: FastifyReply, credential: Credential, status: number, body: { error: string; required?: Scope }) {
+  const entry = { status, error: body.error, credential };
+  if (status >= 500) req.log.error(entry, 'auth rejected');
+  else req.log.warn(entry, 'auth rejected');
+  return reply.code(status).send(body);
+}
+
 /**
  * The single auth boundary. A request carries EITHER a Keycloak bearer token OR
  * an HMAC signature; both at once is refused. On success `req.principal` is set
@@ -65,13 +79,14 @@ export function authenticate(opts: AuthOptions): preHandlerAsyncHookHandler {
     const authorization = req.headers.authorization;
     const hasHmac = HMAC_HEADERS.some((h) => req.headers[h] !== undefined);
     if (authorization !== undefined && hasHmac) {
-      return reply.code(401).send({ error: 'Ambiguous credentials' });
+      return reject(req, reply, 'both', 401, { error: 'Ambiguous credentials' });
     }
-    const outcome = authorization !== undefined ? await fromBearer(authorization) : await fromHmac(req, opts);
-    if ('error' in outcome) return reply.code(outcome.status).send({ error: outcome.error });
+    const credential: Credential = authorization !== undefined ? 'bearer' : 'hmac';
+    const outcome = credential === 'bearer' ? await fromBearer(authorization!) : await fromHmac(req, opts);
+    if ('error' in outcome) return reject(req, reply, credential, outcome.status, { error: outcome.error });
 
     if (opts.scope !== 'any' && !outcome.principal.scopes.has(opts.scope)) {
-      return reply.code(403).send({ error: 'Insufficient scope', required: opts.scope });
+      return reject(req, reply, credential, 403, { error: 'Insufficient scope', required: opts.scope });
     }
     req.principal = outcome.principal;
   };
