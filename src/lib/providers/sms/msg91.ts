@@ -85,6 +85,8 @@ export async function sendSmsWithMsg91(
 
 export const smsProvider: ProviderDefinition = {
   name: 'sms',
+  vendor: 'msg91',
+  renders: 'provider',
 
   // Only the legacy single-var OTP is named here; per-event DLT flow ids are
   // sent raw by signalstack (allowRawTemplateId), so they need no entry. The

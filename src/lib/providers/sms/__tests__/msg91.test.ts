@@ -110,4 +110,9 @@ describe('msg91 SMS provider', () => {
     expect(smsProvider.schema.safeParse({ name: 'Asha', link: 'https://x' }).success).toBe(true);
     expect(smsProvider.schema.safeParse({ message: '123' }).success).toBe(true);
   });
+
+  it('declares its vendor and render mode', () => {
+    expect(smsProvider.vendor).toBe('msg91');
+    expect(smsProvider.renders).toBe('provider');
+  });
 });

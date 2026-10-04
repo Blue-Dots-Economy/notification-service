@@ -282,6 +282,8 @@ export const pinnacleSmsProvider: ProviderDefinition = {
   // name and it is the `channel` every caller sends. Swapping vendors must not
   // change the channel.
   name: 'sms',
+  vendor: 'pinnacle',
+  renders: 'ns',
 
   // Pinnacle's `dlttempid` IS the DLT template id, so unlike MSG91 there is no
   // vendor-internal indirection — a raw pass-through id needs no entry here.
