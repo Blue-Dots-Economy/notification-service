@@ -3,6 +3,7 @@ import { loadSecrets } from './lib/auth/secrets.js';
 import { spawnWorker } from './lib/worker.js';
 import { runMigrations } from './lib/db/migrate.js';
 import { startPartitionMaintenance } from './lib/db/maintenance.js';
+import { recoverLostJobs } from './lib/audit/recover.js';
 
 const PORT = process.env.SERVER_PORT || `3000`;
 
@@ -13,8 +14,14 @@ async function main() {
   // orchestrator keeps the previous pod serving.
   await runMigrations();
   startPartitionMaintenance();
+  // Before the worker starts draining, so recovered jobs join the queue in order.
+  await recoverLostJobs();
   await app.listen({ port: parseInt(PORT) || 3000, host: '0.0.0.0' });
   spawnWorker();
+  // Periodic stale-dispatch sweep; a failure is logged, never thrown.
+  setInterval(() => {
+    recoverLostJobs().catch((err) => console.error('Recovery sweep failed:', err.message));
+  }, 5 * 60 * 1000).unref();
   console.log(`API running on worker ${process.pid}`);
 }
 
