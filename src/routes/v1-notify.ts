@@ -16,7 +16,8 @@ import { SendError, StoreUnavailable } from '../lib/send/errors';
 import { claimIdempotency, completeIdempotency, fallbackKey, releaseIdempotency } from '../lib/send/idempotency';
 import { planSend, type SendPlan } from '../lib/send/plan';
 import { PRIORITY_MAP, V1NotifySchema, type V1Request } from '../lib/send/request';
-import { requestAuth } from '../plugins/request-auth';
+import { principalLabel } from '../lib/auth/principal';
+import { authenticate } from '../plugins/auth';
 
 
 const FALLBACK_TTL_S = 5;
@@ -67,7 +68,7 @@ export async function v1NotifyRoutes(app: FastifyInstance) {
   app.route({
     url: '/v1/notify',
     method: 'POST',
-    preHandler: requestAuth,
+    preHandler: authenticate({ scope: 'notify:send' }),
     bodyLimit: notifyBodyLimitBytes(),
     handler: async (req: FastifyRequest, reply: FastifyReply) => {
       const parsed = V1NotifySchema.safeParse(req.body);
@@ -124,7 +125,7 @@ export async function v1NotifyRoutes(app: FastifyInstance) {
         }
 
         const jobs = buildJobs(body, plan, req.headers['x-correlation-id']);
-        const source = String(req.headers['x-ns-key'] ?? 'unknown');
+        const source = principalLabel(req.principal);
         const records = jobs.map((j) => toAcceptedRecord(j, source));
         const eventId = jobs[0]!.audit!.eventId;
 

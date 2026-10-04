@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../../plugins/request-auth', () => ({ requestAuth: async () => {} }));
+const auth = vi.hoisted(() => ({
+  authenticate: vi.fn((_opts: unknown) => async (req: any) => {
+    req.principal = { kind: 'hmac', id: 'test-key', scopes: new Set(['notify:send', 'templates:admin']) };
+  }),
+}));
+vi.mock('../../plugins/auth', () => auth);
 const repo = vi.hoisted(() => ({
   createTemplateDraft: vi.fn(), updateTemplateDraft: vi.fn(), publishTemplate: vi.fn(),
   retireTemplate: vi.fn(), getTemplate: vi.fn(), listTemplates: vi.fn(),
@@ -34,18 +39,19 @@ async function build() {
   await app.ready();
   return app;
 }
-const admin = { 'x-ns-key': 'ns-admin' };
+const admin = {};
 
 beforeEach(() => {
-  process.env.NS_ADMIN_KEY_IDS = 'ns-admin';
   Object.values(repo).forEach((f) => f.mockReset());
   cache.clearResolveCache.mockClear();
 });
 
 describe('admin template routes', () => {
-  it('403s a non-admin key', async () => {
-    const res = await (await build()).inject({ method: 'GET', url: '/v1/admin/templates', headers: { 'x-ns-key': 'sender' } });
-    expect(res.statusCode).toBe(403);
+  it('guards every route with the templates:admin scope', async () => {
+    auth.authenticate.mockClear();
+    await build();
+    expect(auth.authenticate).toHaveBeenCalled();
+    for (const [opts] of auth.authenticate.mock.calls) expect(opts).toEqual({ scope: 'templates:admin' });
   });
 
   it('creates a draft from snake_case input with the caller as actor', async () => {
@@ -57,7 +63,7 @@ describe('admin template routes', () => {
     expect(res.statusCode).toBe(201);
     expect(repo.createTemplateDraft).toHaveBeenCalledWith(
       expect.objectContaining({ channel: 'email', templateKey: 'welcome', bodyHtml: '<p>{{name}}</p>', variables: [{ name: 'name', required: true, type: 'string', sensitive: false, raw: false }] }),
-      'ns-admin',
+      'hmac:test-key',
     );
     expect(res.json()).toMatchObject({ id: ID, template_key: 'welcome', body_html: '<p>{{name}}</p>', status: 'draft' });
   });
@@ -136,6 +142,7 @@ describe('admin template routes', () => {
     repo.publishTemplate.mockResolvedValue({ ...row, status: 'active' });
     expect((await app.inject({ method: 'POST', url: `/v1/admin/templates/${ID}/publish`, headers: admin })).statusCode).toBe(200);
     expect(cache.clearResolveCache).toHaveBeenCalledTimes(1);
+    expect(repo.publishTemplate).toHaveBeenLastCalledWith(ID, 'hmac:test-key');
     repo.retireTemplate.mockResolvedValue({ ...row, status: 'retired' });
     expect((await app.inject({ method: 'POST', url: `/v1/admin/templates/${ID}/retire`, headers: admin })).statusCode).toBe(200);
     expect(cache.clearResolveCache).toHaveBeenCalledTimes(2);

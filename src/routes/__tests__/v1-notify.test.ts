@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-vi.mock('../../plugins/request-auth', () => ({ requestAuth: async () => {} }));
+const auth = vi.hoisted(() => ({
+  authenticate: vi.fn((_opts: unknown) => async (req: any) => {
+    req.principal = { kind: 'hmac', id: 'test-key', scopes: new Set(['notify:send', 'templates:admin']) };
+  }),
+}));
+vi.mock('../../plugins/auth', () => auth);
 const plan = vi.hoisted(() => ({ planSend: vi.fn() }));
 vi.mock('../../lib/send/plan', () => plan);
 const idem = vi.hoisted(() => ({ claimIdempotency: vi.fn(), completeIdempotency: vi.fn(async () => {}), releaseIdempotency: vi.fn(async () => {}), fallbackKey: vi.fn(() => 'fk') }));
@@ -165,6 +170,8 @@ describe('POST /v1/notify', () => {
     plan.planSend.mockResolvedValue({ mode: 'single', deliveries: [delivery('sms')], redact: true, variables: { message: '123456' } });
     await post({ template_key: 'login_otp', channel: 'sms', to: { phone: '+919999999999' }, variables: { message: '123456' } });
     const recs = store.recordAcceptedMany.mock.calls[0]![0] as any[];
+    expect(recs[0].source).toBe('hmac:test-key');
+    expect(auth.authenticate).toHaveBeenCalledWith({ scope: 'notify:send' });
     expect(recs[0].job).toBeUndefined();
     expect(recs[0].recoverable).toBe(false);
     expect(recs[0].payload.variable_names).toEqual(['message']);

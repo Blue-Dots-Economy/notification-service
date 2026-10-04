@@ -198,7 +198,9 @@ All API routes require HMAC-SHA256 signed requests with headers:
 METHOD\nPATH\nTIMESTAMP\nNONCE
 ```
 
-Implementation: `src/lib/auth/secrets.ts` (loads the JSON file named by `INTERNAL_SECRETS_JSON`), `src/plugins/request-auth.ts` (validates).
+Implementation: `src/lib/auth/secrets.ts` (loads the JSON file named by `INTERNAL_SECRETS_JSON`), `src/plugins/auth.ts` (`authenticate({ scope, legacyHmacV1? })`, the single preHandler for bearer tokens and HMAC), `src/plugins/raw-body.ts` (keeps the exact JSON bytes on `req.rawBody` for the v2 body digest).
+
+**Caller identity in audit rows.** The audit `source` on `/notify` and `/v1/notify`, and the admin `created_by`/`published_by`, are `principalLabel(req.principal)`: `hmac:<keyId>` or `bearer:<id>`. Rows written before this change hold the bare key id.
 
 ### Provider System
 

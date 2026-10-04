@@ -52,8 +52,3 @@ export function loadSecrets() {
 export function getKey(keyId: string): HmacKey | null {
   return KEYS.get(keyId) ?? null;
 }
-
-/** Transitional: removed with request-auth.ts in Task 3. */
-export function getSecret(keyId: string): string | null {
-  return getKey(keyId)?.secret ?? null;
-}
