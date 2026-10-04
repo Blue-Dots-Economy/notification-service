@@ -32,8 +32,11 @@ export function bucketsFor(channel: string, env: NodeJS.ProcessEnv = process.env
   return { shared, reserved };
 }
 
-// Token bucket take: refill by elapsed time, take one if available. Fixed
-// script; key and parameters are passed as KEYS/ARGV.
+// Token bucket take: refill by elapsed time, take one if available. The stored
+// ts only moves forward: with clock skew between worker pods (or EVALs arriving
+// out of order) an older `now` must not rewind it, or the next caller would be
+// re-credited the same gap again. Fixed script; key and parameters are passed
+// as KEYS/ARGV.
 const TAKE = `
 local function take(key, now, rate, cap)
   local data = redis.call('HMGET', key, 'tokens', 'ts')
@@ -42,7 +45,7 @@ local function take(key, now, rate, cap)
   tokens = math.min(cap, tokens + (math.max(0, now - ts) / 1000) * rate)
   local ok = 0
   if tokens >= 1 then tokens = tokens - 1; ok = 1 end
-  redis.call('HSET', key, 'tokens', tokens, 'ts', now)
+  redis.call('HSET', key, 'tokens', tokens, 'ts', math.max(ts, now))
   redis.call('PEXPIRE', key, math.max(60000, math.ceil(cap / rate * 1000)))
   return ok
 end
