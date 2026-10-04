@@ -79,6 +79,10 @@ async function requeueFailedJob(raw: string, priority: 'realtime' | 'other') {
   return retryJob;
 }
 
+function refuse(job: Job) {
+  console.log('DLQ replay refused →', job.job_id, `replays=${job.replays ?? 0}`);
+}
+
 export async function retryFailedJobs({
   jobId,
   limit = 1,
@@ -96,6 +100,7 @@ export async function retryFailedJobs({
 
     const parsed = parseJob(raw);
     if (parsed && (parsed.replays ?? 0) >= MAX_REPLAYS) {
+      refuse(parsed);
       return { retried, skipped, refused: [jobId], not_found: [] };
     }
 
@@ -109,18 +114,23 @@ export async function retryFailedJobs({
     return { retried, skipped, refused, not_found: [] };
   }
 
-  for (let i = 0; i < limit; i += 1) {
-    // Peek the oldest entry first so a capped job stays in the DLQ.
-    const oldest = await redis.lindex(DLQ_QUEUE, -1);
-    if (!oldest) break;
-    const parsed = parseJob(oldest);
+  // The DLQ is LPUSHed, so the oldest entry is at the tail: walk from the end.
+  // Capped entries stay in place and are reported; each other entry is claimed
+  // with LREM so a concurrent drain cannot hand the same job out twice.
+  const entries = await redis.lrange(DLQ_QUEUE, 0, -1);
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    if (retried.length + skipped.length >= limit) break;
+    const raw = entries[i];
+    const parsed = parseJob(raw);
+
     if (parsed && (parsed.replays ?? 0) >= MAX_REPLAYS) {
+      refuse(parsed);
       refused.push(parsed.job_id);
-      break;
+      continue;
     }
 
-    const raw = await redis.rpop(DLQ_QUEUE);
-    if (!raw) break;
+    // Another drain took it first: skip silently.
+    if ((await redis.lrem(DLQ_QUEUE, 1, raw)) === 0) continue;
 
     const job = await requeueFailedJob(raw, priority);
     if (job) retried.push(job.job_id);

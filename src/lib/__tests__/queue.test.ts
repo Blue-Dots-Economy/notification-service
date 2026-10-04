@@ -217,14 +217,34 @@ describe('retryFailedJobs replay accounting', () => {
     expect(JSON.parse(raw).replays).toBe(2);
   });
 
-  it('refuses a capped job in a drain, leaves it in place and stops', async () => {
-    // Oldest first: 'fresh' drains, then the capped entry is reached and left.
-    await queue.pushDLQ(job({ job_id: 'fresh' }));
+  it('skips a capped job at the tail and retries the jobs behind it', async () => {
+    // Oldest (tail) first: the capped entry must not block the drain.
     await queue.pushDLQ(job({ job_id: 'capped', replays: queue.MAX_REPLAYS }));
-    const res = await queue.retryFailedJobs({ limit: 5 });
-    expect(res.retried).toEqual(['fresh']);
+    await queue.pushDLQ(job({ job_id: 'f1' }));
+    await queue.pushDLQ(job({ job_id: 'f2' }));
+    await queue.pushDLQ(job({ job_id: 'f3' }));
+    const res = await queue.retryFailedJobs({ limit: 2 });
+    expect(res.retried).toEqual(['f1', 'f2']);
     expect(res.refused).toEqual(['capped']);
-    expect(await redis.lrange('queue:dlq', 0, -1)).toHaveLength(1);
+    const left = (await redis.lrange('queue:dlq', 0, -1)).map((r) => JSON.parse(r).job_id);
+    expect(left).toEqual(['f3', 'capped']);
+  });
+
+  it('does not requeue a job another drain removed between read and claim', async () => {
+    await queue.pushDLQ(job({ job_id: 'gone' }));
+    await queue.pushDLQ(job({ job_id: 'kept' }));
+    const realLrem = redis.lrem.bind(redis);
+    redis.lrem = async (key, count, value) =>
+      JSON.parse(value).job_id === 'gone' ? 0 : realLrem(key, count, value);
+    try {
+      const res = await queue.retryFailedJobs({ limit: 2 });
+      expect(res.retried).toEqual(['kept']);
+      expect(res.skipped).toEqual([]);
+      const requeued = (await redis.lrange('queue:other', 0, -1)).map((r) => JSON.parse(r).job_id);
+      expect(requeued).toEqual(['kept']);
+    } finally {
+      redis.lrem = realLrem;
+    }
   });
 
   it('records a replay as a new delivery attempt, keeping the event identity', async () => {
