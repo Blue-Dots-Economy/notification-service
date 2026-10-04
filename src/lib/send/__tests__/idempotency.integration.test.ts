@@ -31,13 +31,40 @@ describe.each(['realtime', 'other'] as const)('idempotency (%s)', (priority) => 
     expect(claims.filter((c) => c.status === 'fresh')).toHaveLength(1);
   });
 
+  it('release after complete leaves the stored response intact', async () => {
+    await claimIdempotency('n', 'k5', priority);
+    await completeIdempotency('n', 'k5', priority, { notification_event_id: 'e5' });
+    await releaseIdempotency('n', 'k5', priority);
+    expect(await claimIdempotency('n', 'k5', priority)).toEqual({ status: 'replay', response: { notification_event_id: 'e5' } });
+  });
+
   it('keys are scoped per network', async () => {
     await claimIdempotency('a', 'k4', priority);
     expect(await claimIdempotency('b', 'k4', priority)).toEqual({ status: 'fresh' });
   });
 });
 
+describe('stale Postgres claims', () => {
+  const insertStale = () =>
+    getPool().query(`INSERT INTO idempotency_key (network, key, created_at) VALUES ('n', 'stale', now() - interval '16 minutes')`);
+  it('reclaims a null-response row older than the window', async () => {
+    await insertStale();
+    expect(await claimIdempotency('n', 'stale', 'other')).toEqual({ status: 'fresh' });
+    expect(await claimIdempotency('n', 'stale', 'other')).toEqual({ status: 'in_progress' });
+  });
+  it('concurrent claims on a stale row: exactly one fresh', async () => {
+    await insertStale();
+    const claims = await Promise.all(Array.from({ length: 8 }, () => claimIdempotency('n', 'stale', 'other')));
+    expect(claims.filter((c) => c.status === 'fresh')).toHaveLength(1);
+  });
+});
+
 describe('fallbackKey and pruning', () => {
+  it('treats an undefined variable like an absent key (JSON.stringify drops undefined)', () => {
+    const a = V1NotifySchema.parse({ event_type: 'x', to: { phone: '+919999999999' }, variables: { a: undefined } });
+    const b = V1NotifySchema.parse({ event_type: 'x', to: { phone: '+919999999999' }, variables: {} });
+    expect(fallbackKey(a)).toBe(fallbackKey(b));
+  });
   it('is stable regardless of key order and differs by content', () => {
     const a = V1NotifySchema.parse({ event_type: 'x', to: { phone: '+919999999999' }, variables: { a: '1', b: '2' } });
     const b = V1NotifySchema.parse({ variables: { b: '2', a: '1' }, to: { phone: '+919999999999' }, event_type: 'x' });
