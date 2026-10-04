@@ -3,8 +3,7 @@ import type { TemplateRow } from '../db/schema';
 import { urgentDefaultDeadlineS } from '../deadline';
 import { CHANNEL_CONTACT, planDelivery } from '../policies/plan';
 import { TemplateError } from '../templates/errors';
-import { validateVariables } from '../templates/contract';
-import { renderTemplate, type Rendered } from '../templates/render';
+import { renderWithValues, type Rendered } from '../templates/render';
 import { classify, SendError } from './errors';
 import { parseDeadline, type V1Request } from './request';
 import { cachedResolvePolicy, cachedResolveTemplate } from './resolver-cache';
@@ -88,14 +87,15 @@ export async function planSend(req: V1Request, now = Date.now()): Promise<SendPl
     const own = new Set(r.template.variables.map((s) => s.name));
     let rendered: Rendered;
     try {
-      rendered = renderTemplate(r.template, r.renders, pick(req.variables, own));
+      const out = renderWithValues(r.template, r.renders, pick(req.variables, own));
+      rendered = out.rendered;
+      Object.assign(variables, out.values);
     } catch (e) {
       if (!(e instanceof TemplateError)) throw e;
       if (classify(e.code) === 'caller') throw toSendError(e);
       skip(e);
       continue;
     }
-    Object.assign(variables, validateVariables(r.template.variables, pick(req.variables, own)));
     deliveries.push({
       channel: r.channel,
       to: r.channel === 'email' ? contacts.email! : contacts.phone!,
