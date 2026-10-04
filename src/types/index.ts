@@ -17,10 +17,13 @@ export interface NotifyRequest {
   body?: string;
 }
 
+/** Internal priority. Public API names (Plan C2): urgent → realtime, normal → other, bulk → bulk. */
+export type Priority = 'realtime' | 'other' | 'bulk';
+
 export interface Job {
   job_id: string;
   channel: string;
-  priority: 'realtime' | 'other';
+  priority: Priority;
   to: string;
   template_id: string;
   variables: any;
@@ -31,4 +34,6 @@ export interface Job {
   audit?: import('../lib/audit/store').AuditIds;
   /** Times this job has been replayed from the DLQ (capped; see queue.ts). */
   replays?: number;
+  /** Absolute epoch-ms deadline. Past it the job is never sent: terminal `expired`. */
+  deadline?: number;
 }

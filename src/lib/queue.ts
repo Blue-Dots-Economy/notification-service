@@ -1,11 +1,17 @@
 import { randomUUID } from 'crypto';
-import { Job } from 'src/types';
+import type Redis from 'ioredis';
+import type { Job, Priority } from 'src/types';
 import redis from './redis';
 
 // Queue Keys
 
-const REALTIME_QUEUE = 'queue:realtime';
-const OTHER_QUEUE = 'queue:other';
+export const QUEUE_KEYS: Record<Priority, string> = {
+  realtime: 'queue:realtime',
+  other: 'queue:other',
+  bulk: 'queue:bulk',
+};
+const REALTIME_QUEUE = QUEUE_KEYS.realtime;
+const OTHER_QUEUE = QUEUE_KEYS.other;
 const RETRY_ZSET = 'queue:retry';
 const DLQ_QUEUE = 'queue:dlq';
 
@@ -20,12 +26,71 @@ export const MAX_REPLAYS = 3;
 
 /** Enqueue realtime job (high priority). */
 export async function pushRealtime(job: Job) {
-  return redis.lpush(REALTIME_QUEUE, JSON.stringify(job));
+  return pushToPriority({ ...job, priority: 'realtime' });
 }
 
 /** Enqueue fallback job. */
 export async function pushOther(job: Job) {
-  return redis.lpush(OTHER_QUEUE, JSON.stringify(job));
+  return pushToPriority({ ...job, priority: 'other' });
+}
+
+export async function pushToPriority(job: Job): Promise<void> {
+  await redis.lpush(QUEUE_KEYS[job.priority] ?? QUEUE_KEYS.other, JSON.stringify(job));
+}
+
+/**
+ * Blocking pop for one priority on the caller's own connection. BRPOP holds its
+ * connection until it returns, so every pool loop owns a dedicated connection —
+ * sharing one would let a bulk pop hold up an urgent one.
+ */
+export async function popFrom(
+  conn: Redis,
+  priority: Priority,
+  timeoutSeconds = 1,
+): Promise<Job | null> {
+  const res = await conn.brpop(QUEUE_KEYS[priority], timeoutSeconds);
+  return res ? (JSON.parse(res[1]) as Job) : null;
+}
+
+/** Schedule a job without counting an attempt (rate-limit deferral). */
+export async function deferJob(job: Job, delayMs: number): Promise<void> {
+  await redis.zadd(RETRY_ZSET, String(Date.now() + delayMs), JSON.stringify(job));
+}
+
+// Claim every due retry and push it onto its own priority's queue in one atomic
+// step, so concurrent schedulers never move a member twice and a retry never
+// changes pool. A member that is not valid JSON goes to the DLQ untouched rather
+// than vanishing. Fixed script; keys and cutoff are passed as KEYS/ARGV.
+const MOVE_DUE_RETRIES = `
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1])
+local moved = 0
+for _, raw in ipairs(due) do
+  redis.call('ZREM', KEYS[1], raw)
+  local ok, job = pcall(cjson.decode, raw)
+  if ok and type(job) == 'table' then
+    local p = job['priority']
+    local target = KEYS[3]
+    if p == 'realtime' then target = KEYS[2] elseif p == 'bulk' then target = KEYS[4] end
+    redis.call('LPUSH', target, raw)
+    moved = moved + 1
+  else
+    redis.call('LPUSH', KEYS[5], raw)
+  end
+end
+return moved
+`;
+
+export async function moveDueRetries(now = Date.now()): Promise<number> {
+  return (await redis.eval(
+    MOVE_DUE_RETRIES,
+    5,
+    RETRY_ZSET,
+    QUEUE_KEYS.realtime,
+    QUEUE_KEYS.other,
+    QUEUE_KEYS.bulk,
+    DLQ_QUEUE,
+    String(now),
+  )) as number;
 }
 
 /**
@@ -61,7 +126,7 @@ export async function pushDLQ(job: Job) {
 type RetryFailedJobsOptions = {
   jobId?: string;
   limit?: number;
-  priority?: 'realtime' | 'other';
+  priority?: Priority;
 };
 
 function parseJob(raw: string): Job | null {
@@ -72,7 +137,7 @@ function parseJob(raw: string): Job | null {
   }
 }
 
-async function requeueFailedJob(raw: string, priority: 'realtime' | 'other') {
+async function requeueFailedJob(raw: string, priority: Priority) {
   const job = parseJob(raw);
   if (!job) return null;
 
@@ -87,8 +152,7 @@ async function requeueFailedJob(raw: string, priority: 'realtime' | 'other') {
     ...(job.audit ? { audit: { ...job.audit, attemptId: randomUUID() } } : {}),
   };
 
-  if (priority === 'realtime') await pushRealtime(retryJob);
-  else await pushOther(retryJob);
+  await pushToPriority(retryJob);
 
   return retryJob;
 }
@@ -239,6 +303,7 @@ export async function getQueueMetrics() {
     .zcard(RETRY_ZSET)
     .zrange(RETRY_ZSET, '0', '0', 'WITHSCORES') // oldest retry entry (string indices: ioredis 6 types zrange stop as string|Buffer)
     .llen(DLQ_QUEUE)
+    .llen(QUEUE_KEYS.bulk)
     .exec();
 
   if (!execResult) {
@@ -249,6 +314,7 @@ export async function getQueueMetrics() {
       retry_oldest: null,
       retry_eta_seconds: null,
       dlq: 0,
+      bulk: 0,
     };
   }
 
@@ -258,6 +324,7 @@ export async function getQueueMetrics() {
     [, retry_count],
     [, oldestRetryRaw],
     [, dlq],
+    [, bulk],
   ] = execResult;
 
   // Handle empty retry zset
@@ -283,5 +350,6 @@ export async function getQueueMetrics() {
     retry_oldest,
     retry_eta_seconds,
     dlq,
+    bulk,
   };
 }
