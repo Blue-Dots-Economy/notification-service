@@ -97,7 +97,7 @@ export class RedisFake {
     value: string,
     _ex: 'EX',
     ttlSeconds: number,
-    mode: 'NX',
+    mode?: 'NX',
   ): Promise<'OK' | null> {
     const existing = this.strings.get(key);
     const live =
@@ -105,6 +105,16 @@ export class RedisFake {
     if (mode === 'NX' && live) return null;
     this.strings.set(key, { value, expiresAt: Date.now() + ttlSeconds * 1000 });
     return 'OK';
+  }
+
+  async get(key: string): Promise<string | null> {
+    const e = this.strings.get(key);
+    if (!e || (e.expiresAt !== undefined && e.expiresAt <= Date.now())) return null;
+    return e.value;
+  }
+
+  async mget(...keys: string[]): Promise<Array<string | null>> {
+    return Promise.all(keys.map((k) => this.get(k)));
   }
 
   async zadd(key: string, score: string | number, member: string): Promise<number> {

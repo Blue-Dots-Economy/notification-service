@@ -16,6 +16,9 @@ vi.mock('../metrics', () => ({
 const { stamp } = vi.hoisted(() => ({ stamp: vi.fn(async () => {}) }));
 vi.mock('../audit/stamp', () => ({ stamp }));
 
+const { markAttempt } = vi.hoisted(() => ({ markAttempt: vi.fn(async () => {}) }));
+vi.mock('../audit/marker', () => ({ markAttempt }));
+
 vi.mock('../queue', () => ({
   pushDLQ: vi.fn(async () => 1),
   scheduleRetry: vi.fn(async () => 1),
@@ -358,5 +361,29 @@ describe('processJob audit stamping', () => {
       { status: 'failed', attemptNo: 1, error: 'template_not_configured' },
       { status: 'failed', attemptNo: 1, error: 'unknown_template' },
     ]);
+  });
+});
+
+describe('processJob attempt markers', () => {
+  it('marks sent before the sent stamp', async () => {
+    await processJob(job());
+    expect(markAttempt).toHaveBeenCalledWith(expect.anything(), 'sent', 1);
+    const sentStamp = stamp.mock.calls.findIndex((c) => (c[1] as { status: string }).status === 'sent');
+    expect(markAttempt.mock.invocationCallOrder[0]).toBeLessThan(stamp.mock.invocationCallOrder[sentStamp]!);
+  });
+
+  it('marks retry with the next attempt number before the queued stamp', async () => {
+    send.mockResolvedValueOnce({ ok: false, error: 'timeout' });
+    await processJob(job());
+    expect(markAttempt).toHaveBeenCalledWith(expect.anything(), 'retry', 2);
+    expect(markAttempt.mock.invocationCallOrder[0]).toBeLessThan(stamp.mock.invocationCallOrder.at(-1)!);
+    expect(queue.scheduleRetry).toHaveBeenCalled();
+  });
+
+  it('marks failed on every dead-letter path', async () => {
+    send.mockResolvedValueOnce({ ok: false, error: 'bad', retryable: false });
+    await processJob(job());
+    await processJob(job({ channel: 'nope' }));
+    expect(markAttempt.mock.calls.map((c) => [c[1], c[2]])).toEqual([['failed', 1], ['failed', 1]]);
   });
 });

@@ -11,6 +11,7 @@ import { Job } from 'src/types';
 import { ProviderSendResult } from 'src/types/provider';
 import { loadSecrets } from './auth/secrets';
 import { stamp } from './audit/stamp';
+import { markAttempt } from './audit/marker';
 
 const MAX_RETRIES = 5;
 
@@ -29,6 +30,7 @@ export async function processJob(job: Job) {
   if (!provider) {
     await metrics.incr('ns_job_dlq_total', { channel: job.channel, reason: 'unknown_channel' });
     console.log('Unknown provider, sending to DLQ:', job.job_id, job.channel);
+    await markAttempt(job, 'failed', job.attempt);
     await stamp(job, { status: 'failed', attemptNo: job.attempt, error: 'unknown_channel' });
     return pushDLQ(job);
   }
@@ -54,6 +56,7 @@ export async function processJob(job: Job) {
         `(id=${named === '' ? 'missing' : 'ok'}, body=${namedBody === '' ? 'missing' : 'ok'}), sending to DLQ:`,
       job.job_id
     );
+    await markAttempt(job, 'failed', job.attempt);
     await stamp(job, { status: 'failed', attemptNo: job.attempt, error: 'template_not_configured' });
     return pushDLQ(job);
   }
@@ -62,6 +65,7 @@ export async function processJob(job: Job) {
   if (!templateId) {
     await metrics.incr('ns_job_dlq_total', { channel: job.channel, reason: 'unknown_template' });
     console.log('Unknown provider template, sending to DLQ:', job.job_id);
+    await markAttempt(job, 'failed', job.attempt);
     await stamp(job, { status: 'failed', attemptNo: job.attempt, error: 'unknown_template' });
     return pushDLQ(job);
   }
@@ -102,6 +106,7 @@ export async function processJob(job: Job) {
     if (res.retryable === false) {
       await metrics.incr('ns_job_dlq_total', { channel: job.channel, reason: 'permanent_failure' });
       console.log(`Permanent failure → DLQ: ${job.job_id}${res.error ? ` (${res.error})` : ''}`);
+      await markAttempt(job, 'failed', job.attempt);
       await stamp(job, { status: 'failed', attemptNo: job.attempt, error: res.error ?? 'permanent_failure' });
       return pushDLQ(job);
     }
@@ -111,6 +116,7 @@ export async function processJob(job: Job) {
       console.log(
         `Max retries reached → DLQ: ${job.job_id}${res.error ? ` (${res.error})` : ''}`
       );
+      await markAttempt(job, 'failed', job.attempt);
       await stamp(job, { status: 'failed', attemptNo: job.attempt, error: res.error ?? 'max_retries' });
       return pushDLQ(job);
     }
@@ -118,10 +124,15 @@ export async function processJob(job: Job) {
     const delay = 5 * Math.pow(2, job.attempt - 1);
     console.log(`Retry scheduled in ${delay}s:`, job.job_id);
 
+    // Marker before stamp: if the stamp fails the row stays `dispatching`, and
+    // the marker tells recovery the job is already in the retry set.
+    await markAttempt(job, 'retry', job.attempt + 1);
     await stamp(job, { status: 'queued', attemptNo: job.attempt + 1, error: res.error });
     return scheduleRetry(job, delay);
   }
 
+  // Marker before stamp: a failed `sent` stamp must not let recovery re-send.
+  await markAttempt(job, 'sent', job.attempt);
   await stamp(job, { status: 'sent', attemptNo: job.attempt, providerMessageId: res.provider_message_id });
   console.log('Delivered:', job.job_id);
 }
