@@ -36,4 +36,28 @@ describe('stamp', () => {
     await expect(stamp(bad as never, { status: 'sent', attemptNo: 1 })).resolves.toBeUndefined();
     expect(incr).toHaveBeenCalledWith('ns_audit_write_failures_total', { stage: 'sent' });
   });
+
+  it('does not wait for the database on the realtime path', async () => {
+    upsertAttempt.mockReturnValueOnce(new Promise(() => {}));
+    const rt = { ...job, priority: 'realtime' as const };
+    const outcome = await Promise.race([
+      stamp(rt, { status: 'sent', attemptNo: 1 }).then(() => 'returned'),
+      new Promise((r) => setTimeout(() => r('hung'), 100)),
+    ]);
+    expect(outcome).toBe('returned');
+  });
+
+  it('still counts a failed realtime write', async () => {
+    upsertAttempt.mockRejectedValueOnce(new Error('db down'));
+    const rt = { ...job, priority: 'realtime' as const };
+    await stamp(rt, { status: 'failed', attemptNo: 1, error: 'x' });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(incr).toHaveBeenCalledWith('ns_audit_write_failures_total', { stage: 'failed' });
+  });
+
+  it('resolves even when the failure counter itself rejects', async () => {
+    upsertAttempt.mockRejectedValueOnce(new Error('db down'));
+    incr.mockRejectedValueOnce(new Error('redis down'));
+    await expect(stamp(job, { status: 'sent', attemptNo: 1 })).resolves.toBeUndefined();
+  });
 });

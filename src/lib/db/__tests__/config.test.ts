@@ -37,4 +37,20 @@ describe('loadDbConfig', () => {
   it('rejects a non-numeric port', () => {
     expect(() => loadDbConfig({ ...base, DATABASE_PORT: 'abc' })).toThrow('DATABASE_PORT');
   });
+
+  it('bounds database waits by default', () => {
+    expect(loadDbConfig(base)).toMatchObject({
+      connectionTimeoutMillis: 2000, query_timeout: 5000, statement_timeout: 5000,
+    });
+  });
+
+  it('applies timeout overrides', () => {
+    const cfg = loadDbConfig({ ...base, DATABASE_CONNECT_TIMEOUT_MS: '300', DATABASE_QUERY_TIMEOUT_MS: '700' });
+    expect(cfg).toMatchObject({ connectionTimeoutMillis: 300, query_timeout: 700, statement_timeout: 700 });
+  });
+
+  it('rejects non-numeric or non-positive timeouts', () => {
+    expect(() => loadDbConfig({ ...base, DATABASE_CONNECT_TIMEOUT_MS: 'abc' })).toThrow('DATABASE_CONNECT_TIMEOUT_MS');
+    expect(() => loadDbConfig({ ...base, DATABASE_QUERY_TIMEOUT_MS: '0' })).toThrow('DATABASE_QUERY_TIMEOUT_MS');
+  });
 });

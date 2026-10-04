@@ -13,17 +13,29 @@ const REQUIRED = ['DATABASE_HOST', 'DATABASE_NAME', 'DATABASE_USER', 'DATABASE_P
  * `DATABASE_SSL` is `disable` (default — how the other services reach the shared
  * RDS today) or `require`, which verifies the server certificate against the
  * Node trust store plus any CA in `NODE_EXTRA_CA_CERTS`.
+ *
+ * Waits are bounded (node-postgres defaults to waiting forever): a connect
+ * timeout (`DATABASE_CONNECT_TIMEOUT_MS`, 2000) and client- and server-side
+ * query timeouts (`DATABASE_QUERY_TIMEOUT_MS`, 5000), so an unreachable
+ * database cannot hold the worker loop.
  */
+function positiveInt(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const n = Number(env[name] ?? fallback);
+  if (!Number.isInteger(n) || n <= 0) {
+    throw new Error(`${name} must be a positive integer, got '${env[name]}'`);
+  }
+  return n;
+}
+
 export function loadDbConfig(env: NodeJS.ProcessEnv = process.env): PoolConfig {
   const missing = REQUIRED.filter((k) => !env[k]);
   if (missing.length > 0) {
     throw new Error(`Database not configured: missing ${missing.join(', ')}`);
   }
 
-  const port = Number(env.DATABASE_PORT ?? 5432);
-  if (!Number.isInteger(port) || port <= 0) {
-    throw new Error(`DATABASE_PORT must be a positive integer, got '${env.DATABASE_PORT}'`);
-  }
+  const port = positiveInt(env, 'DATABASE_PORT', 5432);
+  const connectionTimeoutMillis = positiveInt(env, 'DATABASE_CONNECT_TIMEOUT_MS', 2000);
+  const queryTimeout = positiveInt(env, 'DATABASE_QUERY_TIMEOUT_MS', 5000);
 
   const ssl = (env.DATABASE_SSL ?? 'disable').trim().toLowerCase();
   if (ssl !== 'disable' && ssl !== 'require') {
@@ -38,5 +50,8 @@ export function loadDbConfig(env: NodeJS.ProcessEnv = process.env): PoolConfig {
     password: env.DATABASE_PASSWORD,
     ssl: ssl === 'require' ? { rejectUnauthorized: true } : false,
     max: Number(env.DATABASE_POOL_MAX ?? 10),
+    connectionTimeoutMillis,
+    query_timeout: queryTimeout,
+    statement_timeout: queryTimeout,
   };
 }
