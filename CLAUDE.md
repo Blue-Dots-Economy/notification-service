@@ -186,7 +186,10 @@ export const emailProvider: ProviderDefinition = {
 };
 ```
 
-Providers are auto-discovered and registered by `src/lib/providers/index.ts`. To add a provider, create a folder and export the definition (see README for full example).
+`vendor` (`'smtp' | 'msg91' | 'pinnacle' | 'twilio'`) and `renders` (`'ns' | 'provider'`) are
+**required** on every definition; see Templates and policies for what they drive.
+
+Providers are auto-discovered and registered by `src/lib/providers/index.ts`. To add a provider, create a folder and export the definition, including `vendor` and `renders` (see README for full example).
 
 **`allowRawTemplateId` (raw template-id pass-through).** By default a `template_id`
 must name a key in the provider's `templates` map or `/notify` rejects it with a
@@ -269,6 +272,74 @@ to key on `channel:to:template_id` alone, which for a generic template like
 `basic_email` collapsed to one email per recipient per window regardless of content.
 See README for the full request/response contract.
 
+## Templates and policies
+
+Code: `src/lib/templates/` (`contract`, `render`, `repo`, `validate`, `vendors`, `seed`),
+`src/lib/policies/` (`repo`, `plan`), routes `src/routes/admin-templates.ts` and
+`admin-policies.ts`. Plan C wires these into `/notify`; until then `/notify` behaves as before.
+
+**Tables.** `template` is keyed `(network, channel, template_key, locale)` and `notification_policy`
+`(network, domain, event_type)` where NULL means "any". Both carry a `version` and a status of
+`draft`, `active` or `retired`. The network is deployment config (`NS_NETWORK`, read through
+`currentNetwork()`), never request input; unset, `NetworkNotConfigured` is thrown and admin routes
+answer `503`.
+
+**Lifecycle.** Only drafts are editable. Active and retired rows are immutable on every channel
+(`409 invalid_state`); to change one, create a new draft version. Publishing validates, retires the
+previous active row for the same key and activates the draft in one transaction under a
+`pg_advisory_xact_lock`, backed by a partial unique index on `status = 'active'`, so there is
+exactly one active row per key even with concurrent publishes. Retire never deletes.
+
+**One vendor per channel per deployment.** `ProviderDefinition.vendor` names it and `renders` says
+who turns a template into text: `ns` (email/smtp, Pinnacle SMS) or `provider` (MSG91 Flow, Twilio
+Content). A template's `provider` must equal the deployment's vendor, checked at publish and again
+in `resolveTemplate`, which refuses with `vendor_mismatch` instead of falling back to another
+locale. DLT and Meta template ids are per vendor, so a template from another vendor would send a
+meaningless id. Adding a provider means declaring both fields.
+
+**Locale chain.** A requested `xx-YY` resolves `xx-YY` → `xx` → `NS_DEFAULT_LOCALE`.
+
+**Variable contract** (`contract.ts`) is a list of `{ name, required, type: string|number|url,
+sensitive, raw, urlHosts? }`. It is enforced at publish (every `{{token}}` in a stored body is
+declared, every declared variable is used) and again on each send, **before** any vendor call:
+- Unknown variables are rejected; required ones must be present and non-empty.
+- Names that exist on `Object.prototype` (`constructor`, `toString`, ...) are rejected, and values
+  are read as own properties only.
+- Values must be a string, a finite number or a boolean; `number` must match `^-?\d+(\.\d+)?$`.
+- `url` must be `http(s)` with no userinfo. `urlHosts` is an allowlist with subdomain matching and
+  one trailing dot tolerated. The stored and rendered value is the normalised `url.href`, so what
+  was validated is what is sent.
+- Error messages name variables, never their values.
+
+**Rendering** (`render.ts`). Email HTML-escapes every variable by default; `raw: true` is the
+reviewable opt-out and is valid on email only. Subjects collapse CR/LF to a space, so a variable
+cannot inject headers. SMS bodies are stored byte-exact (the DLT operator matches on them). The
+rendered SMS length is checked against 2000 (TXT) or 750 (UNI), chosen by the *rendered* text, so a
+non-GSM variable cannot push a TXT-sized body past the UNI limit. Vendor-rendered templates pass the
+provider template id and the validated variables.
+
+**Policies.** `resolvePolicy` picks the most specific active row: `(domain, event)` → `(any, event)`
+→ `(domain, any)` → `(any, any)` default. Publish requires an active template for every channel
+listed, checked at publish only: a template retired later surfaces as an error at send time.
+`planDelivery(policy, contacts)` filters the channel list by what the caller supplied (email needs
+an email address; sms and whatsapp need a phone) because NS holds no user directory. `first_available`
+tries candidates in order; `all` fans out.
+
+**Admin scope.** `/v1/admin/templates` and `/v1/admin/policies` need a valid HMAC signature
+(`requestAuth`) **and** the key id in `NS_ADMIN_KEY_IDS`, else `403 {"error":"admin scope required"}`.
+Editing a DLT-registered template has a compliance blast radius a sending credential must not
+carry. Interim until Keycloak admin roles (#62). Request schemas are strict (unknown keys → `400`).
+Errors: `404 not_found`, `409 invalid_state`, `422` for any other rule violation, `503
+network_not_configured`. `POST .../preview` renders a template of any status with the supplied
+variables and sends nothing.
+
+**`login_otp` seeding** (`seed.ts`, called from `server.ts` after recovery). At boot the SMS
+`login_otp` template is created and published from the provider's configured template id and body,
+with contract `message` (required, sensitive). It **never overwrites** any existing `login_otp` row
+of any status, so an admin's edits always win over environment defaults. Replicas booting together
+serialise on a session advisory lock. Seeding is non-fatal (logged, never blocks listen) and is
+skipped when `NS_NETWORK` is unset; a template that fails publish validation is left as a draft.
+
 ## Key Files
 
 **Routes** (`src/routes/`):
@@ -278,6 +349,7 @@ See README for the full request/response contract.
 - `metrics.ts` — Queue metrics endpoint (HMAC-authed JSON) **and** `/metrics`,
   the unauthenticated Prometheus scrape endpoint
 - `retry.ts` — Manual DLQ retry endpoint (`refused` in the response; see DLQ replay cap)
+- `admin-templates.ts`, `admin-policies.ts` — template and policy admin API (see Templates and policies)
 
 **Library** (`src/lib/`):
 - `queue.ts` — Redis queue and retry helpers
@@ -323,7 +395,13 @@ Required for persistence and Redis:
   database cannot hold the worker loop.
 - `DATABASE_SSL` — `disable` (default; parity with the other services on the shared RDS) or
   `require`. `require` **verifies** the certificate, so supply the RDS CA via `NODE_EXTRA_CA_CERTS`.
-- `NS_NETWORK` — optional until #62; recorded on each event, `unknown` when unset.
+- `NS_NETWORK` — the network this deployment serves (opentofu sets it from `signals_network`).
+  **Required for the template/policy admin API and boot seeding**: unset, the admin routes answer
+  `503 network_not_configured` and seeding is skipped. Still recorded on each event, `unknown`
+  when unset.
+- `NS_DEFAULT_LOCALE` — optional, default `en`; the last step of the template locale chain.
+- `NS_ADMIN_KEY_IDS` — comma-separated HMAC key ids allowed to use `/v1/admin/*`. Unset means
+  nobody can.
 - `PARTITION_MAINTENANCE_INTERVAL_MS` — optional, default 6h.
 - `RECOVERY_MAX_AGE_HOURS` — optional, default 24, positive integer (invalid fails boot). Open
   recoverable sends older than this are marked failed by recovery instead of sent late.
@@ -382,7 +460,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 300 unit tests across 23 files (plus 36 integration tests). The unit suite runs in about a second because Redis
+vitest 4, 371 unit tests across 33 files (plus 36 integration tests). The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
