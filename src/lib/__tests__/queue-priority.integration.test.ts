@@ -55,4 +55,30 @@ describe('priority queues', () => {
     expect(await moveDueRetries()).toBe(0);
     expect(await redis.lrange('queue:dlq', 0, -1)).toEqual(['not json']);
   });
+
+  it.each(['[1,2]', '5', 'null', '{"job_id":7}', '{}'])(
+    'a member that is not an object with a string job_id (%s) is dead-lettered',
+    async (member) => {
+      await redis.zadd('queue:retry', '0', member);
+      expect(await moveDueRetries()).toBe(0);
+      expect(await redis.lrange('queue:dlq', 0, -1)).toEqual([member]);
+    },
+  );
+
+  it('bounds each call and moves 1500 due members exactly once across calls', async () => {
+    const tx = redis.multi();
+    for (let i = 0; i < 1500; i++) tx.zadd('queue:retry', '0', JSON.stringify(job(`m${i}`, 'bulk')));
+    await tx.exec();
+    expect(await moveDueRetries()).toBe(1000);
+    expect(await moveDueRetries()).toBe(500);
+    expect(await moveDueRetries()).toBe(0);
+    const ids = (await redis.lrange(QUEUE_KEYS.bulk, 0, -1)).map((r) => JSON.parse(r).job_id);
+    expect(ids).toHaveLength(1500);
+    expect(new Set(ids).size).toBe(1500);
+  });
+
+  it('an unknown priority is pushed to the other queue, even for inherited keys', async () => {
+    await pushToPriority({ ...job('x', 'other'), priority: 'constructor' as never });
+    expect(await redis.llen(QUEUE_KEYS.other)).toBe(1);
+  });
 });
