@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { PoolClient, QueryConfig, QueryResultRow } from 'pg';
 import redis from '../redis';
-import { pushOtherMany } from '../queue';
+import { pushManyToPriority } from '../queue';
 import { getPool } from '../db/client';
 import * as metrics from '../metrics';
 import type { Job } from 'src/types';
@@ -111,7 +111,8 @@ export interface RecoveryResult {
  *    stamped on the row; `retry` means the job is in the retry set → left as is.
  * 2. Created more than `maxAgeHours` ago → marked failed (abandoned) and
  *    counted in ns_recovery_abandoned_total; a late send is worse than none.
- * 3. Otherwise → attempt_no + 1, status queued, pushed onto the other queue.
+ * 3. Otherwise → attempt_no + 1, status queued, pushed back onto its own
+ *    priority's queue (a recovered job never changes pool).
  *
  * Work runs in batches of RECOVERY_BATCH_SIZE, each its own transaction: the
  * row updates and the batch's single MULTI push commit together, or roll back
@@ -245,7 +246,7 @@ async function recoverBatch(p: {
         [toRequeue.map((r) => r.id), toRequeue.map((r) => r.created_at)],
       );
       const attemptById = new Map(bumped.map((b) => [b.id, b.attempt_no]));
-      await pushOtherMany(
+      await pushManyToPriority(
         toRequeue.map((r) => ({ ...r.job, attempt: (attemptById.get(r.id) ?? r.attempt_no + 1) - 1 })),
       );
     }

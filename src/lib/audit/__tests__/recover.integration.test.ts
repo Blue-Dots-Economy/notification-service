@@ -2,10 +2,20 @@ import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const pushed: unknown[] = [];
-vi.mock('../../queue', () => ({ pushOtherMany: vi.fn(async (jobs: unknown[]) => { pushed.push(...jobs); }) }));
+// The real push runs (so tests can read the priority queues), recorded on the way.
+vi.mock('../../queue', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../queue')>();
+  return {
+    ...actual,
+    pushManyToPriority: vi.fn(async (jobs: Parameters<typeof actual.pushManyToPriority>[0]) => {
+      pushed.push(...jobs);
+      await actual.pushManyToPriority(jobs);
+    }),
+  };
+});
 
 import redis from '../../redis';
-import { pushOtherMany } from '../../queue';
+import { pushManyToPriority, QUEUE_KEYS } from '../../queue';
 import { closeDb, getPool } from '../../db/client';
 import { runMigrations } from '../../db/migrate';
 import { recordAccepted, upsertAttempt, type AcceptedRecord } from '../store';
@@ -16,18 +26,19 @@ beforeAll(async () => { await runMigrations(); });
 afterAll(async () => { await closeDb(); redis.disconnect(); });
 beforeEach(async () => {
   pushed.length = 0;
-  vi.mocked(pushOtherMany).mockClear();
-  await redis.del(REDIS_RECOVERY_LOCK_KEY);
+  vi.mocked(pushManyToPriority).mockClear();
+  await redis.del(REDIS_RECOVERY_LOCK_KEY, ...Object.values(QUEUE_KEYS));
   await getPool().query(`DELETE FROM delivery_attempt; DELETE FROM notification_event;`);
 });
 
-function rec(priority: 'realtime' | 'other', createdAt = new Date()): AcceptedRecord {
+function rec(priority: 'realtime' | 'other' | 'bulk', createdAt = new Date()): AcceptedRecord {
   const jobId = randomUUID();
+  const recoverable = priority !== 'realtime';
   return {
     ids: { eventId: randomUUID(), attemptId: randomUUID(), createdAt: createdAt.toISOString(), correlationId: jobId },
     network: 'n', source: 's', priority, channel: 'email', templateId: 't',
-    payload: {}, recoverable: priority === 'other',
-    job: priority === 'other' ? { job_id: jobId, channel: 'email', priority, to: 'x', template_id: 't', variables: {} } : undefined,
+    payload: {}, recoverable,
+    job: recoverable ? { job_id: jobId, channel: 'email', priority, to: 'x', template_id: 't', variables: {} } : undefined,
   };
 }
 
@@ -47,6 +58,22 @@ describe('recoverLostJobs', () => {
     expect(a.requeued + b.requeued).toBe(1);
     expect(pushed).toHaveLength(1);
     expect(await redis.get(REDIS_EPOCH_KEY)).not.toBeNull();
+  });
+
+  it('requeues each job onto its own priority queue', async () => {
+    const other = rec('other');
+    const bulk = rec('bulk');
+    for (const r of [other, bulk]) {
+      await recordAccepted(r);
+      await backdate(r);
+    }
+    await redis.del(REDIS_EPOCH_KEY);
+
+    expect((await recoverLostJobs()).requeued).toBe(2);
+    const ids = async (key: string) => (await redis.lrange(key, 0, -1)).map((raw) => JSON.parse(raw).job_id);
+    expect(await ids(QUEUE_KEYS.other)).toEqual([other.job!.job_id]);
+    expect(await ids(QUEUE_KEYS.bulk)).toEqual([bulk.job!.job_id]);
+    expect(await redis.llen(QUEUE_KEYS.realtime)).toBe(0);
   });
 
   it('does nothing when the epoch is present and nothing is stale', async () => {
@@ -105,7 +132,7 @@ describe('recoverLostJobs', () => {
     await upsertAttempt(r, { status: 'dispatching', attemptNo: 1 });
     await backdate(r, '1 hour');
     await redis.set(REDIS_EPOCH_KEY, 'x');
-    vi.mocked(pushOtherMany).mockRejectedValueOnce(new Error('redis down'));
+    vi.mocked(pushManyToPriority).mockRejectedValueOnce(new Error('redis down'));
     await expect(recoverLostJobs({ staleDispatchMs: 60_000 })).rejects.toThrow('redis down');
     const { rows } = await getPool().query(`SELECT attempt_no, status FROM delivery_attempt WHERE id = $1`, [r.ids.attemptId]);
     expect(rows[0]).toMatchObject({ attempt_no: 1, status: 'dispatching' });
@@ -118,7 +145,7 @@ describe('recoverLostJobs', () => {
     await recordAccepted(r);
     await backdate(r);
     await redis.del(REDIS_EPOCH_KEY);
-    vi.mocked(pushOtherMany).mockRejectedValueOnce(new Error('redis down'));
+    vi.mocked(pushManyToPriority).mockRejectedValueOnce(new Error('redis down'));
     await expect(recoverLostJobs()).rejects.toThrow();
     expect(await redis.get(REDIS_EPOCH_KEY)).toBeNull();
     expect(await recoverLostJobs()).toMatchObject({ epochLost: true, requeued: 1 });
@@ -239,7 +266,7 @@ describe('recoverLostJobs', () => {
       expect(res.requeued).toBe(1201);
       expect(pushed).toHaveLength(1201);
       expect(new Set(pushed.map((j) => (j as { job_id: string }).job_id)).size).toBe(1201);
-      expect(vi.mocked(pushOtherMany)).toHaveBeenCalledTimes(3);
+      expect(vi.mocked(pushManyToPriority)).toHaveBeenCalledTimes(3);
       const { rows } = await getPool().query(`SELECT count(*)::int AS n FROM delivery_attempt WHERE status = 'queued'`);
       expect(rows[0].n).toBe(1201);
     });
@@ -252,7 +279,7 @@ describe('recoverLostJobs', () => {
       for (const r of old) { await recordAccepted(r); await backdate(r); }
       await redis.del(REDIS_EPOCH_KEY);
       const live = rec('other', new Date(Date.now() + 60_000)); // sorts after the cursor
-      vi.mocked(pushOtherMany).mockImplementationOnce(async (jobs) => {
+      vi.mocked(pushManyToPriority).mockImplementationOnce(async (jobs) => {
         pushed.push(...jobs);
         await recordAccepted(live); // committed between batch 1 and batch 2
         await new Promise((r) => setTimeout(r, 20));
@@ -274,7 +301,7 @@ describe('recoverLostJobs', () => {
         await backdate(r);
       }
       await redis.del(REDIS_EPOCH_KEY);
-      vi.mocked(pushOtherMany)
+      vi.mocked(pushManyToPriority)
         .mockImplementationOnce(async (jobs) => { pushed.push(...jobs); })
         .mockRejectedValueOnce(new Error('redis down'));
       await expect(recoverLostJobs({ batchSize: 2 })).rejects.toThrow('redis down');

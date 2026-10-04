@@ -37,11 +37,15 @@ export async function pushOther(job: Job) {
   return pushToPriority({ ...job, priority: 'other' });
 }
 
-export async function pushToPriority(job: Job): Promise<void> {
-  const key = Object.prototype.hasOwnProperty.call(QUEUE_KEYS, job.priority)
-    ? QUEUE_KEYS[job.priority]
+/** The job's own priority queue; anything unrecognised goes to other (own-property lookup only). */
+function queueKeyFor(priority: unknown): string {
+  return typeof priority === 'string' && Object.prototype.hasOwnProperty.call(QUEUE_KEYS, priority)
+    ? QUEUE_KEYS[priority as Priority]
     : QUEUE_KEYS.other;
-  await redis.lpush(key, JSON.stringify(job));
+}
+
+export async function pushToPriority(job: Job): Promise<void> {
+  await redis.lpush(queueKeyFor(job.priority), JSON.stringify(job));
 }
 
 /**
@@ -122,13 +126,14 @@ export async function moveDueRetries(now = Date.now()): Promise<number> {
 }
 
 /**
- * Enqueue many fallback jobs in one MULTI round trip (recovery). Throws if
- * any push failed, so the caller can roll back what it recorded.
+ * Enqueue many jobs, each on its own priority's queue, in one MULTI round trip
+ * (recovery). Throws if any push failed, so the caller can roll back what it
+ * recorded.
  */
-export async function pushOtherMany(jobs: Job[]): Promise<void> {
+export async function pushManyToPriority(jobs: Job[]): Promise<void> {
   if (jobs.length === 0) return;
   const tx = redis.multi();
-  for (const job of jobs) tx.lpush(OTHER_QUEUE, JSON.stringify(job));
+  for (const job of jobs) tx.lpush(queueKeyFor(job.priority), JSON.stringify(job));
   const results = await tx.exec();
   if (!results) throw new Error('Redis MULTI aborted while re-queueing');
   const failed = results.find(([err]) => err);
