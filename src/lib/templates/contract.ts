@@ -64,6 +64,11 @@ function hostAllowed(host: string, allowed: string[]): boolean {
 }
 
 function normalise(spec: VariableSpec, value: unknown): string {
+  // Reject non-finite JS numbers (NaN, Infinity, -Infinity) for all variable types
+  if (typeof value === 'number' && !Number.isFinite(value)) {
+    throw new TemplateError('invalid_variable', `${spec.name} must be a scalar`, { variable: spec.name });
+  }
+
   // Reject non-scalar types: object, function, symbol, bigint
   const valueType = typeof value;
   if (valueType === 'object' || valueType === 'function' || valueType === 'symbol' || valueType === 'bigint') {

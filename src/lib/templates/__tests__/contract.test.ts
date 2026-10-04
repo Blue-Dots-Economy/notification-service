@@ -117,8 +117,10 @@ describe('security hardening', () => {
   it('accepts trailing dot and strips for host comparison', () => {
     const contract = [v({ name: 'link', type: 'url', urlHosts: ['blue-dots.org'] })];
     const result = validateVariables(contract, { link: 'https://blue-dots.org./path' });
-    // url.href normalizes the hostname
-    expect(result.link).toBeTruthy();
+    // url.href preserves the trailing dot, but we strip it from hostname for allowlist comparison
+    expect(result.link).toBe('https://blue-dots.org./path');
+    // Negative case: lookalike with trailing dot should still be rejected
+    expect(code(() => validateVariables(contract, { link: 'https://evil-blue-dots.org./' }))).toBe('invalid_variable');
   });
 
   it('rejects URLs with credentials', () => {
@@ -148,6 +150,18 @@ describe('security hardening', () => {
     expect(validateVariables(contract, { count: 0 })).toEqual({ count: '0' });
   });
 
+  it('rejects non-finite numbers (NaN, Infinity) for all types', () => {
+    const stringContract = [v({ name: 'name', type: 'string' })];
+    const numberContract = [v({ name: 'count', type: 'number' })];
+    const urlContract = [v({ name: 'link', type: 'url', urlHosts: ['blue-dots.org'] })];
+    expect(code(() => validateVariables(stringContract, { name: NaN }))).toBe('invalid_variable');
+    expect(code(() => validateVariables(stringContract, { name: Infinity }))).toBe('invalid_variable');
+    expect(code(() => validateVariables(stringContract, { name: -Infinity }))).toBe('invalid_variable');
+    expect(code(() => validateVariables(numberContract, { count: NaN }))).toBe('invalid_variable');
+    expect(code(() => validateVariables(numberContract, { count: Infinity }))).toBe('invalid_variable');
+    expect(code(() => validateVariables(urlContract, { link: NaN }))).toBe('invalid_variable');
+  });
+
   it('returns url.href as normalized URL', () => {
     const contract = [v({ name: 'link', type: 'url', urlHosts: ['blue-dots.org'] })];
     const result = validateVariables(contract, { link: 'HTTPS://blue-dots.org/path' });
@@ -161,12 +175,12 @@ describe('security hardening', () => {
       validateVariables(contract, { otp: { nested: 'SECRET_VALUE' } });
       expect.fail('should have thrown');
     } catch (e) {
-      if (e instanceof TemplateError) {
-        const msg = e.message;
-        const details = JSON.stringify(e.details || {});
-        expect(msg).not.toContain('SECRET_VALUE');
-        expect(details).not.toContain('SECRET_VALUE');
-      }
+      expect(e).toBeInstanceOf(TemplateError);
+      const err = e as TemplateError;
+      const msg = err.message;
+      const details = JSON.stringify(err.details || {});
+      expect(msg).not.toContain('SECRET_VALUE');
+      expect(details).not.toContain('SECRET_VALUE');
     }
   });
 });
