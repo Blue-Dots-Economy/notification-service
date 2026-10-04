@@ -35,7 +35,8 @@ src/
 │  │  └─ provider-docs.ts    # Provider payload/schema serialization
 │  └─ providers/             # Provider implementations
 └─ plugins/
-   └─ request-auth.ts        # HMAC request signing guard
+   ├─ auth.ts                # Bearer token / HMAC v2 guard and route scopes
+   └─ raw-body.ts            # JSON-only body parser that keeps the signed bytes
 ```
 
 ## Local Requirements
@@ -93,6 +94,12 @@ is for local runs only).
 | `DATABASE_QUERY_TIMEOUT_MS` | `5000` | Client and server-side query timeout |
 | `DATABASE_SSL` | `disable` | `disable` or `require`; `require` verifies the certificate, so supply the CA via `NODE_EXTRA_CA_CERTS` |
 | `NS_NETWORK` | `unknown` | Network recorded on each event |
+| `INTERNAL_SECRETS_JSON` | required | Path to the HMAC signing keys file (see [Authentication](#authentication)) |
+| `NS_KEYCLOAK_ISSUER` | unset | Turns bearer-token auth on. Must equal the token `iss` exactly, an http(s) URL with no trailing slash |
+| `NS_KEYCLOAK_JWKS_URI` | `<issuer>/protocol/openid-connect/certs` | Key set location |
+| `NS_AUTH_AUDIENCE` | `notification-service` | Required token `aud` |
+| `NS_AUTH_ALLOWED_AZP` | required with the issuer | Comma-separated client ids whose tokens are accepted |
+| `NS_DOCS_ENABLED` | unset | `true` serves `GET /` and `GET /openapi.json`; leave unset in deployed environments |
 | `PARTITION_MAINTENANCE_INTERVAL_MS` | 6 hours | Partition pre-creation interval |
 | `RECOVERY_MAX_AGE_HOURS` | `24` | Open sends older than this are marked failed by recovery, not re-sent |
 | `WORKER_URGENT_CONCURRENCY` | `2` | Urgent loops, each on its own Redis connection; must be a positive integer |
@@ -174,7 +181,8 @@ and what each suite covers.
 
 ## API Docs
 
-Open the Scalar reference:
+With `NS_DOCS_ENABLED=true` (set in `example.env` for local development; off by
+default), open the Scalar reference:
 
 ```text
 GET /
@@ -188,7 +196,8 @@ GET /openapi.json
 
 ## Endpoint Summary
 
-Every endpoint below requires signed auth headers.
+Every endpoint below except `GET /metrics`, `GET /` and `GET /openapi.json` requires
+authentication (a bearer token or HMAC v2 headers; see [Authentication](#authentication)).
 
 ```text
 GET  /                    # Scalar API reference HTML
@@ -205,8 +214,9 @@ The admin API under `/v1/admin/` is listed in [Admin API](#admin-api).
 
 ## Admin API
 
-Templates and routing policies are managed over HTTP. Every route needs the usual signed
-headers **and** a key id listed in `NS_ADMIN_KEY_IDS` (otherwise `403 admin scope required`).
+Templates and routing policies are managed over HTTP. Every route needs the
+`templates:admin` scope, held by an HMAC key whose `scopes` entry lists it or by a bearer
+token carrying that role (otherwise `403 Insufficient scope`).
 `NS_NETWORK` must be set (otherwise `503 network_not_configured`). A database failure answers
 `503 database_unavailable`; the query and its parameters are never logged or returned. Request bodies are strict:
 unknown keys return `400`.
@@ -234,26 +244,26 @@ never their values).
 Create, preview and publish an email template:
 
 ```bash
-KEY_ID="admin-key"        # must be listed in NS_ADMIN_KEY_IDS
+KEY_ID="admin-key"        # its internal-secrets.json entry lists "templates:admin"
 SECRET="ns_admin_secret"
 BASE=http://localhost:3000
 
-# Signs METHOD + PATH + timestamp + nonce, as in "Signed cURL Example".
+# Signs v2: METHOD, PATH, timestamp, nonce and the SHA-256 of the body, as in "Signed cURL Example".
 # The signed path is the full request URL as sent, including any query string
 # (matters for list endpoints, e.g. /v1/admin/templates?status=active).
-# Fastify rejects an empty body sent as application/json, so bodyless POSTs
-# (publish, retire) send -d '{}'.
+# The body is the last argument; bodyless POSTs (publish, retire) send '{}'.
 ns_curl() {
-  local METHOD="$1" REQ_PATH="$2"; shift 2
+  local METHOD="$1" REQ_PATH="$2" BODY="${3:-}"
   local TS=$(date +%s) NONCE=$(openssl rand -hex 16)
-  local SIG="v1=$(printf "%s\n%s\n%s\n%s" "$METHOD" "$REQ_PATH" "$TS" "$NONCE" | \
+  local DIGEST=$(printf "%s" "$BODY" | openssl dgst -sha256 | sed 's/^.* //')
+  local SIG="v2=$(printf "%s\n%s\n%s\n%s\n%s" "$METHOD" "$REQ_PATH" "$TS" "$NONCE" "$DIGEST" | \
     openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')"
   curl -sS -X "$METHOD" "$BASE$REQ_PATH" -H "Content-Type: application/json" \
     -H "X-NS-Key: $KEY_ID" -H "X-NS-Timestamp: $TS" -H "X-NS-Nonce: $NONCE" \
-    -H "X-NS-Signature: $SIG" "$@"
+    -H "X-NS-Signature: $SIG" ${BODY:+--data-binary "$BODY"}
 }
 
-ID=$(ns_curl POST /v1/admin/templates -d '{
+ID=$(ns_curl POST /v1/admin/templates '{
   "channel": "email",
   "template_key": "welcome",
   "subject": "Welcome, {{name}}",
@@ -265,9 +275,9 @@ ID=$(ns_curl POST /v1/admin/templates -d '{
 }' | jq -r .id)
 
 ns_curl POST "/v1/admin/templates/$ID/preview" \
-  -d '{"variables": {"name": "Asha <b>", "link": "https://app.example.com/start"}}'
+  '{"variables": {"name": "Asha <b>", "link": "https://app.example.com/start"}}'
 
-ns_curl POST "/v1/admin/templates/$ID/publish" -d '{}'
+ns_curl POST "/v1/admin/templates/$ID/publish" '{}'
 ```
 
 Email variables are HTML-escaped unless declared `raw: true`. Variable `type` is `string`,
@@ -275,8 +285,6 @@ Email variables are HTML-escaped unless declared `raw: true`. Variable `type` is
 (subdomains match). A variable used inside an `href` or `src` attribute must be `type: "url"`,
 and publish rejects malformed tokens such as `{{ name }}`.
 
-Keep `NS_ADMIN_KEY_IDS` empty in production until request bodies are covered by the signature
-(HMAC v2, #62).
 
 ## Queue Model
 
@@ -305,42 +313,99 @@ count, the job is written to `queue:dlq`.
 
 ## Authentication
 
-All API routes are protected by request signing. The request must include:
+A request carries **one** of two credential types. An `Authorization` header together
+with any of the four HMAC headers is `401 Ambiguous credentials`.
+
+### HMAC v2 signing
+
+Headers: `X-NS-Key` (key id), `X-NS-Timestamp` (unix seconds, within 30 s of the
+server), `X-NS-Nonce` (unique per request) and `X-NS-Signature: v2=<64 lowercase hex>`.
+
+The signature is HMAC-SHA256 with the key's secret over:
 
 ```text
-X-NS-Key
-X-NS-Timestamp
-X-NS-Nonce
-X-NS-Signature
+METHOD\npath\ntimestamp\nnonce\nsha256(body)
 ```
 
-The signature format is:
+- `path` is the request URL exactly as sent, including the query string.
+- `sha256(body)` is lowercase hex over the exact body bytes, or over the empty string when
+  there is no body.
+- JSON (`application/json`) is the only accepted body type; any other content type is `415`.
+  Every accepted body is covered by the signature.
+- A nonce is accepted once; a correctly signed repeat is `401 Replay detected`.
 
-```text
-v1=<hmac_sha256>
+Node example (a JSON body; `fetch` sends the same bytes that were signed):
+
+```js
+import crypto from 'node:crypto';
+
+const BASE = 'http://localhost:3000';
+const KEY_ID = 'jobstack';
+const SECRET = process.env.NS_SECRET;
+
+async function signedRequest(method, path, payload) {
+  const body = payload === undefined ? '' : JSON.stringify(payload);
+  const ts = String(Math.floor(Date.now() / 1000));
+  const nonce = crypto.randomBytes(16).toString('hex');
+  const digest = crypto.createHash('sha256').update(body).digest('hex');
+  const canonical = [method, path, ts, nonce, digest].join('\n');
+  const mac = crypto.createHmac('sha256', SECRET).update(canonical).digest('hex');
+  return fetch(BASE + path, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      'X-NS-Key': KEY_ID,
+      'X-NS-Timestamp': ts,
+      'X-NS-Nonce': nonce,
+      'X-NS-Signature': `v2=${mac}`,
+    },
+    body: body || undefined,
+  });
+}
 ```
 
-The signed base string is:
+The legacy `POST /notify` also accepts `v1=` signatures (`METHOD\npath\ntimestamp\nnonce`,
+no body digest) until the cutover release removes that route. Every other route needs `v2=`.
 
-```text
-METHOD
-PATH
-TIMESTAMP
-NONCE
-```
+### Keys and scopes
 
-`PATH` must match the request URL path exactly as sent to Fastify. Include the
-query string if the request has one.
-
-Example secret configuration:
+`INTERNAL_SECRETS_JSON` names a JSON file of signing keys:
 
 ```json
 {
-  "jobstack": {
-    "secret": "ns_jobstack_secret-key"
-  }
+  "jobstack": { "secret": "ns_jobstack_secret-key" },
+  "ops": { "secret": "ns_ops_secret-key", "scopes": ["notify:send", "templates:admin"] }
 }
 ```
+
+`scopes` is optional and defaults to `["notify:send"]`.
+
+| Scope | Routes |
+|---|---|
+| `notify:send` | `POST /v1/notify`, `POST /notify` |
+| `templates:admin` | `/v1/admin/templates*`, `/v1/admin/policies*`, `POST /failed/retry` |
+| any authenticated | `GET /providers`, `GET /providers/:name`, `GET /metrics/queue` |
+
+A missing scope is `403 {"error":"Insufficient scope","required":"<scope>"}`. `GET /metrics`
+needs no credentials.
+
+### Bearer tokens
+
+Set `NS_KEYCLOAK_ISSUER` (exactly the token `iss`, no trailing slash) and
+`NS_AUTH_ALLOWED_AZP` to accept Keycloak access tokens. The token must carry
+`aud` = `NS_AUTH_AUDIENCE` (default `notification-service`) and an `azp` on the allowlist.
+Grant the `notification-service` client roles `notify:send` and `templates:admin` to the
+caller; the role grant adds the audience, so no client definition changes. A bad token is
+`401`; a Keycloak key set that cannot be reached is `503`.
+
+### Upgrade notes
+
+- `POST /failed/retry` now needs `templates:admin`. A key with only `notify:send` gets `403`;
+  add `"templates:admin"` to the operator key's `scopes`.
+- The admin key-id environment list is removed. Grant admin access through `scopes` in the secrets file instead.
+- Audit `source` and admin `created_by`/`published_by` are now `hmac:<keyId>` or
+  `bearer:<id>`. Rows written earlier keep the bare key id.
+- Admin and v1 routes require `v2=` signatures with the body digest.
 
 ## Send API v1
 
@@ -389,10 +454,11 @@ keys return `400`.
 | `200` | Repeat of an `idempotency_key`: the original response |
 | `202` | Accepted; delivery is asynchronous |
 | `400` | Invalid request or `invalid_deadline` |
-| `401` | Missing or invalid request signature |
+| `401` | Missing, malformed or invalid credentials |
+| `403` | The credential lacks `notify:send` |
 | `409` | `idempotency_in_progress`, or `duplicate-fallback` (same content within 5 s and no key) |
 | `422` | `{ error, kind, message, details? }`; `kind` is `caller` or `configuration` |
-| `503` | `network_not_configured`; `template store unavailable` (a template or policy not yet cached could not be read); or `audit store unavailable` (normal/bulk) |
+| `503` | `network_not_configured`; `template store unavailable` (a template or policy not yet cached could not be read); `audit store unavailable` (normal/bulk); or the Keycloak key set could not be reached for a bearer token |
 
 `422` codes. `caller`: `missing_variable`, `unknown_variable`, `invalid_variable`,
 `no_reachable_channel`. `configuration`: `not_found`, `vendor_mismatch`, `incomplete_template`,
@@ -525,7 +591,7 @@ List all providers:
 GET /providers
 ```
 
-This route requires signed auth headers.
+This route requires authentication (any scope).
 
 Find one provider by name:
 
@@ -535,7 +601,7 @@ GET /providers/sms
 GET /providers/whatsapp
 ```
 
-These routes require signed auth headers.
+These routes require authentication (any scope).
 
 Provider responses include:
 
@@ -686,7 +752,7 @@ WhatsApp:
 GET /metrics/queue
 ```
 
-This route requires signed auth headers.
+This route requires authentication (any scope).
 
 Example response:
 
@@ -713,7 +779,8 @@ Failed jobs in `queue:dlq` can be requeued manually:
 POST /failed/retry
 ```
 
-This route requires signed auth headers.
+This route requires the `templates:admin` scope, because replaying the dead-letter queue
+re-sends other callers' messages. A sending-only credential gets `403`.
 
 Retry one failed job by `job_id`:
 
@@ -769,53 +836,35 @@ KEY_ID="jobstack"
 SECRET="ns_jobstack_secret-key"
 
 METHOD="POST"
-PATH="/notify"
+REQ_PATH="/v1/notify"
 TIMESTAMP=$(date +%s)
 NONCE=$(openssl rand -hex 16)
+BODY='{"template_key":"welcome","channel":"email","to":{"email":"test@example.com"},"variables":{"name":"Asha"}}'
 
-BASE_STRING="$METHOD
-$PATH
-$TIMESTAMP
-$NONCE"
-
-SIGNATURE="v1=$(printf "%s" "$BASE_STRING" | \
+DIGEST=$(printf "%s" "$BODY" | openssl dgst -sha256 | sed 's/^.* //')
+SIGNATURE="v2=$(printf "%s\n%s\n%s\n%s\n%s" "$METHOD" "$REQ_PATH" "$TIMESTAMP" "$NONCE" "$DIGEST" | \
   openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')"
 
-curl -X POST http://localhost:3000/notify \
+curl -X POST "http://localhost:3000$REQ_PATH" \
   -H "Content-Type: application/json" \
   -H "X-NS-Key: $KEY_ID" \
   -H "X-NS-Timestamp: $TIMESTAMP" \
   -H "X-NS-Nonce: $NONCE" \
   -H "X-NS-Signature: $SIGNATURE" \
-  -d '{
-    "channel": "email",
-    "to": "test@example.com",
-    "template_id": "basic_email",
-    "priority": "realtime",
-    "variables": {
-      "fromName": "Notification Service",
-      "fromEmail": "no-reply@example.com",
-      "subject": "Hello",
-      "html": "<h1>Hello World</h1>"
-    }
-  }'
+  --data-binary "$BODY"
 ```
 
-For signed GET requests, use the same signing process with the target method and
-path. Example for provider discovery:
+For a request without a body (a `GET`), sign the digest of the empty string and send
+no body. Example for provider discovery:
 
 ```bash
 METHOD="GET"
-PATH="/providers"
+REQ_PATH="/providers"
 TIMESTAMP=$(date +%s)
 NONCE=$(openssl rand -hex 16)
 
-BASE_STRING="$METHOD
-$PATH
-$TIMESTAMP
-$NONCE"
-
-SIGNATURE="v1=$(printf "%s" "$BASE_STRING" | \
+DIGEST=$(printf "" | openssl dgst -sha256 | sed 's/^.* //')
+SIGNATURE="v2=$(printf "%s\n%s\n%s\n%s\n%s" "$METHOD" "$REQ_PATH" "$TIMESTAMP" "$NONCE" "$DIGEST" | \
   openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')"
 
 curl http://localhost:3000/providers \

@@ -47,7 +47,7 @@ This is a **Fastify notification service** that queues and asynchronously proces
      is never a healthy-looking API queueing work that nothing drains.
 
 2. **Request Pipeline** (e.g., `POST /notify`)
-   - HMAC signature validation (`src/plugins/request-auth.ts`)
+   - Authentication: bearer token or HMAC signature, plus route scope (`src/plugins/auth.ts`)
    - Payload validation via Zod schemas
    - Record in Postgres and enqueue to Redis (order depends on priority; see Persistence)
 
@@ -185,22 +185,58 @@ move rows out of a default partition, and a row in the default for a future rang
 `ns_partition_default_rows{parent}` (1 = non-empty); move the rows with
 `partman.partition_data_proc`. There is no retention until #65, so nothing is dropped today.
 
-### Request Signing (Authentication)
+### Authentication
 
-All API routes require HMAC-SHA256 signed requests with headers:
-- `X-NS-Key` — Client identifier
-- `X-NS-Timestamp` — Unix timestamp
-- `X-NS-Nonce` — Random string (prevents replay)
-- `X-NS-Signature` — `v1=<hmac_sha256>` of signed base string
+One preHandler, `authenticate({ scope, legacyHmacV1? })` (`src/plugins/auth.ts`), guards every route except `GET /metrics` (unauthenticated, content-free). A request carries **one** of two credential types:
 
-**Signed base string:**
+- **HMAC v2** headers: `X-NS-Key`, `X-NS-Timestamp`, `X-NS-Nonce`, `X-NS-Signature: v2=<64 lowercase hex>`.
+- **Keycloak bearer token**: `Authorization: Bearer <jwt>`.
+
+An `Authorization` header together with any of the four HMAC headers is `401 Ambiguous credentials`; the caller picks one.
+
+**HMAC v2.** The signature is HMAC-SHA256 with the key's secret over
 ```
-METHOD\nPATH\nTIMESTAMP\nNONCE
+METHOD\npath\ntimestamp\nnonce\nsha256(body)
 ```
+`path` is `req.url` including the query string. The digest is lowercase hex SHA-256 of the exact body bytes, or of the empty string when there is no body. The signature format is strict: `v1=` or `v2=` followed by 64 lowercase hex characters. Allowed clock skew is 30 s; a non-numeric timestamp is `401 Request expired`. The **signature is verified first, then the nonce is claimed** (`nonce:<keyId>:<nonce>`, `SET NX EX 60`), so `Replay detected` always means a correctly signed request seen twice.
 
-Implementation: `src/lib/auth/secrets.ts` (loads the JSON file named by `INTERNAL_SECRETS_JSON`), `src/plugins/auth.ts` (`authenticate({ scope, legacyHmacV1? })`, the single preHandler for bearer tokens and HMAC), `src/plugins/raw-body.ts` (keeps the exact JSON bytes on `req.rawBody` for the v2 body digest).
+**Bodies.** JSON is the only accepted body type; any other content type is `415` before authentication runs, and every accepted body is covered by the v2 signature. `registerRawJsonBody` (`src/plugins/raw-body.ts`) removes all default content-type parsers and installs one `application/json` parser that keeps the raw bytes on `req.rawBody` and then parses with Fastify's own JSON parser. The built-in parser is replaced because it hands over only the parsed object, and re-serialising an object does not reproduce the bytes the caller signed.
+
+**HMAC v1** (`METHOD\npath\ntimestamp\nonce`, no body digest) is accepted on legacy `POST /notify` only (`legacyHmacV1: true`), until the cutover release deletes that route. Every other route answers `401 Signature version not accepted` for `v1=`.
+
+**Scopes.** Two scopes: `notify:send` and `templates:admin`. A route's scope is in its `authenticate` options; the table is pinned by `src/__tests__/route-scopes.test.ts`.
+
+| Route | Scope |
+| --- | --- |
+| `POST /v1/notify` | `notify:send` |
+| `POST /notify` (legacy; HMAC v1 or v2) | `notify:send` |
+| `/v1/admin/templates*`, `/v1/admin/policies*` | `templates:admin` |
+| `POST /failed/retry` | `templates:admin` |
+| `GET /providers`, `GET /providers/:name`, `GET /metrics/queue` | any authenticated principal |
+| `GET /metrics` | none |
+| `GET /`, `GET /openapi.json` | none; registered only when `NS_DOCS_ENABLED=true` |
+
+A missing scope is `403 {"error":"Insufficient scope","required":"<scope>"}`. `POST /failed/retry` needs `templates:admin` because replaying the dead-letter queue re-sends other callers' messages: a sending-only credential gets `403` there. Administration of DLT-registered templates likewise needs the admin scope, which a sending credential does not carry.
+
+**HMAC keys and scopes.** `INTERNAL_SECRETS_JSON` names a file of this shape (`src/lib/auth/secrets.ts`, validated at boot):
+```json
+{ "<keyId>": { "secret": "...", "scopes": ["notify:send", "templates:admin"] } }
+```
+`scopes` is optional and defaults to `["notify:send"]`, so a key may send but administers nothing unless it is granted `templates:admin`. Unknown scopes or an empty list fail the boot.
+
+**Bearer tokens** (`src/lib/auth/bearer.ts`). One Keycloak realm is shared by every service, so a token must carry `aud` = `NS_AUTH_AUDIENCE` **and** an `azp` on the `NS_AUTH_ALLOWED_AZP` allowlist. Signature, issuer and audience alone are not enough.
+- `typ` must be `Bearer`; `exp` and `sub` are required. Algorithms: RS256, PS256, ES256; 30 s clock tolerance.
+- Scopes are the `notification-service` client roles in `resource_access` (`notify:send`, `templates:admin`). The audience comes from the role grant (Keycloak's built-in `roles` client scope adds `aud: notification-service` to a token whose subject holds a `notification-service` client role), so granting a role is the whole act of authorising a caller and no client definition changes.
+- Principal id: the caller is a service account only when `client_id === azp` (id = `azp`); otherwise the id is `<azp>:<sub>`.
+- Env: `NS_KEYCLOAK_ISSUER` turns bearer auth on; it must equal the token `iss` exactly (`https://<host>/auth/realms/<realm>`), with **no trailing slash**, and be an http(s) URL, or boot fails. `NS_KEYCLOAK_JWKS_URI` is optional (default `<issuer>/protocol/openid-connect/certs`). `NS_AUTH_AUDIENCE` defaults to `notification-service`. `NS_AUTH_ALLOWED_AZP` (comma-separated client ids) must list at least one client when the issuer is set. With no issuer, a bearer token is `401 Bearer auth not enabled`.
+- Status codes: a bad, expired, wrong-audience or non-allowlisted token is `401`; a key set that cannot be fetched (unreachable, timeout, non-200 or invalid set) is `503 Auth service unavailable`.
+- **`jose` is ESM-only**, and this package builds as CommonJS under `module: Node16`. It is loaded with `await import('jose')`; a static `import` is compile error TS1479. Type-only imports use `with { 'resolution-mode': 'import' }`. Tests inject a local key set with `setKeyResolverForTests`.
+
+**`NS_DOCS_ENABLED`.** The API reference (`/`) and `/openapi.json` are registered only when `NS_DOCS_ENABLED=true`. The local-dev `example.env` sets it; deployed environments leave it unset.
 
 **Caller identity in audit rows.** The audit `source` on `/notify` and `/v1/notify`, and the admin `created_by`/`published_by`, are `principalLabel(req.principal)`: `hmac:<keyId>` or `bearer:<id>`. Rows written before this change hold the bare key id.
+
+Implementation: `src/lib/auth/` (`secrets.ts`, `hmac.ts`, `bearer.ts`, `principal.ts`), `src/plugins/auth.ts`, `src/plugins/raw-body.ts`.
 
 ### Provider System
 
@@ -360,13 +396,8 @@ listed, checked at publish only: a template retired later surfaces as an error a
 an email address; sms and whatsapp need a phone) because NS holds no user directory. `first_available`
 tries candidates in order; `all` fans out.
 
-**Admin scope.** `/v1/admin/templates` and `/v1/admin/policies` need a valid HMAC signature
-(`requestAuth`) **and** the key id in `NS_ADMIN_KEY_IDS`, else `403 {"error":"admin scope required"}`.
-Editing a DLT-registered template has a compliance blast radius a sending credential must not
-carry. Interim until Keycloak admin roles (#62). **Keep `NS_ADMIN_KEY_IDS` empty in production
-until HMAC v2 (#62) signs request bodies**: the current signature covers method, path, timestamp and
-nonce but not the body, so whoever can see a signed admin request in flight can send a different
-template or policy under its headers. Request bodies (including each variable spec) are strict, so unknown keys → `400`; list query params are not strict.
+**Admin scope.** `/v1/admin/templates` and `/v1/admin/policies` need the `templates:admin` scope, from an HMAC key's `scopes` entry or a bearer token's role (see Authentication). Editing a DLT-registered template has a compliance blast radius a sending credential must not carry; a credential without the scope gets `403 Insufficient scope`.
+Request bodies (including each variable spec) are strict, so unknown keys → `400`; list query params are not strict.
 Errors: `404 not_found`, `409 invalid_state`, `422` for any other rule violation, `503
 network_not_configured`, and `503 database_unavailable` for anything else (`sendAdminError`). That
 last path logs only `describeDbError(err)` and returns a fixed body: a `DrizzleQueryError` message
@@ -483,7 +514,7 @@ a 5-second content guard answers a repeat with `409 duplicate-fallback`.
 - `notify.ts` — Enqueue notification endpoint (legacy)
 - `v1-notify.ts` — Send API v1 (see Send API v1)
 - `providers.ts` — Provider discovery endpoints
-- `metrics.ts` — Queue metrics endpoint (HMAC-authed JSON) **and** `/metrics`,
+- `metrics.ts` — Queue metrics endpoint (authenticated JSON) **and** `/metrics`,
   the unauthenticated Prometheus scrape endpoint
 - `retry.ts` — Manual DLQ retry endpoint (`refused` in the response; see DLQ replay cap)
 - `admin-templates.ts`, `admin-policies.ts` — template and policy admin API (see Templates and policies)
@@ -496,7 +527,7 @@ a 5-second content guard answers a repeat with `409 duplicate-fallback`.
 - `rate_limit.ts` — Split shared/reserved vendor quota
 - `deadline.ts` — Deadline and redaction helpers
 - `db/`, `audit/` — Postgres client, migrations, partition maintenance, audit store, stamps, recovery (see Persistence)
-- `auth/secrets.ts` — Load signing secrets from the JSON file at `INTERNAL_SECRETS_JSON`
+- `auth/` — `secrets.ts` (signing keys and scopes from `INTERNAL_SECRETS_JSON`), `hmac.ts`, `bearer.ts`, `principal.ts`
 - `providers/` — Provider implementations (auto-loaded)
 - `utils/openapi.ts` — OpenAPI document builder
 - `utils/provider-docs.ts` — Provider schema/payload serialization
@@ -507,7 +538,7 @@ a 5-second content guard answers a repeat with `409 duplicate-fallback`.
 
 **Tests** (`src/**/__tests__/`):
 - `lib/__tests__/redis-fake.ts` — in-memory ioredis stand-in shared by the suites
-- `lib/__tests__/queue.test.ts`, `lib/__tests__/dedupe.test.ts`, `plugins/__tests__/request-auth.test.ts`
+- `lib/__tests__/queue.test.ts`, `lib/__tests__/dedupe.test.ts`, `plugins/__tests__/auth.test.ts`, `__tests__/route-scopes.test.ts`
 
 ## Environment Setup
 
@@ -540,8 +571,8 @@ Required for persistence and Redis:
   `503 network_not_configured` and seeding is skipped. Still recorded on each event, `unknown`
   when unset.
 - `NS_DEFAULT_LOCALE` — optional, default `en`; the last step of the template locale chain.
-- `NS_ADMIN_KEY_IDS` — comma-separated HMAC key ids allowed to use `/v1/admin/*`. Unset means
-  nobody can.
+- `NS_KEYCLOAK_ISSUER`, `NS_KEYCLOAK_JWKS_URI`, `NS_AUTH_AUDIENCE`, `NS_AUTH_ALLOWED_AZP` — bearer-token
+  auth; see Authentication. `NS_DOCS_ENABLED` — serves `/` and `/openapi.json` when `true`.
 - `NS_RESOLVE_CACHE_TTL_MS` — optional, default 60000, positive integer (invalid fails boot). See
   Resolver cache.
 - `PARTITION_MAINTENANCE_INTERVAL_MS` — optional, default 6h.
@@ -603,7 +634,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 545 unit tests across 44 files, plus 119 integration tests across 15 files. The unit suite runs in about a second because Redis
+vitest 4, 605 unit tests across 48 files, plus 119 integration tests across 15 files. The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
@@ -755,16 +786,14 @@ dead-letters on EC1003. **Alert on staleness, not just on the number.**
 
 ## Known Issues
 
-Two design problems found while writing the tests, both filed rather than fixed:
+Design problems found while writing the tests, filed rather than fixed unless marked resolved:
 
 - **#51 — `popScheduledRetries` is not atomic.** It does `zrangebyscore` then
   `zremrangebyscore` in two round trips, deleting by *score range* rather than by the members
   read, despite a comment claiming atomicity. A retry written between the two calls is deleted
   without being returned (silent job loss, no concurrency required), and two workers can both
   return the same jobs.
-- **#52 — the nonce is claimed before the signature is verified.** A client with a bad
-  signature gets `Invalid signature` first and `Replay detected` on every retry with the same
-  nonce, and anyone who knows a key id (it is not secret) can write nonce keys unauthenticated.
+- **#52 — resolved.** The HMAC signature is now verified before the nonce is claimed, so only a correctly signed request can claim one and `Replay detected` always means a valid request seen twice.
 
 ## CI
 
