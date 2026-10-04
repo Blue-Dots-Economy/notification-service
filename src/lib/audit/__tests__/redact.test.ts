@@ -54,3 +54,28 @@ describe('toAcceptedRecord — sticky redaction', () => {
     expect(rec.job).toMatchObject({ variables: { subject: 's' } });
   });
 });
+
+describe('toAcceptedRecord — email attachments', () => {
+  const data = Buffer.from('%PDF-1.7 secret contract body').toString('base64');
+  const job: Job = {
+    job_id: 'j', channel: 'email', priority: 'other', to: 'a@b.c', template_id: 'basic_email',
+    variables: { subject: 's', attachments: [{ filename: 'c.pdf', contentType: 'application/pdf', data }] },
+    audit: ids,
+  };
+
+  it('drops attachment bodies from the payload, keeping filename, contentType and size', () => {
+    const rec = toAcceptedRecord(job, 'x');
+    expect(JSON.stringify(rec.payload)).not.toContain(data);
+    expect((rec.payload.variables as { attachments: unknown[] }).attachments).toEqual([
+      { filename: 'c.pdf', contentType: 'application/pdf', size: Buffer.from(data, 'base64').length },
+    ]);
+    expect((rec.payload.variables as { subject: string }).subject).toBe('s');
+  });
+
+  it('keeps the attachments intact in the job copy, which recovery re-sends', () => {
+    const rec = toAcceptedRecord(job, 'x');
+    expect((rec.job as { variables: { attachments: Array<{ data: string }> } }).variables.attachments[0]!.data).toBe(data);
+    // The original job is not mutated.
+    expect((job.variables.attachments[0] as { data: string }).data).toBe(data);
+  });
+});

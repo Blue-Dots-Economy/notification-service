@@ -1,5 +1,27 @@
 import type { Job } from 'src/types';
 import type { AcceptedRecord } from './store';
+import { decodedBase64Length } from '../providers/email/attachments';
+
+/**
+ * Email attachments are file bodies, not audit data: the persisted payload
+ * keeps filename, contentType and size only. The JOB copy keeps them intact —
+ * recovery re-pushes that copy, and an email recovered without its
+ * attachments would be a different message.
+ */
+function withoutAttachmentBodies(channel: string, variables: unknown): unknown {
+  if (channel !== 'email' || !variables || typeof variables !== 'object') return variables;
+  const v = variables as Record<string, unknown>;
+  if (!Array.isArray(v.attachments)) return variables;
+  return {
+    ...v,
+    attachments: v.attachments.map((a) => {
+      if (!a || typeof a !== 'object') return a;
+      const { data, content, ...meta } = a as Record<string, unknown>;
+      const body = typeof data === 'string' ? data : typeof content === 'string' ? content : undefined;
+      return body === undefined ? meta : { ...meta, size: decodedBase64Length(body) };
+    }),
+  };
+}
 
 /**
  * What a job persists. The one place this is decided.
@@ -26,7 +48,11 @@ export function toAcceptedRecord(job: Job, source: string): AcceptedRecord {
     templateId: job.template_id,
     payload: realtime
       ? { to: job.to, variable_names: Object.keys(job.variables ?? {}) }
-      : { to: job.to, variables: job.variables, ...(job.body ? { body: job.body } : {}) },
+      : {
+          to: job.to,
+          variables: withoutAttachmentBodies(job.channel, job.variables),
+          ...(job.body ? { body: job.body } : {}),
+        },
     job: realtime ? undefined : (job as unknown as Record<string, unknown>),
     recoverable: !realtime,
   };
