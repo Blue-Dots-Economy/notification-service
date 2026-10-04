@@ -85,6 +85,12 @@ export async function recordAccepted(rec: AcceptedRecord): Promise<void> {
 /** One event, one attempt per delivery, atomically. Replay-safe. */
 export async function recordAcceptedMany(records: AcceptedRecord[]): Promise<void> {
   if (records.length === 0) return;
+  // One event row is written from records[0]; a record for another event or
+  // timestamp would hang its attempt off the wrong (or a missing) event.
+  const { eventId, createdAt } = records[0]!.ids;
+  if (records.some((r) => r.ids.eventId !== eventId || r.ids.createdAt !== createdAt)) {
+    throw new Error('recordAcceptedMany: records must share one eventId and createdAt');
+  }
   await getDb().transaction(async (tx) => {
     await tx.execute(insertEvent(records[0]!, 'accepted'));
     for (const rec of records) await tx.execute(insertAttempt(rec));

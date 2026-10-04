@@ -11,3 +11,13 @@ describe('capError', () => {
     expect(capError(undefined)).toBeNull();
   });
 });
+
+describe('recordAcceptedMany guard', () => {
+  const rec = (eventId: string, createdAt: string) =>
+    ({ ids: { eventId, attemptId: 'a', createdAt, correlationId: 'c' } }) as never;
+  it('refuses records that do not share one eventId and createdAt', async () => {
+    const { recordAcceptedMany } = await import('../store');
+    await expect(recordAcceptedMany([rec('e1', 't'), rec('e2', 't')])).rejects.toThrow(/share one eventId/);
+    await expect(recordAcceptedMany([rec('e1', 't1'), rec('e1', 't2')])).rejects.toThrow(/share one eventId/);
+  });
+});
