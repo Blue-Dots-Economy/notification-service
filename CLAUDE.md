@@ -422,7 +422,8 @@ background refresh per key replaces it; a refresh that fails on the database kee
 (logged through `describeDbError`), one that finds nothing active drops it. A **cold miss** does read
 Postgres; if that read fails the send is refused `503 {"error":"template store unavailable"}` and the
 claim released. Bounded to 1000 keys, oldest first. Admin publish/retire clears this pod's cache;
-other pods pick the change up within the TTL, so a newly published version can lag up to 60 s.
+other pods pick the change up through the background refresh, so each key there serves the old
+version for up to the TTL, plus one more request if the key sat idle longer than the TTL.
 
 **Modes and event status.** `single` (template_key), `first_available` and `all` (policy). A request's
 jobs are enqueued in one MULTI (`pushManyToPriority`): `all` is one job per delivery,

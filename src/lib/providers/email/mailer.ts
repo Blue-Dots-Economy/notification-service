@@ -56,7 +56,9 @@ export const emailProvider: ProviderDefinition = {
     }),
 
   async send({ to, template_id, variables }) {
-    const ok = await sendMail({ to, ...variables, template_id });
+    // `text` is a v1 (sendRendered) input only; the legacy body is derived from html.
+    const { text: _text, ...legacy } = variables;
+    const ok = await sendMail({ to, ...legacy, template_id });
     return ok;
   },
 
