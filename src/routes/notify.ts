@@ -134,6 +134,11 @@ export async function notifyRoutes(app: FastifyInstance) {
         // send it later. Best-effort (stamp never throws); the error still
         // propagates so the caller sees the failure.
         await stamp(job, { status: 'failed', attemptNo: 1, error: 'enqueue failed' });
+        // Release the claim as on the 503 path, so the caller's retry is not
+        // suppressed as a duplicate of a send that was never queued.
+        await releaseDedupe(key).catch((e) =>
+          req.log.error({ err: (e as Error)?.message ?? String(e), job_id }, 'dedupe release failed'),
+        );
         throw err;
       }
       reply.send({ job_id, enqueued: true });

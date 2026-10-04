@@ -254,6 +254,27 @@ describe('/notify audit', () => {
     expect(audits[2]!.audit.correlationId).toBe('corr-7');
   });
 
+  it('releases the dedupe claim when the enqueue fails, so the same dedupe_id is accepted again', async () => {
+    const claimed = new Set<string>();
+    dedupe.mockImplementation(async (k: string) => !claimed.has(k) && !!claimed.add(k));
+    releaseDedupe.mockImplementation(async (k: string) => void claimed.delete(k));
+    const payload = { ...body(), dedupe_id: 'enq-1' };
+
+    pushOther.mockRejectedValueOnce(new Error('redis down'));
+    expect((await signedNotify(payload)).statusCode).toBe(500);
+    expect(releaseDedupe).toHaveBeenCalledWith('enq-1');
+
+    const retry = await signedNotify(payload);
+    expect(retry.statusCode).toBe(200);
+    expect(retry.json()).toMatchObject({ enqueued: true });
+  });
+
+  it('still fails the request when the enqueue fails and releasing the claim fails too', async () => {
+    pushOther.mockRejectedValueOnce(new Error('redis down'));
+    releaseDedupe.mockRejectedValueOnce(new Error('redis down'));
+    expect((await signedNotify(body())).statusCode).toBe(500);
+  });
+
   it('still answers 503 when releasing the claim fails', async () => {
     recordAccepted.mockRejectedValueOnce(new Error('db down'));
     releaseDedupe.mockRejectedValueOnce(new Error('redis down'));

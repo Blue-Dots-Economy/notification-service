@@ -90,7 +90,8 @@ Postgres is the record of every send; Redis is only the dispatch queue. Code: `s
   `toAcceptedRecord` keys on it, not on the current priority: a DLQ replay of an OTP as `other`
   still persists names only and no job copy. Jobs without the flag fall back to the priority.
 - If the Redis push fails after the record was written, the attempt is stamped `failed`
-  (`enqueue failed`, best-effort) before the error propagates, so recovery never sends it later.
+  (`enqueue failed`, best-effort) and the dedupe claim is released (as on the 503 path) before the
+  error propagates, so recovery never sends it later and the caller's retry is accepted.
 - `x-correlation-id` is trimmed and capped at **128** chars; blank falls back to the job id.
 - The persisted payload never holds email attachment bodies (filename, contentType and size
   only). The **job copy keeps them**: recovery re-pushes that copy. Persisted `error` strings are
