@@ -1,13 +1,22 @@
 # Event Platform & Notification-Service Redesign
 
 > This is the umbrella design. It fixes the whole-platform vision, decisions, and phasing; each stage gets its own detailed spec.
-> A formatted version for the system architect lives alongside this file as `2026-06-26-event-platform-design.technical.md`, kept in sync as of the 2026-08-06 revision.
+> The architect copy alongside this file (`2026-06-26-event-platform-design.technical.md`) reflects the 2026-08-06 revision and is **superseded** by this one until it is regenerated.
 
 ## Revision history
 
 - **2026-06-26** — original.
 - **2026-08-06** — substantial revision. Reframed the ingress model (consumer-owned APIs are the default contract, the bus is for fan-out and decoupled reaction); added urgent-path isolation, the template/routing-policy split, the content resolver, the trace and status lifecycle, and a retention/PII policy; removed consent enforcement from notification-service's scope; re-ordered the stages so notification-service delivers value before any Kafka infrastructure exists; added the issue decomposition.
-- **2026-08-06 (later)** — added §Security, reconciling the design against the Phase-B security audit (#15). Two consequences for the design rather than for implementation: request integrity must cover the request **body** for as long as HMAC is accepted, and the `content_ref` keyspace must be allowlisted.
+- **2026-08-06 (later)** — added §Security, reconciling the design against the Phase-B security audit (#15). Request integrity must cover the request **body**, and the `content_ref` keyspace must be allowlisted.
+- **2026-10-04** — reconciled against two months of change across the repos. Keycloak (single shared realm) reached `feature` and is the only auth provider; Pinnacle was added as a second SMS vendor; Keycloak login OTP gained an `http` path into NS; the caller inventory grew well beyond the original draft. Decisions changed in this revision:
+  - **One SMS/email/WhatsApp vendor per channel per deployment.** Templates carry the vendor's identifiers directly; render mode is a property of the vendor, not of the template. Multi-vendor routing is not built.
+  - **All OTP is delivered through NS** — Keycloak login OTP (SMS *and* email) and Signals guardian OTP. Where OTP is *raised and verified* is deferred to the architect; NS stays a carrier either way.
+  - **No legacy `/notify`.** `/v1/notify` replaces it in one coordinated release with Signals; Signals' cutover moves from Stage 2.5 into Stage 1.
+  - **Network comes from deployment config**, not a token claim — one network per deployment.
+  - **HMAC is permanent** for callers that cannot use `client_credentials` (Keycloak itself), and is extended to sign the body.
+  - Postgres is a **database + role on the shared per-cluster RDS**; migrations run **on boot** under an advisory lock; partitions are managed by **`pg_partman`**.
+  - Urgent sends carry a **deadline** and are dropped, not retried, once it passes.
+  - aggregator's **BullMQ campaign email** joins Stage 2. **Valkey** leaves Stage 1.
 
 ## Overview
 
@@ -15,11 +24,11 @@ We're redesigning **notification-service** (NS) from an HTTP-only mailer into th
 
 The organising idea: **events are the spine of the network, but not the only wire.** Services emit domain events to a durable, ordered, replayable log; consumers react. Notification — email, SMS, WhatsApp, and outbound service-triggers like the voice bot — is the **first and most important consumer, not the centre.**
 
-The routing rule that follows from that, and which the original draft under-stated:
+The routing rule that follows from that:
 
 - **Call the consumer's API** when the caller needs to know it worked *now*. OTP, login, single transactional sends. NS's own API is the contract, not a fallback lane.
 - **Emit an event** when the caller shouldn't know or care who reacts, or when fan-out must be durable and rate-limited.
-- **OTP never rides the bus.** Stated as a hard non-goal, not left as an implicit consequence.
+- **OTP never rides the bus.** A hard non-goal.
 
 This generalises: every consumer-routed service exposes its own API. The bus is not an RPC substitute, and putting a synchronous need behind a shared consumer group makes the consumer a bottleneck.
 
@@ -31,67 +40,81 @@ The platform is three parts, only one of which we build from scratch:
 
 ## Goals
 
-- **One notification authority** — absorb aggregator's parallel mail stack; NS owns templates, routing, and delivery.
+- **One notification authority** — every SMS, email, and WhatsApp message in the network, including all OTP, is delivered by NS; aggregator's parallel mail stack is retired. NS owns templates, routing, and delivery.
 - Durable **audit** of what was sent, with an end-to-end **trace** from origination to closure.
 - **Resilient, rate-limited, reportable bulk fan-out** (T&C re-consent, campaigns).
 - Keep **OTP/login delivery low-latency and reliable** — it must not regress, and bulk must not be able to starve it.
-- **Decoupled cross-service reactions** (including async response-handover to the user).
-- **Multi-tenant** across networks/domains/instances, with tenancy from verified claims.
+- **Template governance** an admin can operate — content, DLT/Meta identifiers, and variable contracts edited through an API, not code.
+- **Decoupled cross-service reactions** (including async response-handover to the user), from Stage 3.
 - Every component **OSI-open and free** (DPG requirement).
 
 ## Non-goals
 
 - **Not** enforcing consent. NS is a tool consent flows *use*, never a consent authority. See §Consent boundary.
+- **Not** raising or verifying OTP. NS delivers a code it is handed. Which service owns OTP generation and verification is an open question (§Open questions); the answer does not change NS.
+- **Not** routing one channel across several vendors. One vendor per channel per deployment (§Templates).
 - **Not** building a workflow/orchestration engine. Choreography first; adopt Temporal only if a real saga appears.
 - **Not** a generic RPC/data bus. Bulk export, profile fetch, and metric rollups belong elsewhere.
 - **Not** a user directory. NS never resolves a person to their contact points; callers pass what they hold.
-- **Not** blocking on the Keycloak migration — auth ships behind a pluggable boundary.
 
 ## Where things stand today
 
-**notification-service** is Fastify 5 with **no database**. Every route is authenticated by a **hand-rolled HMAC** — `HMAC-SHA256` over `METHOD\npath\ntimestamp\nnonce`, keys loaded from a JSON file at `INTERNAL_SECRETS_JSON`, Redis nonce replay protection (`src/plugins/request-auth.ts`). This is unrelated to better-auth, which was Signals' *user* auth.
+*As of 2026-10-04, `feature` at `38baa78`.*
 
-`POST /notify` is the only ingestion path. Three channels sit behind an already-clean adapter contract (`ProviderDefinition { name, templates, schema, send() }` + folder auto-discovery). Async work runs on a **hand-rolled Redis queue** (two lists + a sorted-set retry queue with 5-attempt exponential backoff + a DLQ), drained by a forked worker. A per-provider **token-bucket rate limiter exists but is dormant**. **Nothing is persisted** — a Redis restart loses in-flight jobs, and there is no audit. A test suite now exists (33 tests, CI-wired, plus the atomic retry-claim and auth-ordering fixes; #50/#53/#54 on `feature`). Only caller is Signals (OTP/login/action).
+**notification-service** is Fastify 5 with **no database**. Every route except `GET /metrics` is authenticated by a **hand-rolled HMAC** — `HMAC-SHA256` over `METHOD\npath\ntimestamp\nnonce` (the body is not signed), keys loaded from the JSON file at `INTERNAL_SECRETS_JSON`, Redis nonce replay protection (`src/plugins/request-auth.ts`). The nonce is claimed before the signature is verified (#52).
 
-**Templates today are not owned here, and the three channels are not symmetric:**
+`POST /notify` is the only ingestion path. Three channels sit behind the `ProviderDefinition` contract with folder auto-discovery. Since the last revision:
 
-| Channel | Where the body lives | Can NS own it? |
+- **Two SMS vendors**, selected per deployment by `SMS_PROVIDER` (`msg91` default, `pinnacle`). They are not the same shape: MSG91 Flow takes a flow id + named variables and renders the DLT body itself; Pinnacle takes fully **rendered text** plus explicit DLT ids, so NS renders (`ProviderDefinition.bodies`, `src/lib/providers/sms/render.ts`). Design: `2026-09-14-pinnacle-sms-provider-design.md`, whose deferred items 2–4 are resolved by this revision.
+- **SMS raw pass-through** (`allowRawTemplateId`): callers send DLT flow ids directly, plus an optional free-text `body`. Most SMS ids therefore live in Signals, not NS.
+- **Deduplication** (#88): explicit `dedupe_id` → 1 h window, `200 {enqueued:false}`; otherwise a 5 s content-hash guard → `409 duplicate-fallback`. Callers branch on the 409.
+- **Email** gained configurable SMTP/SES transport, attachments, cc, and reply-to.
+- **`retryable`** on send results (permanent failures dead-letter immediately), `provider_message_id` on results, Prometheus `GET /metrics` with Redis-backed counters, and a Pinnacle balance gauge.
+
+Unchanged: async work runs on a **hand-rolled Redis queue** (`realtime`/`other` lists, a retry sorted set with 5-attempt backoff, a DLQ) drained by a forked worker; the per-provider **token bucket exists but has no callers**; **nothing is persisted**; WhatsApp's `other` escape hatch accepts an arbitrary `contentSid`. Test suite: ~160 tests, CI-wired.
+
+**Callers today:**
+
+| Caller | Sends | Notes |
 | --- | --- | --- |
-| Email | Caller sends full `subject` + `html`; `basic_email` is a sentinel, not a template | **Yes** |
-| SMS (MSG91) | MSG91 flow id `6896c26d…`, DLT-registered | **No** — regulated, provider-side |
-| WhatsApp (Twilio) | Twilio `contentSid` `HXa9cc97…`, Meta-approved | **No** — provider-side |
+| signals-dpg | email via `basic_email` (Signals renders the HTML from properties-file copy) for ~15 cases: welcome, item lifecycle, connect/apply/shortlist, retire/cancel, aggregator-init, support (with attachments/cc/reply-to); guardian OTP by email **and** SMS; WhatsApp welcome via `other` | single dispatcher (`apps/api/src/notifications/email/dispatch_email.ts`); HMAC |
+| keycloak-otp-authenticator | login OTP by SMS via its `http` provider → `/notify` `login_otp` | HMAC, key id `keycloak`. **Off on every live cluster** — they set `smsProvider: msg91` and call MSG91 directly. Login **email** OTP uses Keycloak's own SMTP. |
+| aggregator-dpg | — | **Does not call NS.** `packages/mailer` (SMTP/SES) with ~8 templates from ~7 call sites, plus **bulk campaign email from a BullMQ worker**. No SMS. |
+| bluedots-e2e | — | Reads NS's Redis queues directly to assert enqueues. |
 
-WhatsApp also has an `other` escape hatch that lets any caller pass an arbitrary `contentSid`. That hole is a large part of why template governance is worth building.
+So, today, **neither login OTP channel touches NS**, and neither does any aggregator email.
 
-**aggregator-dpg** has a single `MailerAdapter` (SES or SMTP) with four HTML templates (`admin-review`, `applicant-approved`, `applicant-rejected`, `support-request`), called **synchronously inline** from four route handlers (`aggregator-approvals` ×2, `registration-notify`, `support`). It has **no SMS stack and no Redis notification queue** — the original draft overstated this, and the migration is correspondingly smaller.
+**Auth context:** Keycloak with **one shared `bluedots` realm** is live on `feature` and in infra; better-auth is retired. Service-to-service tokens are verified with `jose` against the realm JWKS, checking `azp`/`aud` allowlists (`signals-dpg/apps/api/src/utils/keycloak_token.ts`); the caller-side token provider pattern is aggregator's `packages/signalstack-writer`. Realm config source of truth: `aggregator-dpg/infra/keycloak/realms/realm.json`. No NS client exists.
 
-Context: the **Keycloak migration** landed on the `epic/keycloak-iam` branch (signals-dpg #456, aggregator #570, both merged 2026-08-03) but has **not** reached `feature`; merge-back is gated on that epic's unresolved shared-realm-vs-per-DPG-realm question. aggregator #570 implements *shared-realm service auth*, which is the M2M pattern NS adopts.
+**Infra context:** each cluster has one shared AWS RDS (PG 17) with a database and role per service, created by the `postgresBootstrap` job in `bluedots-automation/helm/common-services`. NS is a subchart of the `signals` umbrella chart, so NS and Signals deploy in one Helm release. Redis is a shared, auth-enabled Redis 7.4 instance. Secrets are SOPS + age (ALIMCO-TCS still has one Ansible-Vault file).
 
 ## Problems we're solving
 
 1. **No durable record / audit / trace** — NS persists nothing; a Redis restart drops work; there is no way to answer "what happened to that message".
-2. **No resilient bulk fan-out** — broadcasts have no rate-limited, reportable path; the rate limiter isn't even wired.
-3. **Duplicated notification stacks** — NS and aggregator each send their own way, with no single authority.
-4. **No template governance** — bodies are hardcoded in adapters or hand-built by callers, and any caller can send an arbitrary WhatsApp template. A wrong DLT template is a compliance incident.
+2. **Login delivery bypasses the authority** — login OTP goes straight from Keycloak to MSG91 or Keycloak's SMTP, and guardian OTP is separate again. Changing vendor or auditing OTP delivery means touching Keycloak.
+3. **Duplicated notification stacks** — NS and aggregator each send their own way, including aggregator's bulk campaigns.
+4. **No template governance** — bodies are hand-built by callers or held in Signals properties files, SMS DLT ids live in caller config, and any caller can send an arbitrary WhatsApp template. A wrong DLT template is a compliance incident and, because drift is scrubbed at the operator, a silent one.
 5. **No routing policy** — nothing expresses "SMS for seekers, email for providers", or what to do when a recipient has no email.
-6. **Point-to-point coupling** — services trigger each other by direct RPC; no decoupled, replayable way to react to "X happened".
-7. **Login rides a fragile path** — OTP must be low-latency and must-not-fail, yet shares every resource with everything else.
-8. **Multi-tenant trust** — a shared service spans networks/domains/instances; tenancy must come from verified claims, never client input.
+6. **No resilient bulk fan-out** — broadcasts have no rate-limited, reportable path; the rate limiter isn't wired.
+7. **Point-to-point coupling** — services trigger each other by direct RPC; no decoupled, replayable way to react to "X happened".
+8. **Weak request integrity** — HMAC does not cover the body.
 9. **DPG license compliance** — every component must be OSI-open and free; common defaults (Redpanda BSL, Confluent Schema Registry, Redis ≥ 7.4) violate this.
 
 ## Key decisions
 
 ### Ingress and isolation
 
-**Two doors, with an explicit routing rule** (see §Overview). The transactional door (`POST /v1/notify`) is a near-synchronous send; the event door (produce via SDK + outbox/Debezium) is the resilient path for bulk and domain events.
+**Two doors, with an explicit routing rule** (see §Overview). The transactional door (`POST /v1/notify`) is a near-synchronous send; the event door (produce via SDK + outbox/Debezium, Stage 3) is the resilient path for bulk and domain events.
 
-**Isolating the urgent path is a resource question, not a door question.** Bypassing the bus alone does not protect OTP — on the direct path it still shares NS's process, its Postgres, and, decisively, the *provider account*. A 200k-recipient T&C broadcast will exhaust the MSG91 quota and queue OTPs at the provider regardless of how NS is wired. Therefore:
+**All OTP enters through the transactional door.** Keycloak login OTP (SMS and email) and Signals guardian OTP call `/v1/notify` with `priority: urgent`. For SMS on MSG91 this needs no new vendor capability — Keycloak's `http` provider sends `{ message: <code> }`, which NS maps to the same `var` the flow already uses. Email OTP needs a new `http` path in `keycloak-otp-authenticator`. Clusters switch only after priority isolation lands (Stage 1, item 10).
 
-- `priority: urgent | normal | bulk`, carried on the send API or derived from template metadata.
-- **Separate worker pools per priority.** Bulk workers can never occupy an urgent slot. This is what removes head-of-line blocking.
-- **Reserved provider quota.** The dormant token bucket is activated *and split*: urgent holds a guaranteed share that bulk physically cannot consume.
+**Isolating the urgent path is a resource question, not a door question.** Bypassing the bus does not protect OTP — on the direct path it still shares NS's process, its Postgres, and the *vendor account*. A 200k-recipient broadcast will exhaust the vendor quota and queue OTPs at the vendor regardless of wiring. Therefore:
+
+- `priority: urgent | normal | bulk` on the send API.
+- **Separate worker pools per priority.** Bulk workers can never occupy an urgent slot.
+- **Reserved vendor quota.** The token bucket is activated, keyed per channel × vendor, and *split*: urgent holds a configurable reserved share that bulk physically cannot consume.
 - **Audit writes on the urgent path are fire-and-forget.** A slow Postgres must never delay an OTP.
-- Later, the bulk consumer group stays separate from anything urgent by construction.
+- **Urgent sends carry a deadline.** `deadline` (defaulting per template, e.g. the OTP lifetime) bounds retries; once passed the attempt is terminal `expired` — not retried, not dead-lettered. A late OTP is worse than none, and a dead-lettered OTP job would keep a live code at rest.
 
 One NS deployment, not two — the pools give the isolation without a second deployment's config surface.
 
@@ -99,19 +122,19 @@ One NS deployment, not two — the pools give the isolation without a second dep
 
 Templates carry *content*. Routing policy decides *which* template on *which* channel for *whom*. Collapsing them produces an unusable composite key and cannot express "send to both".
 
-**`template`** — key `(network, channel, template_key, locale)`, with a `render_mode` discriminator that is honest about the provider asymmetry:
+**One vendor per channel per deployment.** Each deployment configures one active vendor per channel (as `SMS_PROVIDER` does today). Running two vendors on one channel at once has no product requirement, and getting a template set DLT- or Meta-approved with a second vendor is a large enough task that deployments will not do it. Nothing below prevents adding it later — the vendor fields would move into a per-vendor binding table — but it is not built.
 
-```
-render_mode = 'owned'         (email)     NS stores subject/body_html/body_text and renders
-render_mode = 'provider_ref'  (sms, wa)   NS stores provider_template_id (MSG91 flow /
-                                          Twilio contentSid) + provider_approval_ref
-                                          (DLT entity/template id, Meta status);
-                                          the provider renders
-```
+**`template`** — key `(network, channel, template_key, locale)`, versioned:
 
-Both modes declare a **variable contract** (`name`, `required`, `type`, `source`, `sensitive`), validated at send time *before* the provider is called. This is the main win for SMS/WhatsApp even though NS cannot own their bodies — today a malformed MSG91 call simply fails at the provider.
+- **Content, constant across vendors.** Email: `subject`, `body_html`, `body_text`. SMS: `body_text`, which must be **byte-identical to the DLT-registered text** — stored for every vendor, because Pinnacle sends it, and for MSG91 it drives preview and variable validation. WhatsApp: the approved body, for preview and validation.
+- **Vendor identifiers.** `provider` plus `provider_template_id` (MSG91 flow id / Pinnacle DLT template id / Twilio `contentSid`) and optional `sender_id`, `dlt_entity_id`, `dlt_header_id`, `dlt_tag_id`, `approval_ref`. Optional fields override deployment-level config (most deployments set sender and entity once).
+- **Variable contract** — `name`, `required`, `type`, `source`, `sensitive` — validated at send time *before* the vendor is called, in every mode.
 
-Lifecycle `draft → active → retired`; exactly one `active` per resolution key; **retire never deletes**, because audit rows reference old versions. Callers always send one stable `template_key` + variables and never see the render-mode difference.
+**The vendor is checked, never chosen.** A template's `provider` must match the deployment's configured vendor for that channel; a mismatch fails at publish and again, defensively, at send. Changing vendor is a deliberate re-registration of the template set — which a vendor change requires anyway, since DLT template ids are registered per telemarketer.
+
+**Render mode is a property of the vendor.** Each `ProviderDefinition` declares `renders: 'ns' | 'provider'`. Email and Pinnacle render in NS from the stored body; MSG91 Flow and Twilio render vendor-side and receive only variables. There is no `render_mode` column and no third mode.
+
+Lifecycle `draft → active → retired`; exactly one `active` per key; **retire never deletes**, because audit rows reference old versions. Callers send one stable `template_key` (or `event_type`) + variables and never see vendor identifiers.
 
 **`notification_policy`** — key `(network, domain, event_type)` → ordered channel list, per-channel `template_key`, and a mode:
 
@@ -120,264 +143,267 @@ Lifecycle `draft → active → retired`; exactly one `active` per resolution ke
 | `first_available` | Try channels in order; fall through on failure or missing contact point |
 | `all` | Fan out to every listed channel |
 
-`domain` and `event_type` are nullable, so network-wide defaults and per-domain/per-event overrides are the same mechanism at different specificity; **most-specific-wins**. This expresses "SMS for seekers, email for providers", "the same for everyone", and "send to both" without three features.
+`domain` and `event_type` are nullable, so network-wide defaults and per-domain/per-event overrides are the same mechanism at different specificity; **most-specific-wins**.
 
-**Policy lives in NS's database, edited through the admin API — not in `network.json`.** `network.json` is the network *contract* (what domains exist) and is consumed by aggregator and match-engine too; how to notify a domain is a delivery concern. Putting it in `network.json` would make every routing tweak a cross-repo PR plus a ConfigMap sync plus a redeploy per instance.
+**Policy lives in NS's database, edited through the admin API — not in `network.json`.** `network.json` is the network *contract*; how to notify a domain is a delivery concern. In `network.json`, every routing tweak would be a cross-repo PR plus a ConfigMap sync plus a redeploy per instance.
 
-**Recipient capability — NS holds no user directory.** The caller passes every contact point it has (`{ email?, phone? }`); NS filters the resolved channel list down to what is reachable. NS never calls Signals to resolve a person: that would put a network hop on the OTP path and turn NS into a PII store. "Registered by phone only" then needs no special case — the policy says `[sms, email]`, there is no email, `sms` is the only candidate.
+**Recipient capability — NS holds no user directory.** The caller passes every contact point it has (`{ email?, phone? }`); NS filters the resolved channel list to what is reachable. NS never calls Signals to resolve a person.
 
-**Fallback has two clocks**, and conflating them produces a design that cannot work:
+**Fallback has two clocks:**
 
-- *Synchronous* failure (provider rejects; no contact point for the channel) → fall through to the next channel immediately.
-- *Asynchronous* failure (a bounce or DLR arriving seconds to hours later) → cannot be a retry-in-place. Before the backbone exists this records a terminal `failed` status, queryable by trace. From Stage 3 it emits `notification.delivery_failed`, and a policy may opt into async fallback.
+- *Synchronous* failure (vendor rejects; no contact point for the channel) → fall through to the next channel immediately.
+- *Asynchronous* failure (a bounce or DLR arriving later) → cannot be a retry-in-place. Before the backbone exists it records a terminal `failed` status, queryable by trace. From Stage 3 it emits `notification.delivery_failed`, and a policy may opt into async fallback.
 
 ### Consent boundary
 
-**NS enforces nothing about consent.** Consent acceptance is enforced in Signals/aggregator code with records in their Postgres. Some consent flows need an OTP (an ordinary urgent send); some consent failures need an SMS or email (an ordinary send). In neither case does NS need to know what consent *is*. This removes the consent-service dependency — and with it the parked-Keycloak blocker — from this epic's critical path.
+**NS enforces nothing about consent.** Consent acceptance is enforced in Signals/aggregator code with records in their Postgres. Some consent flows need an OTP (an ordinary urgent send); some consent failures need an SMS or email (an ordinary send). In neither case does NS need to know what consent *is*.
 
-**The caller owns the audience.** For bulk especially, the producer is responsible for having applied consent/opt-out when building the recipient list. `bulk_job.audience_basis` records the caller's assertion (free text, e.g. `"tnc_v3_pending"`) so a DPDP audit can answer "why was this person contacted" without NS holding consent state.
+**The caller owns the audience.** For bulk especially, the producer is responsible for having applied consent/opt-out when building the recipient list. `bulk_job.audience_basis` records the caller's assertion so a DPDP audit can answer "why was this person contacted" without NS holding consent state.
 
-**But NS must be able to *render* consent content** — a T&C link or the statement itself in the message body. That is a content dependency, not a consent dependency, and it is served by the **content resolver**: a template variable may declare `source: content_ref` with a key like `tnc.in_force.url` or `tnc.on_offer.text`, resolved per locale by a pluggable provider — `configmap` today (mounted file), `db`/`http` later. Resolved values are cached by `(key, locale, version)`.
-
-`in_force` versus `on_offer` is deliberate: the consent design's advance-notice version windows make "the current T&C" ambiguous during a notice period. A re-consent broadcast needs the *offered* version; an acceptance receipt needs the *in-force* one. The content key must say which.
+**But NS must be able to *render* consent content** — a T&C link or statement in the message body. That is served by the **content resolver**: a template variable may declare `source: content_ref` with a key like `tnc.in_force.url` or `tnc.on_offer.text`, resolved per locale by a pluggable provider — `configmap` today, `db`/`http` later — cached by `(key, locale, version)`. `in_force` versus `on_offer` is deliberate: during a consent notice period "the current T&C" is ambiguous.
 
 ### Trace and status lifecycle
 
 Two identifiers, deliberately distinct:
 
-- **`correlation_id`** — the business trace. Caller-supplied or NS-generated, spanning the whole flow (consent broadcast → send → provider → receipt → closure). This is the query key.
-- **`trace_id`** — the W3C observability trace, accepted via the `traceparent` header, so notification records join OTel traces. This is what makes the telemetry design's `cdata.trace_id` bridge work.
-
-Status is tracked at two levels, stamped by whichever worker touches the record:
+- **`correlation_id`** — the business trace, caller-supplied or NS-generated, spanning the whole flow. The query key.
+- **`trace_id`** — the W3C observability trace from `traceparent`, so records join OTel traces and the telemetry design's `cdata.trace_id`.
 
 ```
 notification_event   accepted → resolved → dispatching → sent
-                     → delivered | partially_delivered | failed
+                     → delivered | partially_delivered | failed | expired
 
 delivery_attempt     queued → sent → accepted_by_provider
-                     → delivered | bounced | failed
+                     → delivered | bounced | failed | expired
 ```
 
-`partially_delivered` exists because `all` mode fans out to several channels and one may bounce while another lands. Async receipts update the attempt, which rolls up to the event — so one lifecycle covers urgent, queued, and bulk sends with no separate mechanism. Both identifiers carry into the Kafka envelope in Stage 3, so the trace survives the move onto the bus.
+`partially_delivered` exists because `all` mode fans out. `expired` is the urgent-deadline terminal state. Both identifiers carry into the Kafka envelope in Stage 3.
 
 ### Delivery receipts
 
-Receipts are provider **callbacks**, so they are already out-of-band from how the send was requested; bulk and urgent converge on identical handling. Every send creates a `delivery_attempt` carrying a `provider_message_id`; the provider calls back (SES → SNS bounce/complaint, MSG91 DLR, Twilio status webhook); NS matches on `provider_message_id`, writes a `delivery_receipt`, and updates the attempt. `bulk_job_item` links to its attempt, so bulk reports aggregate receipts as they arrive.
+Every send creates a `delivery_attempt` carrying the vendor's `provider_message_id` (already returned by the adapters today). Receipts update the attempt, which rolls up to the event; `bulk_job_item` links to its attempt, so bulk reports aggregate receipts as they arrive. Receipts arrive two ways, because vendors differ:
 
-Three consequences that must be designed for, not discovered:
+- **Callbacks** — SES → SNS bounce/complaint, MSG91 DLR, Twilio status. Public inbound endpoints; **vendor signature verification is a hard requirement** (MSG91's is weak and needs a shared-secret path parameter).
+- **Polling** — Pinnacle documents no DLR webhook, only `/index.php/response` by `uniqueid`. A polling lane queries outstanding attempts.
 
-- **A bulk job has two completions** — "submitted" (all sends accepted) and "delivered" (all receipts in), potentially hours apart. `bulk_job` carries both, and the report must not claim success at submit time.
-- **Receipt ingestion gets its own low-priority lane.** It is the highest-volume inbound traffic in the system and must never contend with sends.
-- **Receipt webhooks are public inbound endpoints** and require provider signature verification (SES SNS signature, Twilio signature; MSG91's is weaker and needs a shared-secret path parameter). This is a hard requirement, not a follow-up.
-
-Channels with no receipt capability — notably the `http_callout` voice-bot trigger, an outbound POST and *not* a hosted webhook — declare `receipts: none` and terminate at `accepted`.
+Both run in their own low-priority lane. **A bulk job has two completions** — submitted and delivered, potentially hours apart; reports must not claim success at submit time. Channels with no receipt capability (the `http_callout` voice trigger) declare `receipts: none` and terminate at `accepted`.
 
 ### Retention and PII
 
-Storing every attempt forever is not viable, and it is a **compliance** problem before it is a cost problem: recipient phone and email are PII subject to DPDP erasure. Three tiers:
+Recipient phone and email are PII subject to DPDP erasure. Three tiers:
 
-- **Tier 1 — operational detail** (recipient, variables, provider response). Postgres, monthly `RANGE` partitions on `created_at`, **dropped by partition at 90 days**. Partition-drop rather than `DELETE`, so there is no vacuum churn.
-- **Tier 2 — aggregate counters** (network × template × channel × day: sent/failed/bounced/delivered). Tiny, retained indefinitely. This is what dashboards and historical bulk reports read once Tier 1 has aged out.
-- **Tier 3 — long-term event log.** Kafka tiered storage, from Stage 3 only. **Before Stage 3, 90 days is the audit horizon** — better stated plainly than implied away.
+- **Tier 1 — operational detail** (recipient, variables, vendor response). Postgres, monthly `RANGE` partitions on `created_at` managed by **`pg_partman`**, **dropped by partition at 90 days**.
+- **Tier 2 — aggregate counters** (network × template × channel × day). No personal data; retained indefinitely.
+- **Tier 3 — long-term event log.** Kafka tiered storage, Stage 3 only. **Before Stage 3, 90 days is the audit horizon.**
 
-Two hard content rules:
+Content rules:
 
-- **OTP codes are never persisted** — not in `variables`, not in a rendered body.
-- Variables marked `sensitive: true` in the template's variable contract are **redacted at write time**, reusing the variable-contract machinery rather than adding a parallel one.
+- **OTP codes are never persisted** — not in Postgres, not in logs, not in a dead-letter entry. They exist in the Redis job only while the send is in flight, bounded by the urgent deadline.
+- Variables marked `sensitive: true` are **redacted at write time**, in rows, logs, and dead-letter payloads.
 
 ### Auth and tenancy
 
-NS targets **Keycloak `client_credentials` + JWKS** natively, following the shared-realm service-auth pattern from aggregator #570; `network` comes from a **verified claim, never from client input**; the template and policy admin API is gated by admin scopes.
+**Tenancy is deployment configuration.** Each NS deployment serves one network (`NS_NETWORK`); every row is stamped with it and no caller can supply it. Template and policy rows keep a `network` column so that serving several networks later is additive.
 
-Because `epic/keycloak-iam` has not reached `feature`, this ships behind the **pluggable auth boundary**: HMAC keeps working and Keycloak is switched on by configuration. NS is therefore not blocked if the realm question drags. Existing `/notify` callers keep HMAC through a dual-accept window that closes with the Signals cutover.
+**Two credential types behind one pluggable boundary:**
 
-**Who may administer templates and policy** is genuinely unresolved: the right answer is a **network-admin** role, which does not exist in Keycloak today. That is filed as a *sibling* spec (§Deferred), not absorbed here. Interim: an admin-scoped, network-bound credential.
+- **Keycloak bearer tokens** — verified with `jose` against the shared `bluedots` realm JWKS, reusing the Signals verification pattern. NS is registered as a **resource-server client** (`notification-service`; it never logs in). An audience mapper puts `aud: notification-service` on tokens issued to NS's callers; NS requires that audience and an allowlisted `azp`, so a token minted for another service cannot be replayed here — necessary precisely because every service shares one realm and one signing key. Client roles `notify:send` and `templates:admin` separate sending from administering.
+- **HMAC, permanently** — for callers that cannot obtain a `client_credentials` token. The defining case is Keycloak itself: its OTP plugin would otherwise have to fetch a token from its own token endpoint in the middle of a login. HMAC moves to a **`v2` canonical string that includes the body**: `METHOD\npath\ntimestamp\nnonce\nsha256(body)`. `v1` is not accepted. The signature is verified before the nonce is claimed.
+
+Signals moves to bearer tokens using its existing `signals-api` client; aggregator starts on bearer tokens in Stage 2; Keycloak's plugin uses HMAC `v2`.
+
+**Who may administer templates and policy:** anyone holding `templates:admin` — a person or a service account. The **network-admin** role (signals-dpg #499) remains a sibling spec; it is no longer blocked on realm topology (settled: one shared realm) but needs product definition, and when it exists it maps onto this role. There is **no admin UI** in this design (§Open questions).
 
 ### Backbone (unchanged from the original)
 
-**Apache Kafka (KRaft), self-hosted via Strimzi.** A log, not a queue, because audit/replay/reproduce need messages to survive consumption and be re-readable from any offset. Kafka over Redpanda and NATS because:
+**Apache Kafka (KRaft), self-hosted via Strimzi.** A log, not a queue, because audit/replay need messages to survive consumption. Kafka over Redpanda (BSL tiered storage fails the DPG rule) and NATS (no mature CDC). **Debezium** outbox for producers; AWS **MSK** as the escape hatch.
 
-- *License (decisive):* Kafka is Apache-2.0 with everything open including **tiered storage** (cheap long retention = the audit store). Redpanda gates tiered storage behind a paid BSL tier — fails the DPG rule.
-- *Producer outbox without dual-write:* producers are Postgres-backed, so **Debezium** CDC reads an outbox table and publishes to Kafka. NATS has no comparable mature CDC.
-- *Escape hatch:* AWS **MSK** is managed Apache Kafka — a connection-string change, still DPG-compliant.
+**One harmonized envelope, adopted from the telemetry design** — Sunbird-v3 `pdata`/`cdata`/`rollup` plus the event-platform fields (`id`, `type`, `version`, `source`, `network`, `subject`, `correlation_id`, `causation_id`, `idempotency_key`, `occurred_at`, `payload`), so producers are instrumented once.
 
-**One harmonized envelope, adopted from the telemetry design** — the Sunbird-v3-aligned envelope (`pdata`/`cdata`/`rollup` = network→domain→instance→org) carrying the event-platform fields (`id`, `type`, `version`, `source`, `network`, `subject`, `correlation_id`, `causation_id`, `idempotency_key`, `occurred_at`, `payload`). Producers are instrumented once; the telemetry platform later adds its `telemetry.*` streams and insight consumer on the same contract. Two envelopes across the same producers would mean instrumenting twice or maintaining a permanent translation layer.
+**Registry: Apicurio** (Apache-2.0), not Confluent Schema Registry.
 
-**Registry: Apicurio** (Apache-2.0), not Confluent Schema Registry (restricted licence).
+**A shared consumer/worker runtime (the SDK):** at-least-once + idempotency, retry/backoff → DLQ, rate-limiting, trace propagation. **The runtime retries *delivery*, never the *business operation*.**
 
-**A shared consumer/worker runtime (the SDK).** At-least-once + idempotency (dedup on `id`/`idempotency_key`), retry/backoff → DLQ, rate-limiting, trace propagation. **Hard boundary: the runtime retries *delivery*, never the *business operation*** — a consumer that triggers external work owns that work's idempotency and compensation. This is what keeps the notification consumer from silently becoming an orchestrator.
+**Choreography, not orchestration.** If a real saga appears, adopt **Temporal** as a separate consumer — never fold it into NS.
 
-**Choreography, not orchestration.** A service emits a domain event; interested services react; when async work finishes, the owning service emits a completion event that NS turns into the response-handover notification. No central coordinator. If a real multi-step saga appears, adopt **Temporal** as a separate consumer — never fold it into NS.
-
-**OSI-open bill of materials.** Kafka · Strimzi · Apicurio (not Confluent SR) · Debezium · Valkey (not Redis ≥ 7.4 — RSALv2/SSPL).
+**OSI-open bill of materials.** Kafka · Strimzi · Apicurio · Debezium · Valkey. The Valkey move replaces the *shared* Redis instance that every service uses, so it is its own infra item alongside Stage 3, not a Stage 1 dependency.
 
 ## Security
 
-> Requirements below derive from the Phase-B security audit of this service (notification-service #15). Candidate findings and their detail are held in a **private** advisory; this repo is public, so what follows is stated as design requirements rather than as findings. They are acceptance criteria for the stage items they sit under, not follow-up work.
+> Requirements below derive from the Phase-B security audit of this service (notification-service #15). Candidate findings are held in a **private** advisory; this repo is public, so what follows is stated as design requirements. They are acceptance criteria for the stage items they sit under, not follow-up work.
 
-The redesign both closes existing exposure and **creates new attack surface**. Both halves need stating, because a notification service is an unusually attractive target: it can reach every participant in the network, and it renders attacker-influenced content into messages those participants trust.
+A notification service can reach every participant in the network and renders attacker-influenced content into messages those participants trust.
 
 **What the redesign closes**
 
-- **Activating the rate limiter** (§Ingress and isolation) is a security control before it is a performance feature. It must be enforced on *every* send path — the transactional API, the worker pools, and the retry/replay endpoints — and keyed by network × channel × provider, so one tenant cannot consume another's headroom.
-- **Retiring the WhatsApp `other` passthrough** removes a caller's ability to put arbitrary provider-approved content in front of a recipient.
-- **Moving durable job state into Postgres** narrows how much of the system's behaviour can be influenced by anything holding the cache.
+- **Activating the rate limiter** is a security control before it is a performance feature. It is enforced on *every* send path — the transactional API, the worker pools, and the retry/replay endpoints.
+- **Retiring raw provider ids, free-text SMS bodies, `basic_email`, and the WhatsApp `other` passthrough** — all in the Stage 1 cutover — removes every way a caller can put arbitrary content under an approved template in front of a recipient.
+- **Signing the body** closes the gap where HMAC authenticated the request but not its contents.
+- **Moving durable job state into Postgres** narrows how much behaviour can be influenced by anything holding the cache.
 
 **What the redesign adds, and must ship already defended**
 
-- **Template rendering.** In `owned` mode NS renders HTML from variables, so interpolated values are **HTML-escaped by default**; raw is an explicit, reviewable per-variable decision. URL-typed variables are scheme-checked and, where the value should be ours, allowlisted — link injection into a delivered message is a phishing primitive.
-- **The content resolver.** `content_ref` keys resolve against an **allowlist**. An unconstrained, caller-influenceable key is an arbitrary-configuration-read primitive that ends with its result rendered into a delivered message. Resolution failure fails the send: a consent notice with a blank T&C link is worse than one not sent.
-- **The admin API.** Template edit carries a compliance blast radius — a wrong DLT-registered template is an incident. Admin scopes are therefore separate from send scopes: a credential that may send must not thereby be able to edit templates. This is the concrete reason the network-admin role is being specced separately.
-- **Receipt webhooks.** Public inbound endpoints where **the signature is the authorization**, since the provider is the caller. Unverified, they let anyone rewrite delivery history — an audit-integrity problem as much as a spoofing one. Unmatched `provider_message_id` values are dropped and counted, never created on the fly.
-- **The bulk door.** An authenticated mass-send endpoint is the highest-value target in the system. Scope binds it to one network, and `audience_basis` records why the audience was contacted.
+- **Template rendering.** Interpolated values are **HTML-escaped by default** in email; raw is an explicit, reviewable per-variable decision. URL-typed variables are scheme-checked and, where the value should be ours, allowlisted.
+- **SMS body integrity.** A stored SMS body that drifts from its DLT registration is scrubbed silently by the operator. Publish shows the exact rendered text; edits to an active SMS body require a new version, never an in-place change.
+- **The content resolver.** `content_ref` keys resolve against an **allowlist**. Resolution failure fails the send.
+- **The admin API.** `templates:admin` is separate from `notify:send`: a credential that may send cannot edit templates.
+- **Receipt endpoints.** Public, and **the signature is the authorization**. Unmatched `provider_message_id` values are dropped and counted, never created.
+- **The bulk door.** The highest-value target in the system; `audience_basis` records why the audience was contacted.
 
 **Cross-cutting requirements**
 
-- **Request integrity must cover the request body.** For as long as HMAC is accepted, the signed canonical string includes a digest of the body. Signing only method, path, timestamp, and nonce authenticates the *request* while leaving the *contents of the send* unauthenticated. Bearer auth does not inherit this property either — a token proves who is calling, not what they asked for — so scope must bound which networks a credential may send for.
-- **Tenancy is enforced at resolution, not just at the edge.** `network` comes from the verified claim, and the template and policy a send resolves to must belong to that network. Cross-tenant resolution is a tenancy break, not a lookup bug.
-- **Recipients are validated per channel** — RFC-shaped addresses for email, E.164 for phone. Loose recipient typing is what lets one channel's payload be smuggled into another's. **Sender identity is server-side configuration** bound to the credential's network, never caller-supplied.
-- **Redaction reaches everywhere a value comes to rest** — logs and queue payloads, not only database rows (§Retention and PII). OTP codes and activation URLs never appear in logs at any level, including debug and any mail-tracing mode; a verbose flag must not be able to turn a log stream into a credential feed. Erasure covers every tier, which is why Tier 2 is designed to hold no personal data.
-- **The cache is authenticated** — no empty-password default, internal network only — and a provider exception is contained at the worker-pool boundary, so a crash loop in one pool cannot deny the others.
+- **Recipients are validated per channel** — RFC-shaped addresses for email, E.164 for phone. **Sender identity is server-side configuration**, never caller-supplied.
+- **Redaction reaches everywhere a value comes to rest** — logs, queue payloads, dead-letter entries, and rows. OTP codes and activation URLs never appear in logs at any level.
+- **The cache is authenticated** (already true in infra) and a vendor exception is contained at the worker-pool boundary.
+- **`GET /metrics` stays unauthenticated and content-free** — counts and depths only, never recipients, variables, or content.
 
 ## Architecture
 
 ```
- callers (Signals, aggregator, voice, …)
+ callers: Signals · Keycloak (OTP) · aggregator · voice · …
     │
-    │  ── needs to know it worked NOW? ──────────► direct API  (OTP, single sends)
-    │  ── doesn't care who reacts / bulk? ───────► event stream
+    │  ── needs to know it worked NOW? ──────────► POST /v1/notify   (OTP, single sends)
+    │  ── doesn't care who reacts / bulk? ───────► event stream      (Stage 3)
     ▼
  ┌───────────────────────────┐        ┌──────────────────────────────┐
  │  NOTIFICATION SERVICE API │        │  produce via SDK             │
  │  POST /v1/notify          │        │  (outbox + Debezium)         │
- │  POST /v1/bulk            │        └───────────────┬──────────────┘
+ │  POST /v1/bulk  (S3)      │        └───────────────┬──────────────┘
  │  admin: templates/policy  │                        ▼
- └────────────┬──────────────┘   ┌──────────────────────────────────────┐
-              │                  │ APACHE KAFKA (KRaft) — durable,      │
-              │                  │ ordered, replayable log; tiered      │
-              │                  │ storage = audit; Apicurio registry   │
+ │  auth: KC bearer | HMAC v2│   ┌──────────────────────────────────────┐
+ └────────────┬──────────────┘   │ APACHE KAFKA (KRaft) — Stage 3       │
               │                  └───────────────┬──────────────────────┘
               │                                  ▼
               │                  ┌──────────────────────────────────────┐
-              │                  │ CONSUMER RUNTIME (SDK): idempotency ·│
-              │                  │ retry/DLQ · rate-limit · trace       │
+              │                  │ CONSUMER RUNTIME (SDK)               │
               │                  └───────────────┬──────────────────────┘
               ▼                                  ▼
  ┌───────────────────────────────────────────────────────────────────┐
  │  NOTIFICATION SERVICE core                                        │
  │                                                                   │
- │  policy resolve ─► capability filter ─► template render           │
- │        │                                                          │
- │        ▼   ┌──── URGENT pool ──── reserved provider quota ────┐   │
+ │  policy resolve ─► capability filter ─► template (+ vendor ids)   │
+ │        │                                 render in NS or vendor   │
+ │        ▼   ┌──── URGENT pool ──── reserved quota · deadline ──┐   │
  │   dispatch ├──── NORMAL pool ────────────────────────────────  │   │
  │            └──── BULK   pool ────────────────────────────────  │   │
  │                                                                   │
- │  channels: email · sms · whatsapp · http_callout                  │
- │  audit projection (partitioned, 90d) · aggregate counters         │
+ │  channels (one vendor each): email · sms · whatsapp · http_callout│
+ │  Postgres: audit projection (pg_partman, 90d) · counters          │
+ │  Redis: dispatch queues · nonces · dedupe guard                   │
  └───────────────────────────┬───────────────────────────────────────┘
                              ▲
-        provider callbacks ──┘  (SES/SNS · MSG91 DLR · Twilio status)
-        signature-verified, own low-priority lane → delivery_receipt
+     receipts ───────────────┘  callbacks (SES/SNS · MSG91 DLR · Twilio),
+                                signature-verified · polling (Pinnacle)
 
  trace: correlation_id (business) + trace_id (W3C) on every record
 ```
 
+**Durability model.** Postgres is the record; Redis stays the dispatch queue. On the normal and bulk paths an attempt is written to Postgres *before* it is queued, and a startup sweep re-queues attempts left in `queued` or `dispatching`, so a Redis restart no longer loses work. On the urgent path the job is queued first and audited fire-and-forget; a Redis loss can drop an in-flight OTP, which the user recovers from by requesting a new code.
+
+**Schema migrations** are Drizzle-generated and run **on boot**: the API process applies pending migrations under a Postgres advisory lock (one replica migrates, others wait) *before* it forks the worker.
+
 ## Data model (Postgres/Drizzle — planned)
 
-Tier-1 tables are monthly `RANGE`-partitioned on `created_at`.
+Tier-1 tables are monthly `RANGE`-partitioned on `created_at` via `pg_partman`.
 
-- **`template`** — `id`, `network`, `channel`, `template_key`, `version`, `locale`, `render_mode`, `status`, `subject`, `body_html`, `body_text`, `provider`, `provider_template_id`, `provider_approval_ref`, `variables` (jsonb: `name`/`required`/`type`/`source`/`sensitive`), `created_at`.
+- **`template`** — `id`, `network`, `channel`, `template_key`, `version`, `locale`, `status`, `subject`, `body_html`, `body_text`, `variables` (jsonb: `name`/`required`/`type`/`source`/`sensitive`), `provider`, `provider_template_id`, `sender_id`, `dlt_entity_id`, `dlt_header_id`, `dlt_tag_id`, `approval_ref`, `default_deadline_s`, `created_at`.
 - **`notification_policy`** — `id`, `network`, `domain` (nullable), `event_type` (nullable), `mode` (`first_available`|`all`), `channels` (jsonb: ordered `[{channel, template_key}]`), `status`, `created_at`.
-- **`notification_event`** — `id`, `correlation_id`, `trace_id`, `event_id` (envelope id, unique dedup key), `idempotency_key`, `event_type`, `network`, `domain`, `source`, `priority`, `status`, `payload` (jsonb, redacted), `received_at`.
+- **`notification_event`** — `id`, `correlation_id`, `trace_id`, `idempotency_key`, `event_type`, `template_key`, `network`, `domain`, `source` (`azp` or HMAC key id), `priority`, `deadline`, `status`, `payload` (jsonb, redacted), `received_at`. Unique `(network, idempotency_key)`.
 - **`delivery_attempt`** — `id`, `notification_event_id`, `channel`, `provider`, `template_id`, `attempt_no`, `status`, `provider_message_id`, `error`, `requested_at`, `completed_at`.
-- **`delivery_receipt`** — `id`, `delivery_attempt_id`, `status` (delivered/bounced/failed), `provider_status`, `received_at`.
-- **`bulk_job`** — `id`, `network`, `requested_by`, `audience_basis`, `template_key`, `channel`, `total`/`succeeded`/`failed`, `status`, `submitted_at`, `delivered_at`, `created_at`.
-- **`bulk_job_item`** — `id`, `bulk_job_id`, `recipient`, `status`, `delivery_attempt_id`.
-- **`notification_counter`** (Tier 2, unpartitioned, permanent) — `network`, `template_key`, `channel`, `day`, `sent`, `delivered`, `bounced`, `failed`.
+- **`delivery_receipt`** *(Stage 2.5)* — `id`, `delivery_attempt_id`, `status`, `provider_status`, `received_at`.
+- **`bulk_job`**, **`bulk_job_item`** *(Stage 3)* — as before: `audience_basis`, two completions, item → attempt link.
+- **`notification_counter`** *(Stage 2.5; Tier 2, unpartitioned)* — `network`, `template_key`, `channel`, `day`, `sent`, `delivered`, `bounced`, `failed`, `expired`.
 
 ## API sketch (planned)
 
 **Send**
 
-- `POST /v1/notify` — transactional door. `{ event_type | template_key, domain?, to: { email?, phone? }, locale, variables, priority, idempotency_key, correlation_id? }` → `202 { notification_event_id, correlation_id, accepted }`. Re-send with the same `idempotency_key` returns the original result.
+- `POST /v1/notify` — the only send endpoint. `{ event_type | template_key, domain?, to: { email?, phone? }, locale?, variables, priority: urgent|normal|bulk, idempotency_key?, correlation_id?, deadline? }`, plus email-only `cc?`, `reply_to?`, `attachments?` → `202 { notification_event_id, correlation_id, status: "accepted" }`.
+  - Exactly one of `event_type` (resolved through policy) or `template_key` (names the content directly). `domain` is caller-supplied because only the caller knows which role the recipient is addressed in; omitted → network-wide default policy.
+  - Not accepted: free-text bodies, raw vendor template ids, sender identity, `network`.
+  - **Idempotency:** `idempotency_key` is persisted, unique per network, for the Tier-1 window; a repeat returns `200` with the **original** `notification_event_id`. Without a key, the existing 5 s content-hash guard still answers `409 duplicate-fallback`.
+- `POST /v1/bulk`, `GET /v1/bulk/:id` — *(Stage 3)*.
 
-  **Where the resolution inputs come from** — `network` is taken from the verified claim and is never read from the body, because it is the tenancy boundary. `domain` *is* supplied by the caller, because only the caller knows which role the recipient is being addressed in — the same person can be a seeker in one flow and a provider in another, so it is a property of the send, not of the identity. It is optional; omitting it resolves against the network-wide default policy. `template_key` bypasses policy resolution entirely and names the content directly (the migration path and the escape hatch for one-off sends); `event_type` goes through policy. Exactly one of the two is required.
-- `POST /v1/bulk` — enqueue a campaign (event door). `{ template_key | event_type, channel, locale, audience_basis, recipients[], variables }` → `202 { bulk_job_id }`. *(Stage 3)*
-- `GET /v1/bulk/:id` — bulk snapshot, with `submitted_at` and `delivered_at` distinct. *(Stage 3)*
+**Audit** *(Stage 2.5)* — `GET /v1/notifications/:id`, `GET /v1/notifications?correlation_id=…`.
 
-**Audit**
-
-- `GET /v1/notifications/:id` and `GET /v1/notifications?correlation_id=…` — the full tree: event → attempts → receipts.
-
-**Admin** (admin scope; network-admin role when it exists)
+**Admin** (`templates:admin`)
 
 - `GET|POST|PATCH /v1/admin/templates`, `POST /v1/admin/templates/:id/publish|retire`, `POST /v1/admin/templates/:id/preview`.
 - `GET|POST|PATCH /v1/admin/policies`, `POST /v1/admin/policies/:id/publish|retire`.
 
-**Operational**
+**Operational** — `POST /v1/webhooks/:provider` *(Stage 2.5)*; `POST /v1/failed/retry`; `GET /v1/metrics/queue`; `GET /metrics` (Prometheus, unauthenticated); `GET /providers`.
 
-- `POST /v1/webhooks/:provider` — signature-verified receipt ingestion.
-- `POST /v1/failed/retry` — DLQ replay. `GET /v1/metrics/queue` — depths + consumer lag. `GET /providers` — channel metadata (existing).
+Legacy `POST /notify` is **removed** in the Stage 1 cutover, not kept alongside.
 
 ## Repos
 
-- **One new repo** (platform) — event envelope/contracts + consumer/worker SDK + open-BOM conventions. Separate from any single consumer because *every* service depends on it. Working name **Event Fabric** / `bluedots-eventbus` (fixed when created).
-- **Reused** — `notification-service`, extended into the notification authority and later the first consumer; depends on the SDK; keeps its direct API as the fast door.
-- **Operated infra** — the Kafka/Strimzi/Apicurio/Debezium stack is deployment config in `bluedots-automation`, not a repo.
+- **One new repo** (platform, Stage 3) — event envelope/contracts + consumer/worker SDK. Working name `bluedots-eventbus`.
+- **Reused** — `notification-service`.
+- **Changed for the Stage 1 cutover** — `signals-dpg` (all sends to `/v1/notify`), `keycloak-otp-authenticator` (email `http` path, HMAC `v2`, `/v1/notify`), `bluedots-e2e` (stop reading NS's Redis queues), `aggregator-dpg` realm config (NS client), `bluedots-automation` / `bluedots-infra-deployments` (database, secrets, `smsProvider` flip).
+- **Operated infra** — Kafka/Strimzi/Apicurio/Debezium as deployment config in `bluedots-automation`.
 
 ## Stages and issue decomposition
 
-Ordering is deliberately **not** backbone-first. Stages 1–2 deliver a working notification authority with no Kafka at all, which means the audit projection and template model get validated by a real consumer (aggregator) before any infrastructure is committed to. `[repo]` marks work outside notification-service.
+Ordering is deliberately **not** backbone-first. Stages 1–2 deliver a working notification authority with no Kafka. `[repo]` marks work outside notification-service.
 
 ### Stage 1 — NS becomes the notification authority
 
-1. **Persistence foundation** — Postgres + Drizzle + config/migrations; `notification_event` + `delivery_attempt` with the two-level status lifecycle and both trace identifiers; **monthly RANGE partitions from day one** (retrofitting is a rewrite); durable job state replacing the restart-lossy Redis queue.
-2. `[automation]` **Provision the NS Postgres** — settles "new database vs shared RDS database/user" on the consent-service precedent.
-3. **Template registry + admin API** — two render modes, lifecycle, locale fallback, variable contract including `sensitive`, seeded from the three hardcoded adapter maps.
-4. **Routing policy + admin API** — `(network, domain, event_type)` → ordered channels + per-channel `template_key`, `first_available` | `all`, most-specific-wins.
-5. **Content resolver** — `source: content_ref` variables, pluggable provider (`configmap` now, `db`/`http` later), locale- and version-aware caching, `in_force` / `on_offer` keys.
-6. **Send API v1** — `event_type` or explicit `template_key`; recipient contact points; policy resolution + capability filtering + synchronous fallback; `idempotency_key`; `priority`; `basic_email` dual-accept.
-7. **Priority isolation** — urgent/normal/bulk worker pools; token bucket activated and split with reserved urgent quota; fire-and-forget audit on the urgent path; OTP codes never persisted.
-8. **Keycloak-native service auth + admin scopes** — `client_credentials` + JWKS following aggregator #570's shared-realm pattern, `network` from a verified claim, behind the pluggable boundary with HMAC dual-accept. **Extends the HMAC canonical string to cover a body digest** (§Security) — this must land *with* the dual-accept window, not after it, or the window ships a known weakness.
+Build order; auth (item 8) runs in parallel from the start.
+
+1. `[automation]` **Provision the NS database** (automation#114) — a `notification` database + role on the shared RDS via `postgresBootstrap`; `pg_partman` installed by the bootstrap; password through `random_passwords` → SOPS `global-secrets.yaml`. ALIMCO-TCS needs its Vault file moved to SOPS first.
+2. **Persistence foundation** (#56) — Postgres + Drizzle, migrate-on-boot under an advisory lock; `notification_event` + `delivery_attempt` with the status lifecycle and both trace ids; `pg_partman` partition creation from day one (pre-make maintenance driven by NS); record-before-queue with the startup re-queue sweep.
+3. **Template registry + admin API** (#57) — the one-vendor-per-channel model, vendor-declared render mode, lifecycle, locale fallback, variable contract including `sensitive`, publish-time vendor check, preview.
+4. **Routing policy + admin API** (#58).
+5. **Content resolver** (#59) — off the cutover's critical path; no template needs it at cutover.
+6. **Send API v1** (#60) — `/v1/notify`, policy resolution, capability filtering, synchronous fallback, persisted idempotency, email extras. Legacy `/notify` removed.
+7. **Priority isolation** (#61) — urgent/normal/bulk pools, split token bucket with reserved urgent quota, urgent `deadline` → `expired`, fire-and-forget urgent audit.
+8. **Service auth + admin scopes** (#62) — Keycloak bearer (`aud` + `azp`), NS resource-server client and roles in `realm.json`, HMAC `v2` with body digest, signature-before-nonce.
+9. **Cutover release** — one coordinated release, NS + Signals in the same Helm release:
+   - `[Signals]` **Every send moves to `/v1/notify`** (signals#496, pulled forward from Stage 2.5) — ~15 email cases, guardian OTP (email + SMS), WhatsApp welcome; their copy and DLT/Meta identifiers seeded as NS templates and policies; Signals stops rendering HTML; bearer auth.
+   - `[e2e]` Assertions move off NS's Redis internals.
+   - `[keycloak-otp-authenticator]` **Email OTP over `http`**, HMAC `v2`, `/v1/notify` with `template_key: login_otp` — must ship before any cluster flips (item 10).
+10. `[infra-deployments]` **Route all OTP through NS** — per cluster: confirm NS's login-OTP template matches Keycloak's current MSG91 flow id, add the HMAC secret where missing (Test-dev), switch Keycloak SMS and email to `http`. Gated on item 7.
 
 ### Stage 2 — aggregator-dpg migrates onto NS
 
-9. `[aggregator]` **Port the four email templates and swap the call sites** — `aggregator-approvals` ×2, `registration-notify`, `support`; `MailerAdapter` → NS client.
-10. `[aggregator]` **Retire the mailer** — delete the adapter and its SES/SMTP configuration and secrets.
+11. `[aggregator]` **Port templates and call sites** (aggr#596) — ~8 templates from ~7 call sites, **and the BullMQ campaign email**, which calls `/v1/notify` with `priority: bulk` (rate-limited by the bulk pool) until Stage 3's bulk door exists. Bearer auth.
+12. `[aggregator]` **Retire the mailer** (aggr#597) — delete `packages/mailer` and its SES/SMTP configuration and secrets.
 
-### Stage 2.5 — NS tranche 2 (overlaps Stage 2)
+### Stage 2.5 — NS tranche 2
 
-11. **Delivery receipts** — SES/SNS, MSG91 DLR, Twilio webhooks; **provider signature verification** (relates to pentest issue #15); own low-priority ingestion lane.
-12. **Audit query API** — by id and by `correlation_id`, returning event → attempts → receipts.
-13. **Retention and rollups** — Tier-2 aggregate counters, partition-drop automation at 90 days, redaction enforcement.
-14. `[Signals]` **Cut over to `template_key`/`event_type`** — stop rendering HTML in code; then retire `basic_email` and the WhatsApp `other` escape hatch in NS.
+13. **Delivery receipts** (#63) — callbacks with vendor signature verification, plus a **Pinnacle polling lane**; own low-priority lane.
+14. **Audit query API** (#64).
+15. **Retention and rollups** (#65) — Tier-2 counters, `pg_partman` partition drop at 90 days, redaction enforcement.
 
 ### Stage 3 — event bus + consumer SDK
 
-15. `[new repo]` **Envelope contract + Apicurio schemas** — the harmonized Sunbird-v3 envelope.
-16. `[new repo]` **Consumer SDK runtime** — idempotency, retry/backoff/DLQ, per-tenant rate limit, trace propagation.
-17. `[automation]` **Kafka (KRaft) + Strimzi + Apicurio deployment.**
-18. **Bulk door, NS as first consumer** — `POST /v1/bulk`, `bulk_job`/`bulk_job_item`, two-completion reporting, `audience_basis`, DLQ replay, `notification.delivery_failed` enabling async fallback.
+16. `[new repo]` **Envelope contract + Apicurio schemas** (#66).
+17. `[new repo]` **Consumer SDK runtime** (#67).
+18. `[automation]` **Kafka (KRaft) + Strimzi + Apicurio** (automation#115).
+19. `[automation]` **Valkey** replacing the shared Redis.
+20. **Bulk door, NS as first consumer** (#68) — `POST /v1/bulk`; aggregator campaigns move onto it.
 
 ### Stage 4 — producers emit events
 
-19. `[Signals]` **Outbox + Debezium CDC** → domain events.
-20. `[Signals]` **Non-urgent notifications become events**; OTP stays on the direct API permanently.
-21. `[aggregator]` **Emit events** for its non-urgent paths.
+21. `[Signals]` **Outbox + Debezium CDC** (signals#497).
+22. `[Signals]` **Non-urgent notifications become events** (signals#498); OTP stays on the direct API permanently.
+23. `[aggregator]` **Emit events** (aggr#598).
 
 ### Stage 5 — orchestration (conditional)
 
-Only if a real saga appears; adopt Temporal as a separate consumer. Otherwise never built. Not decomposed.
+Only if a real saga appears; Temporal as a separate consumer. Not decomposed.
 
 ## Deferred and out of scope
 
-- **network-admin role** — a *sibling* spec, filed against the Keycloak IAM epic (signals-dpg #420), not a child of this one. Initial capabilities: manage notification templates and routing policy; publish terms and consent statements (a manual task today). It collides with that epic's open shared-realm-vs-per-DPG-realm decision, which this design does not pre-empt.
-- **Consent enforcement and opt-out** — owned by Signals/aggregator; NS renders consent *content* only.
+- **network-admin role** — sibling spec signals-dpg #499. Realm topology is settled; it needs product definition. `templates:admin` stands in until then.
+- **Multiple vendors per channel** — not built; the model leaves room (§Templates).
+- **Consent enforcement and opt-out** — owned by Signals/aggregator.
 - **Orchestration** — Stage 5, conditional.
 
 ## Open questions
 
-- Topic taxonomy and partition strategy — fixed in the Stage 3 spec against measured volumes.
-- Whether the 90-day Tier-1 horizon is acceptable to compliance before tiered storage exists in Stage 3.
-- Voice-bot result handling — `http_callout` is fire-and-record by default; whether any caller needs a synchronous result back is unconfirmed.
-- Timing of the HMAC dual-accept window's close, which depends on `epic/keycloak-iam` reaching `feature`.
+- **OTP ownership** — which service raises and verifies OTP (today Keycloak for login, Signals for guardian), and whether that is consolidated. Pending the architect. NS is a carrier either way, so Stage 1 does not wait on it.
+- **Admin UI** — the templates and policy APIs have no UI in any stage. Whether network admins need one, and where it lives.
+- Topic taxonomy and partition strategy — Stage 3 spec.
+- Whether the 90-day Tier-1 horizon is acceptable to compliance before Stage 3.
+- Voice-bot result handling — whether any caller needs a synchronous result from `http_callout`.

@@ -4,6 +4,8 @@
 
 **Status:** Revised 2026-08-06. This copy tracks the canonical spec (`2026-06-26-event-platform-design.md`) as of that revision. Where the two differ, the canonical spec wins.
 
+> **Superseded (2026-10-04).** The canonical spec was revised on 2026-10-04 — one vendor per channel, all OTP via NS, no legacy `/notify`, network from deployment config, permanent HMAC v2, shared-RDS persistence with `pg_partman`, and a re-ordered Stage 1. This copy has not been regenerated; read the canonical spec.
+
 ---
 
 ## Contents
