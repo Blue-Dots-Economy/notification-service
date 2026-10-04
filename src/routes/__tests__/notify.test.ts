@@ -15,6 +15,8 @@ vi.mock('../../lib/dedupe', () => ({
 
 const { recordAccepted } = vi.hoisted(() => ({ recordAccepted: vi.fn(async (_rec: unknown) => {}) }));
 vi.mock('../../lib/audit/store', () => ({ recordAccepted }));
+const { stamp } = vi.hoisted(() => ({ stamp: vi.fn(async (_job: unknown, _u: unknown) => {}) }));
+vi.mock('../../lib/audit/stamp', () => ({ stamp }));
 
 const pushRealtime = vi.fn(async () => {});
 const pushOther = vi.fn(async () => {});
@@ -228,6 +230,18 @@ describe('/notify audit', () => {
     expect(retry.json()).toMatchObject({ enqueued: true });
     expect(recordAccepted).toHaveBeenCalledTimes(2);
     expect(pushOther).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks the recorded attempt failed when the enqueue fails, and still fails the request', async () => {
+    stamp.mockClear();
+    pushOther.mockRejectedValueOnce(new Error('redis down'));
+    const res = await signedNotify(body());
+    expect(res.statusCode).toBe(500);
+    expect(recordAccepted).toHaveBeenCalledTimes(1);
+    expect(stamp).toHaveBeenCalledTimes(1);
+    const [job, update] = stamp.mock.calls[0]!;
+    expect(update).toEqual({ status: 'failed', attemptNo: 1, error: 'enqueue failed' });
+    expect((job as { audit: { attemptId: string } }).audit.attemptId).toEqual(expect.any(String));
   });
 
   it('still answers 503 when releasing the claim fails', async () => {

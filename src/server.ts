@@ -3,7 +3,7 @@ import { loadSecrets } from './lib/auth/secrets.js';
 import { spawnWorker } from './lib/worker.js';
 import { runMigrations } from './lib/db/migrate.js';
 import { startPartitionMaintenance } from './lib/db/maintenance.js';
-import { recoverLostJobs } from './lib/audit/recover.js';
+import { recoverAtBoot, recoverLostJobs, recoveryMaxAgeHours } from './lib/audit/recover.js';
 import { describeDbError } from './lib/db/errors.js';
 
 const PORT = process.env.SERVER_PORT || `3000`;
@@ -15,8 +15,11 @@ async function main() {
   // orchestrator keeps the previous pod serving.
   await runMigrations();
   startPartitionMaintenance();
+  // Config errors are fatal; a recovery failure is not.
+  recoveryMaxAgeHours();
   // Before the worker starts draining, so recovered jobs join the queue in order.
-  await recoverLostJobs();
+  // Not fatal: the periodic sweep below retries within 5 minutes.
+  await recoverAtBoot();
   await app.listen({ port: parseInt(PORT) || 3000, host: '0.0.0.0' });
   spawnWorker();
   // Periodic stale-dispatch sweep; a failure is logged, never thrown.

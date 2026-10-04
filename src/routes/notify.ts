@@ -7,6 +7,7 @@ import { providers } from '../lib/providers';
 import * as queue from '../lib/queue';
 import { recordAccepted } from '../lib/audit/store';
 import { toAcceptedRecord } from '../lib/audit/redact';
+import { stamp } from '../lib/audit/stamp';
 import { describeDbError } from '../lib/db/errors';
 import { requestAuth } from '../plugins/request-auth';
 import { notifyBodyLimitBytes } from '../lib/providers/email/attachments';
@@ -119,7 +120,15 @@ export async function notifyRoutes(app: FastifyInstance) {
         );
         return reply.code(503).send({ error: 'audit store unavailable', enqueued: false });
       }
-      await queue.pushOther(job);
+      try {
+        await queue.pushOther(job);
+      } catch (err) {
+        // Recorded but never queued: close the record so recovery does not
+        // send it later. Best-effort (stamp never throws); the error still
+        // propagates so the caller sees the failure.
+        await stamp(job, { status: 'failed', attemptNo: 1, error: 'enqueue failed' });
+        throw err;
+      }
       reply.send({ job_id, enqueued: true });
     },
   });

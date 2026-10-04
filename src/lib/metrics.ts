@@ -93,6 +93,14 @@ const HELP: Record<string, [type: string, help: string]> = {
     'counter',
     'Best-effort audit status writes that failed, by stage (the status being written).',
   ],
+  ns_recovery_abandoned_total: [
+    'counter',
+    'Open recoverable attempts older than RECOVERY_MAX_AGE_HOURS marked failed by recovery instead of re-sent.',
+  ],
+  ns_partition_default_rows: [
+    'gauge',
+    'Rows in a partitioned table\'s default partition, by parent. Non-zero blocks partition pre-making for that range.',
+  ],
   ns_provider_balance: ['gauge', 'Provider account balance, where the provider exposes one.'],
   ns_provider_balance_updated_at: [
     'gauge',

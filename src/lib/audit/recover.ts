@@ -7,6 +7,7 @@ import * as metrics from '../metrics';
 import type { Job } from 'src/types';
 import { ATTEMPT_RANK, eventStatusFor } from './status';
 import { readAttemptMarkers, type AttemptMarker } from './marker';
+import { describeDbError } from '../db/errors';
 
 /**
  * Redis is the dispatch queue; Postgres is the record. A Redis that restarts
@@ -34,6 +35,18 @@ export function recoveryMaxAgeHours(env: NodeJS.ProcessEnv = process.env): numbe
     throw new Error(`RECOVERY_MAX_AGE_HOURS must be a positive integer, got '${raw}'`);
   }
   return n;
+}
+
+/**
+ * Boot-time recovery. Never throws: a database or Redis hiccup at boot must not
+ * crash-loop the pod, and the periodic sweep retries within minutes.
+ */
+export async function recoverAtBoot(): Promise<void> {
+  try {
+    await recoverLostJobs();
+  } catch (err) {
+    console.error('Boot recovery failed; the periodic sweep will retry:', describeDbError(err));
+  }
 }
 
 // Fixed Redis-side Lua (EVAL), not JavaScript eval(): delete the lock only if
