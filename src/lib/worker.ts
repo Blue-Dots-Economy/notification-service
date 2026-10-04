@@ -229,15 +229,11 @@ function nextDelivery(job: Job): PlannedDelivery | undefined {
 }
 
 /**
- * Start the next delivery of a first_available job as a NEW attempt: fresh
- * attemptId, attempt counter reset, channel/to/template from that delivery.
- * The `queued` stamp writes the new attempt row, and that row's job copy is the
- * ADVANCED job (index + 1), so recovery resends the right delivery. Everything
- * else on `audit` (deliveryMode, redactValues, variableNames) is kept.
- */
-/**
  * Close attempt a1 (`job`) as failed and start the next delivery as a new
- * attempt a2. Order, like scheduleRetryWithMarker: stamp a2 `queued` → one
+ * attempt a2: fresh attemptId, attempt counter reset, channel/to/template from
+ * that delivery, the rest of `audit` kept. a2's `queued` stamp writes its row,
+ * whose job copy is the ADVANCED job (index + 1), so recovery resends the right
+ * delivery. Order, like scheduleRetryWithMarker: stamp a2 `queued` → one
  * MULTI {LPUSH a2, SET a1 marker failed:n} → stamp a1 `failed`. The a1 marker
  * therefore exists iff a2 is queued: a crash before the MULTI leaves a1 open
  * with no marker, so recovery re-queues a1 rather than losing the event.

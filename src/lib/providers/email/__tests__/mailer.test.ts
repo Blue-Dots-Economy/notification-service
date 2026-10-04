@@ -131,6 +131,16 @@ describe('emailProvider.send', () => {
     expect(sent.text).not.toContain('<script');
   });
 
+  it('ignores a caller `text` variable and derives the plain body from html', async () => {
+    await emailProvider.send({
+      to: 'support@example.com',
+      template_id: 'BASIC_EMAIL',
+      variables: { ...base, html: '<p>Hello</p>', text: 'something else' },
+    });
+    const sent = sendMailSpy.mock.calls[0][0] as { text: string };
+    expect(sent.text).toBe('Hello');
+  });
+
   it('decodes attachments into nodemailer buffers', async () => {
     const content = Buffer.from('a tiny png');
     await emailProvider.send({
