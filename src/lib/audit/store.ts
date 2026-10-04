@@ -40,6 +40,14 @@ export interface AttemptUpdate {
   error?: string;
 }
 
+/** Persisted error strings are bounded: provider errors are not ours to size. */
+export const MAX_ERROR_LENGTH = 500;
+
+export function capError(error: string | undefined): string | null {
+  if (error === undefined || error === null) return null;
+  return error.length > MAX_ERROR_LENGTH ? error.slice(0, MAX_ERROR_LENGTH) : error;
+}
+
 function insertEvent(rec: AcceptedRecord, status: string) {
   return sql`
     INSERT INTO notification_event
@@ -85,7 +93,7 @@ export async function upsertAttempt(rec: AcceptedRecord, u: AttemptUpdate): Prom
         (${rec.ids.attemptId}, ${rec.ids.createdAt}, ${rec.ids.eventId}, ${rec.channel},
          ${rec.templateId}, ${u.attemptNo}, ${u.status}, ${rank}, ${rec.recoverable},
          ${rec.job ? JSON.stringify(rec.job) : null}::jsonb,
-         ${u.providerMessageId ?? null}, ${u.error ?? null},
+         ${u.providerMessageId ?? null}, ${capError(u.error)},
          ${u.status === 'dispatching' ? sql`now()` : null},
          ${terminal ? sql`now()` : null})
       ON CONFLICT (id, created_at) DO UPDATE SET

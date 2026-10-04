@@ -69,4 +69,12 @@ describe('audit store', () => {
     await recordAccepted(r);
     expect(await read(r)).toMatchObject({ event: 'sent', attempt: { status: 'sent' } });
   });
+
+  it('persists at most 500 chars of a provider error', async () => {
+    const r = rec();
+    await recordAccepted(r);
+    await upsertAttempt(r, { status: 'failed', attemptNo: 1, error: 'x'.repeat(5000) });
+    const { rows } = await getPool().query(`SELECT length(error) AS n FROM delivery_attempt WHERE id = $1`, [r.ids.attemptId]);
+    expect(rows[0].n).toBe(500);
+  });
 });

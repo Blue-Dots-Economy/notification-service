@@ -31,6 +31,7 @@ export async function stamp(job: Job, update: AttemptUpdate): Promise<void> {
 
 async function write_(job: Job, update: AttemptUpdate): Promise<void> {
   try {
+    // upsertAttempt caps `error` at MAX_ERROR_LENGTH before it is persisted.
     await upsertAttempt(toAcceptedRecord(job, 'worker'), update);
   } catch (err) {
     try {
