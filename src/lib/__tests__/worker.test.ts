@@ -24,7 +24,16 @@ vi.mock('../audit/marker', () => ({
 }));
 
 const { acquireSendToken } = vi.hoisted(() => ({ acquireSendToken: vi.fn(async () => true) }));
-vi.mock('../rate_limit', () => ({ acquireSendToken, rateLimitDeferMs: () => 321 }));
+vi.mock('../redis', () => ({ default: {} }));
+vi.mock('../rate_limit', async () => {
+  const actual = await vi.importActual<typeof import('../rate_limit')>('../rate_limit');
+  return {
+    acquireSendToken,
+    bucketsFor: actual.bucketsFor,
+    // Parses (and so validates) an explicit env, like the real one; fixed otherwise.
+    rateLimitDeferMs: (env?: NodeJS.ProcessEnv) => (env ? (actual.rateLimitDeferMs(env), 321) : 321),
+  };
+});
 
 vi.mock('../queue', () => ({
   deferJob: vi.fn(async () => {}),
@@ -66,7 +75,7 @@ vi.mock('../providers', () => ({
 }));
 
 const queue = await import('../queue');
-const { processJob } = await import('../worker');
+const { processJob, validateWorkerConfig } = await import('../worker');
 
 const job = (over: Partial<Job> = {}): Job => ({
   job_id: 'job-1',
@@ -84,7 +93,39 @@ beforeEach(() => {
   acquireSendToken.mockResolvedValue(true);
 });
 
+describe('validateWorkerConfig', () => {
+  it('accepts defaults', () => {
+    expect(() => validateWorkerConfig({})).not.toThrow();
+  });
+  it.each([
+    ['RATE_EMAIL_PER_SEC', '-1'],
+    ['RATE_SMS_BURST', 'abc'],
+    ['RATE_URGENT_SHARE', '1'],
+    ['RATE_LIMIT_DEFER_MS', '0'],
+    ['PROVIDER_TIMEOUT_MS', 'x'],
+  ])('throws naming %s', (key, value) => {
+    expect(() => validateWorkerConfig({ [key]: value })).toThrow(key);
+  });
+});
+
 describe('processJob — rate limit', () => {
+  it('defers (does not lose) the job when the token check itself fails', async () => {
+    acquireSendToken.mockRejectedValueOnce(new Error('redis down'));
+    const j = job({ attempt: 1 });
+
+    await processJob(j);
+
+    expect(queue.deferJob).toHaveBeenCalledWith(j, 321);
+    expect(j.attempt).toBe(1);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('lets a failing defer propagate', async () => {
+    acquireSendToken.mockRejectedValueOnce(new Error('redis down'));
+    vi.mocked(queue.deferJob).mockRejectedValueOnce(new Error('still down'));
+    await expect(processJob(job())).rejects.toThrow('still down');
+  });
+
   it('defers a denied token without counting an attempt, calling the provider or stamping', async () => {
     acquireSendToken.mockResolvedValueOnce(false);
     const j = job({ attempt: 2, priority: 'bulk' });

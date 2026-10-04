@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import redis from '../redis';
 import { acquireSendToken } from '../rate_limit';
 
@@ -28,5 +28,24 @@ describe('acquireSendToken', () => {
     expect(await drain('realtime', 8)).toBe(8);
     expect(await drain('bulk', 5)).toBe(0);
     expect(await drain('realtime', 5)).toBe(2);
+  });
+});
+
+describe('clock skew and expiry', () => {
+  it('a now earlier than the stored ts does not reduce tokens', async () => {
+    expect(await drain('bulk', 1)).toBe(1); // stores ts = real now, 7 tokens left
+    const real = Date.now();
+    const spy = vi.spyOn(Date, 'now').mockReturnValue(real - 3_600_000);
+    try {
+      expect(await drain('bulk', 20)).toBe(7);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('keeps a slow bucket past the 60s floor', async () => {
+    await drain('bulk', 1);
+    const ttl = await redis.pttl('rl:sms:msg91:shared');
+    expect(ttl).toBeGreaterThan(60_000); // cap 8 / rate 0.0008 per s = 10,000,000 ms
   });
 });

@@ -39,11 +39,11 @@ local function take(key, now, rate, cap)
   local data = redis.call('HMGET', key, 'tokens', 'ts')
   local tokens = tonumber(data[1]) or cap
   local ts = tonumber(data[2]) or now
-  tokens = math.min(cap, tokens + ((now - ts) / 1000) * rate)
+  tokens = math.min(cap, tokens + (math.max(0, now - ts) / 1000) * rate)
   local ok = 0
   if tokens >= 1 then tokens = tokens - 1; ok = 1 end
   redis.call('HSET', key, 'tokens', tokens, 'ts', now)
-  redis.call('PEXPIRE', key, 60000)
+  redis.call('PEXPIRE', key, math.max(60000, math.ceil(cap / rate * 1000)))
   return ok
 end
 local now = tonumber(ARGV[1])

@@ -1,6 +1,7 @@
 import { SendEmailCommand, SESv2Client } from '@aws-sdk/client-sesv2';
 import nodemailer from 'nodemailer';
 import SMTPTransport from 'nodemailer/lib/smtp-transport';
+import { providerTimeoutMs } from '../http';
 
 let transporter: nodemailer.Transporter<SMTPTransport.SentMessageInfo>;
 
@@ -45,6 +46,7 @@ const GMAIL_HOST = 'smtp.gmail.com';
 /** The SMTP connection, resolved from the environment. `SMTP_HOST` selects it (#112). */
 function resolveSmtp(): SMTPTransport.Options | undefined {
   if (!SMTP_HOST) return undefined;
+  const timeout = providerTimeoutMs();
 
   // 587 + STARTTLS is the common third-party default, so never assume 465.
   const port = Number(SMTP_PORT) || 587;
@@ -56,6 +58,11 @@ function resolveSmtp(): SMTPTransport.Options | undefined {
     host: SMTP_HOST,
     port,
     secure,
+    // Bound every phase so a silent relay cannot hold the worker loop; a timeout
+    // fails the send, which the worker retries.
+    connectionTimeout: timeout,
+    greetingTimeout: timeout,
+    socketTimeout: timeout,
     // An `auth` with undefined members still attempts AUTH, so omit it entirely.
     ...(SMTP_USER && SMTP_PASS ? { auth: { user: SMTP_USER, pass: SMTP_PASS } } : {}),
   };
@@ -79,8 +86,10 @@ async function initTransporter() {
 
   if (useSes) {
     try {
+      const timeout = providerTimeoutMs();
       const sesClient = new SESv2Client({
         region: AWS_REGION!,
+        requestHandler: { requestTimeout: timeout, connectionTimeout: timeout },
         credentials: {
           accessKeyId: AWS_ACCESS_KEY_ID!,
           secretAccessKey: AWS_SECRET_ACCESS_KEY!,
