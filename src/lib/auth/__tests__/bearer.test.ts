@@ -55,8 +55,26 @@ describe('verifyBearer', () => {
     ['azp not allowlisted', { aud: 'notification-service', azp: 'aggregator-dpg' }, 'Token client not accepted'],
     ['azp absent', { aud: 'notification-service', azp: undefined }, 'Token client not accepted'],
     ['an ID token', { aud: 'notification-service', typ: 'ID' }, 'Token invalid'],
+    ['typ absent', { aud: 'notification-service', typ: undefined }, 'Token invalid'],
   ])('rejects %s with 401', async (_name, claims, error) => {
     expect(await verifyBearer(await token(claims), cfg)).toEqual({ ok: false, status: 401, error });
+  });
+
+  it('identifies a token whose client_id differs from azp by client and subject', async () => {
+    const res = await verifyBearer(await token({ aud: 'notification-service', client_id: 'other' }), cfg);
+    expect(res).toMatchObject({ ok: true, principal: { id: 'signals-api:sa-uuid' } });
+  });
+
+  it('rejects a token without exp', async () => {
+    const t = await new SignJWT({ typ: 'Bearer', azp: 'signals-api', aud: 'notification-service' })
+      .setProtectedHeader({ alg: 'RS256', kid: 'k1' }).setIssuer(ISS).setSubject('sa-uuid').setIssuedAt().sign(privateKey);
+    expect(await verifyBearer(t, cfg)).toEqual({ ok: false, status: 401, error: 'Token invalid' });
+  });
+
+  it('rejects a token without sub', async () => {
+    const t = await new SignJWT({ typ: 'Bearer', azp: 'signals-api', aud: 'notification-service' })
+      .setProtectedHeader({ alg: 'RS256', kid: 'k1' }).setIssuer(ISS).setIssuedAt().setExpirationTime('5m').sign(privateKey);
+    expect(await verifyBearer(t, cfg)).toEqual({ ok: false, status: 401, error: 'Token invalid' });
   });
 
   it('rejects another issuer', async () => {
@@ -86,6 +104,12 @@ describe('verifyBearer', () => {
     expect(await verifyBearer(await token({ aud: 'notification-service' }), cfg)).toEqual({
       ok: false, status: 503, error: 'Auth service unavailable',
     });
+    setKeyResolverForTests(async () => {
+      throw new errors.JWKSInvalid();
+    });
+    expect(await verifyBearer(await token({ aud: 'notification-service' }), cfg)).toEqual({
+      ok: false, status: 503, error: 'Auth service unavailable',
+    });
   });
 });
 
@@ -93,8 +117,8 @@ describe('bearerConfig', () => {
   it('is off without an issuer', () => expect(bearerConfig({})).toBeNull());
 
   it('derives the JWKS URI and defaults the audience', () => {
-    expect(bearerConfig({ NS_KEYCLOAK_ISSUER: `${ISS}/`, NS_AUTH_ALLOWED_AZP: ' signals-api , ' })).toEqual({
-      issuer: `${ISS}/`,
+    expect(bearerConfig({ NS_KEYCLOAK_ISSUER: ISS, NS_AUTH_ALLOWED_AZP: ' signals-api , ' })).toEqual({
+      issuer: ISS,
       jwksUri: `${ISS}/protocol/openid-connect/certs`,
       audience: 'notification-service',
       allowedAzp: new Set(['signals-api']),
@@ -103,6 +127,18 @@ describe('bearerConfig', () => {
 
   it('requires an azp allowlist when bearer auth is on', () => {
     expect(() => bearerConfig({ NS_KEYCLOAK_ISSUER: ISS })).toThrow(/NS_AUTH_ALLOWED_AZP/);
+  });
+
+  it('rejects a trailing slash on the issuer', () => {
+    expect(() => bearerConfig({ NS_KEYCLOAK_ISSUER: `${ISS}/`, NS_AUTH_ALLOWED_AZP: 'a' })).toThrow(/trailing slash/);
+  });
+
+  it('rejects a non-http JWKS URI', () => {
+    expect(() => bearerConfig({ NS_KEYCLOAK_ISSUER: ISS, NS_AUTH_ALLOWED_AZP: 'a', NS_KEYCLOAK_JWKS_URI: 'file:///x' })).toThrow();
+  });
+
+  it('rejects a non-http issuer', () => {
+    expect(() => bearerConfig({ NS_KEYCLOAK_ISSUER: 'ftp://x/realms/r', NS_AUTH_ALLOWED_AZP: 'a' })).toThrow();
   });
 
   it('rejects an invalid JWKS URI', () => {
