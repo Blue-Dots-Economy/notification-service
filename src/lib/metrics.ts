@@ -99,7 +99,7 @@ const HELP: Record<string, [type: string, help: string]> = {
   ],
   ns_partition_default_rows: [
     'gauge',
-    'Rows in a partitioned table\'s default partition, by parent. Non-zero blocks partition pre-making for that range.',
+    '1 when a partitioned table\'s default partition is non-empty, 0 otherwise, by parent. Non-empty blocks partition pre-making for that range.',
   ],
   ns_provider_balance: ['gauge', 'Provider account balance, where the provider exposes one.'],
   ns_provider_balance_updated_at: [

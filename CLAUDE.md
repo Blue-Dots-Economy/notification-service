@@ -382,7 +382,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 295 unit tests across 23 files (plus 35 integration tests). The unit suite runs in about a second because Redis
+vitest 4, 300 unit tests across 23 files (plus 36 integration tests). The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
