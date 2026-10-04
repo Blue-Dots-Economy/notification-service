@@ -14,6 +14,10 @@ const VariableSpecSchema = z
   .refine((s) => s.type === 'url' || s.urlHosts === undefined, {
     message: 'urlHosts applies only to url variables',
     path: ['urlHosts'],
+  })
+  .refine((s) => !(s.name in Object.prototype), {
+    message: 'variable name is reserved',
+    path: ['name'],
   });
 
 export const VariableContractSchema = z
@@ -60,13 +64,21 @@ function hostAllowed(host: string, allowed: string[]): boolean {
 }
 
 function normalise(spec: VariableSpec, value: unknown): string {
-  if (typeof value === 'object' && value !== null) {
+  // Reject non-scalar types: object, function, symbol, bigint
+  const valueType = typeof value;
+  if (valueType === 'object' || valueType === 'function' || valueType === 'symbol' || valueType === 'bigint') {
     throw new TemplateError('invalid_variable', `${spec.name} must be a scalar`, { variable: spec.name });
   }
-  const s = String(value);
-  if (spec.type === 'number' && !Number.isFinite(Number(s))) {
-    throw new TemplateError('invalid_variable', `${spec.name} must be a number`, { variable: spec.name });
+
+  let s = String(value);
+
+  if (spec.type === 'number') {
+    s = s.trim();
+    if (!s || !/^-?\d+(\.\d+)?$/.test(s)) {
+      throw new TemplateError('invalid_variable', `${spec.name} must be a number`, { variable: spec.name });
+    }
   }
+
   if (spec.type === 'url') {
     let url: URL;
     try {
@@ -77,10 +89,21 @@ function normalise(spec: VariableSpec, value: unknown): string {
     if (url.protocol !== 'https:' && url.protocol !== 'http:') {
       throw new TemplateError('invalid_variable', `${spec.name} must be http(s)`, { variable: spec.name });
     }
-    if (spec.urlHosts && !hostAllowed(url.hostname, spec.urlHosts)) {
+    if (url.username || url.password) {
       throw new TemplateError('invalid_variable', `${spec.name} host is not allowed`, { variable: spec.name });
     }
+    // Strip one trailing dot from hostname before allowlist comparison
+    let hostname = url.hostname;
+    if (hostname.endsWith('.')) {
+      hostname = hostname.slice(0, -1);
+    }
+    if (spec.urlHosts && !hostAllowed(hostname, spec.urlHosts)) {
+      throw new TemplateError('invalid_variable', `${spec.name} host is not allowed`, { variable: spec.name });
+    }
+    // Return the normalized URL form
+    return url.href;
   }
+
   return s;
 }
 
@@ -99,7 +122,8 @@ export function validateVariables(
   }
   const out: Record<string, string> = {};
   for (const spec of contract) {
-    const value = input[spec.name];
+    // Use hasOwnProperty to read only own properties, avoiding inherited prototype pollution
+    const value = Object.prototype.hasOwnProperty.call(input, spec.name) ? input[spec.name] : undefined;
     const empty = value === undefined || value === null || value === '';
     if (empty) {
       if (spec.required) {

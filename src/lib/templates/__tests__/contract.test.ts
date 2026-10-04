@@ -84,3 +84,89 @@ describe('validateVariables', () => {
     expect(sensitiveVariables([v({ name: 'otp', sensitive: true }), v({ name: 'name' })])).toEqual(['otp']);
   });
 });
+
+describe('security hardening', () => {
+  it('rejects reserved names in contract schema', () => {
+    expect(VariableContractSchema.safeParse([{ name: 'constructor' }]).success).toBe(false);
+    expect(VariableContractSchema.safeParse([{ name: '__proto__' }]).success).toBe(false);
+    expect(VariableContractSchema.safeParse([{ name: 'toString' }]).success).toBe(false);
+    expect(VariableContractSchema.safeParse([{ name: 'hasOwnProperty' }]).success).toBe(false);
+  });
+
+  it('rejects __proto__ injection via JSON.parse', () => {
+    const contract = [v({ name: 'user' })];
+    // Simulate a caller passing JSON with __proto__ key
+    const input = JSON.parse('{"user":"test","__proto__":{"admin":true}}');
+    expect(code(() => validateVariables(contract, input))).toBe('unknown_variable');
+  });
+
+  it('accepts null-prototype input', () => {
+    const contract = [v({ name: 'user' })];
+    const input = Object.create(null);
+    input.user = 'test';
+    expect(validateVariables(contract, input)).toEqual({ user: 'test' });
+  });
+
+  it('accepts uppercase host and normalizes with url.href', () => {
+    const contract = [v({ name: 'link', type: 'url', urlHosts: ['blue-dots.org'] })];
+    const result = validateVariables(contract, { link: 'https://BLUE-DOTS.ORG/path' });
+    // url.href normalizes hostname to lowercase
+    expect(result.link).toBe('https://blue-dots.org/path');
+  });
+
+  it('accepts trailing dot and strips for host comparison', () => {
+    const contract = [v({ name: 'link', type: 'url', urlHosts: ['blue-dots.org'] })];
+    const result = validateVariables(contract, { link: 'https://blue-dots.org./path' });
+    // url.href normalizes the hostname
+    expect(result.link).toBeTruthy();
+  });
+
+  it('rejects URLs with credentials', () => {
+    const contract = [v({ name: 'link', type: 'url', urlHosts: ['blue-dots.org'] })];
+    expect(code(() => validateVariables(contract, { link: 'https://u:p@blue-dots.org/' }))).toBe('invalid_variable');
+    expect(code(() => validateVariables(contract, { link: 'https://blue-dots.org@evil.com/' }))).toBe('invalid_variable');
+  });
+
+  it('rejects function, symbol, and bigint values', () => {
+    const contract = [v({ name: 'val' })];
+    expect(code(() => validateVariables(contract, { val: () => {} }))).toBe('invalid_variable');
+    expect(code(() => validateVariables(contract, { val: Symbol('test') }))).toBe('invalid_variable');
+    expect(code(() => validateVariables(contract, { val: BigInt(123) }))).toBe('invalid_variable');
+  });
+
+  it('rejects whitespace and hex strings for number type', () => {
+    const contract = [v({ name: 'count', type: 'number' })];
+    expect(code(() => validateVariables(contract, { count: '   ' }))).toBe('invalid_variable');
+    expect(code(() => validateVariables(contract, { count: '0x10' }))).toBe('invalid_variable');
+    expect(code(() => validateVariables(contract, { count: '1.2.3' }))).toBe('invalid_variable');
+  });
+
+  it('accepts valid number formats after trim', () => {
+    const contract = [v({ name: 'count', type: 'number' })];
+    expect(validateVariables(contract, { count: '  42  ' })).toEqual({ count: '42' });
+    expect(validateVariables(contract, { count: '-3.14' })).toEqual({ count: '-3.14' });
+    expect(validateVariables(contract, { count: 0 })).toEqual({ count: '0' });
+  });
+
+  it('returns url.href as normalized URL', () => {
+    const contract = [v({ name: 'link', type: 'url', urlHosts: ['blue-dots.org'] })];
+    const result = validateVariables(contract, { link: 'HTTPS://blue-dots.org/path' });
+    // url.href should normalize the scheme to lowercase
+    expect(result.link).toBe('https://blue-dots.org/path');
+  });
+
+  it('does not expose sensitive values in error messages', () => {
+    const contract = [v({ name: 'otp', sensitive: true, type: 'string' })];
+    try {
+      validateVariables(contract, { otp: { nested: 'SECRET_VALUE' } });
+      expect.fail('should have thrown');
+    } catch (e) {
+      if (e instanceof TemplateError) {
+        const msg = e.message;
+        const details = JSON.stringify(e.details || {});
+        expect(msg).not.toContain('SECRET_VALUE');
+        expect(details).not.toContain('SECRET_VALUE');
+      }
+    }
+  });
+});
