@@ -1,13 +1,15 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { closeDb, getPool } from '../client';
 import { runMigrations } from '../migrate';
 import { runPartitionMaintenance } from '../maintenance';
+import redis from '../../redis';
 
 beforeAll(async () => {
   await runMigrations();
 });
 afterAll(async () => {
   await closeDb();
+  redis.disconnect();
 });
 
 async function childPartitions(parent: string): Promise<string[]> {
@@ -58,5 +60,26 @@ describe('audit partitions', () => {
       holder.release();
     }
     await expect(runPartitionMaintenance()).resolves.toBe(true);
+  });
+
+  it('reports a non-empty default partition via the gauge and a warning', async () => {
+    const gauge = async () => redis.hget('metrics:gauges', 'ns_partition_default_rows|parent=public.notification_event');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await getPool().query(
+        `INSERT INTO notification_event
+           (id, created_at, correlation_id, network, source, priority, status, payload)
+         VALUES (gen_random_uuid(), now() + interval '5 years', 'c', 'n', 's', 'other', 'accepted', '{}')`,
+      );
+      await expect(runPartitionMaintenance()).resolves.toBe(true);
+      expect(await gauge()).toBe('1');
+      expect(await redis.hget('metrics:gauges', 'ns_partition_default_rows|parent=public.delivery_attempt')).toBe('0');
+      expect(warn.mock.calls.flat().join(' ')).toContain('public.notification_event');
+    } finally {
+      await getPool().query(`DELETE FROM notification_event_default`);
+      warn.mockRestore();
+    }
+    await runPartitionMaintenance();
+    expect(await gauge()).toBe('0');
   });
 });
