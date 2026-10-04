@@ -66,6 +66,9 @@ export const emailProvider: ProviderDefinition = {
     }
     const fromEmail = process.env.EMAIL_FROM_ADDRESS?.trim();
     if (!fromEmail) return { ok: false, retryable: false, error: 'email sender not configured' };
+    if (!rendered.html && !rendered.text) {
+      return { ok: false, retryable: false, error: 'email has no body' };
+    }
     const res = await sendMail({
       to,
       fromEmail,
