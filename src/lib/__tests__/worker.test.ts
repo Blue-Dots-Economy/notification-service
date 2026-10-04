@@ -23,7 +23,11 @@ vi.mock('../audit/marker', () => ({
     j.audit ? { key: `ns:attempt:${j.audit.attemptId}`, value: `${fate}:${n}`, ttlSeconds: 604800 } : undefined,
 }));
 
+const { acquireSendToken } = vi.hoisted(() => ({ acquireSendToken: vi.fn(async () => true) }));
+vi.mock('../rate_limit', () => ({ acquireSendToken, rateLimitDeferMs: () => 321 }));
+
 vi.mock('../queue', () => ({
+  deferJob: vi.fn(async () => {}),
   pushDLQ: vi.fn(async () => 1),
   scheduleRetryWithMarker: vi.fn(async () => 1),
   popRealtime: vi.fn(async () => null),
@@ -41,6 +45,7 @@ vi.mock('../providers', () => ({
   providers: {
     email: {
       name: 'email',
+      vendor: 'smtp',
       templates: { welcome: 'provider-template-123' },
       schema: { safeParse: () => ({ success: true, data: {} }) },
       send,
@@ -50,6 +55,7 @@ vi.mock('../providers', () => ({
     // has not landed yet" placeholder.
     sms: {
       name: 'sms',
+      vendor: 'msg91',
       templates: { login_otp: 'DLT-1', pending_case: '', blank_body: 'DLT-2' },
       bodies: { login_otp: '{{message}} is your OTP', blank_body: '' },
       allowRawTemplateId: true,
@@ -75,6 +81,35 @@ const job = (over: Partial<Job> = {}): Job => ({
 beforeEach(() => {
   vi.clearAllMocks();
   send.mockResolvedValue({ ok: true });
+  acquireSendToken.mockResolvedValue(true);
+});
+
+describe('processJob — rate limit', () => {
+  it('defers a denied token without counting an attempt, calling the provider or stamping', async () => {
+    acquireSendToken.mockResolvedValueOnce(false);
+    const j = job({ attempt: 2, priority: 'bulk' });
+
+    await processJob(j);
+
+    expect(queue.deferJob).toHaveBeenCalledWith(j, 321);
+    expect(j.attempt).toBe(2);
+    expect(send).not.toHaveBeenCalled();
+    expect(stamp).not.toHaveBeenCalled();
+    expect(markAttempt).not.toHaveBeenCalled();
+    expect(queue.pushDLQ).not.toHaveBeenCalled();
+    expect(incr).toHaveBeenCalledWith('ns_rate_limited_total', { channel: 'email', priority: 'bulk' });
+  });
+
+  it('proceeds as before when a token is granted', async () => {
+    const j = job({ priority: 'realtime' });
+
+    await processJob(j);
+
+    expect(acquireSendToken).toHaveBeenCalledWith('email', 'smtp', 'realtime');
+    expect(queue.deferJob).not.toHaveBeenCalled();
+    expect(j.attempt).toBe(1);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('processJob — routing', () => {

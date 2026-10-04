@@ -1,4 +1,5 @@
-import { pushDLQ, scheduleRetryWithMarker } from './queue';
+import { deferJob, pushDLQ, scheduleRetryWithMarker } from './queue';
+import { acquireSendToken, rateLimitDeferMs } from './rate_limit';
 import { poolConfig, startPools } from './pools';
 import { providers } from './providers';
 import * as metrics from './metrics';
@@ -20,6 +21,14 @@ const MAX_RETRIES = 5;
  */
 export async function processJob(job: Job) {
   const provider = providers[job.channel];
+
+  // Before the attempt is counted: a rate-limited job has not been tried, so it
+  // is deferred, not failed, and uses none of its retry budget.
+  if (provider && !(await acquireSendToken(job.channel, provider.vendor, job.priority))) {
+    await metrics.incr('ns_rate_limited_total', { channel: job.channel, priority: job.priority });
+    return deferJob(job, rateLimitDeferMs());
+  }
+
   job.attempt = (job.attempt ?? 0) + 1;
 
   if (!provider) {
