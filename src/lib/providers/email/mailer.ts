@@ -25,6 +25,8 @@ const EmailAttachmentSchema = z.object({
 
 export const emailProvider: ProviderDefinition = {
   name: 'email',
+  vendor: 'smtp',
+  renders: 'ns',
 
   templates: {
     basic_email: 'BASIC_EMAIL',

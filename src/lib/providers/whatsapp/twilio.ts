@@ -4,6 +4,8 @@ import { sendWhatsAppMessage } from './twilioSend';
 
 export const whatsappProvider: ProviderDefinition = {
   name: 'whatsapp',
+  vendor: 'twilio',
+  renders: 'provider',
 
   templates: {
     dialflow: 'HXa9cc9766cfdd966ae28b7ebc4ca0d09e',

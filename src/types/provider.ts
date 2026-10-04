@@ -40,6 +40,19 @@ export interface ProviderSendArgs {
 
 export interface ProviderDefinition {
   name: string;
+  /**
+   * The vendor behind this channel in this deployment ('smtp', 'msg91',
+   * 'pinnacle', 'twilio'). Templates are registered against a vendor — DLT and
+   * Meta template ids are per vendor — so a template whose vendor differs from
+   * the deployment's is refused rather than sent.
+   */
+  vendor: string;
+  /**
+   * Who turns a template into the delivered text: 'ns' renders the stored body
+   * here (email, Pinnacle); 'provider' sends an approved template id plus
+   * variables and the vendor renders (MSG91 Flow, Twilio Content).
+   */
+  renders: 'ns' | 'provider';
   templates: ProviderTemplateMap;
   /**
    * Body text for the templates this provider NAMES, keyed by the same public
