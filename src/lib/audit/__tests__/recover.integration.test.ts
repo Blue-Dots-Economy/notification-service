@@ -424,6 +424,23 @@ describe('recoverLostJobs', () => {
       expect(await event(a1)).toMatchObject({ status: 'partially_delivered' });
     });
 
+    it('a re-queued attempt rolls its event up too', async () => {
+      const [a1, a2] = siblings('all');
+      await recordAcceptedMany([a1, a2]);
+      await upsertAttempt(a1, { status: 'failed', attemptNo: 1, error: 'x' });
+      await upsertAttempt(a2, { status: 'dispatching', attemptNo: 1 });
+      expect(await event(a1)).toMatchObject({ status: 'dispatching' });
+      await backdate(a2, '1 hour');
+
+      expect(await recoverLostJobs({ staleDispatchMs: 60_000 })).toMatchObject({ requeued: 1 });
+      expect(await row(a2)).toMatchObject({ status: 'queued', attempt_no: 2 });
+      expect(await event(a1)).toMatchObject({ status: 'accepted' }); // a2 queued again, nothing dispatching
+
+      const single = await staleDispatching(1);
+      expect(await recoverLostJobs({ staleDispatchMs: 60_000 })).toMatchObject({ requeued: 1 });
+      expect(await event(single)).toMatchObject({ status: 'accepted' });
+    });
+
     it('an expired marker stamps the attempt and a single event expired', async () => {
       const r = await staleDispatching(1);
       await redis.set(attemptMarkerKey(r.ids.attemptId), 'expired:1', 'EX', 60);
