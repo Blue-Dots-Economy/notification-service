@@ -222,6 +222,10 @@ SECRET="ns_admin_secret"
 BASE=http://localhost:3000
 
 # Signs METHOD + PATH + timestamp + nonce, as in "Signed cURL Example".
+# The signed path is the full request URL as sent, including any query string
+# (matters for list endpoints, e.g. /v1/admin/templates?status=active).
+# Fastify rejects an empty body sent as application/json, so bodyless POSTs
+# (publish, retire) send -d '{}'.
 ns_curl() {
   local METHOD="$1" REQ_PATH="$2"; shift 2
   local TS=$(date +%s) NONCE=$(openssl rand -hex 16)
@@ -246,7 +250,7 @@ ID=$(ns_curl POST /v1/admin/templates -d '{
 ns_curl POST "/v1/admin/templates/$ID/preview" \
   -d '{"variables": {"name": "Asha <b>", "link": "https://app.example.com/start"}}'
 
-ns_curl POST "/v1/admin/templates/$ID/publish"
+ns_curl POST "/v1/admin/templates/$ID/publish" -d '{}'
 ```
 
 Email variables are HTML-escaped unless declared `raw: true`. Variable `type` is `string`,

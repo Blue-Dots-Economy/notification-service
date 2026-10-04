@@ -21,7 +21,10 @@ const errorBody = (description: string) => ({
 });
 
 const adminErrors = {
-  '400': errorBody('Invalid request: unknown keys, wrong types or a malformed id'),
+  '400': {
+    description: 'Validation error (Zod format): unknown keys, wrong types or a malformed id',
+    content: { 'application/json': { schema: { type: 'object', additionalProperties: true } } },
+  },
   '401': { description: 'Missing or invalid request signature' },
   '403': errorBody('The key id is not listed in NS_ADMIN_KEY_IDS ({"error":"admin scope required"})'),
   '404': errorBody('not_found: no such template or policy'),

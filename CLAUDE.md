@@ -186,7 +186,7 @@ export const emailProvider: ProviderDefinition = {
 };
 ```
 
-`vendor` (`'smtp' | 'msg91' | 'pinnacle' | 'twilio'`) and `renders` (`'ns' | 'provider'`) are
+`vendor` (a string naming the vendor, e.g. `'smtp'`, `'msg91'`, `'pinnacle'`, `'twilio'`) and `renders` (`'ns' | 'provider'`) are
 **required** on every definition; see Templates and policies for what they drive.
 
 Providers are auto-discovered and registered by `src/lib/providers/index.ts`. To add a provider, create a folder and export the definition, including `vendor` and `renders` (see README for full example).
@@ -328,7 +328,7 @@ tries candidates in order; `all` fans out.
 **Admin scope.** `/v1/admin/templates` and `/v1/admin/policies` need a valid HMAC signature
 (`requestAuth`) **and** the key id in `NS_ADMIN_KEY_IDS`, else `403 {"error":"admin scope required"}`.
 Editing a DLT-registered template has a compliance blast radius a sending credential must not
-carry. Interim until Keycloak admin roles (#62). Request schemas are strict (unknown keys → `400`).
+carry. Interim until Keycloak admin roles (#62). Request bodies (including each variable spec) are strict, so unknown keys → `400`; list query params are not strict.
 Errors: `404 not_found`, `409 invalid_state`, `422` for any other rule violation, `503
 network_not_configured`. `POST .../preview` renders a template of any status with the supplied
 variables and sends nothing.
@@ -460,7 +460,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 371 unit tests across 33 files (plus 36 integration tests). The unit suite runs in about a second because Redis
+vitest 4, 372 unit tests across 33 files (plus 61 integration tests). The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
