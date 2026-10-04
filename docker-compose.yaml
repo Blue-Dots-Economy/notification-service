@@ -51,11 +51,13 @@ services:
     container_name: notification-service-redis
     image: redis:7
     restart: always
+    # noeviction (as on the shared production Redis): an eviction policy could
+    # drop the ns:epoch key and trigger a needless full re-queue.
     command:
       - sh
       - -c
       - >
-        exec redis-server --appendonly yes --appendfsync everysec --save "" --maxmemory ${REDIS_MAXMEMORY:-256mb} --maxmemory-policy ${REDIS_MAXMEMORY_POLICY:-allkeys-lru} ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
+        exec redis-server --appendonly yes --appendfsync everysec --save "" --maxmemory ${REDIS_MAXMEMORY:-256mb} --maxmemory-policy ${REDIS_MAXMEMORY_POLICY:-noeviction} ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
 
     healthcheck:
       test: ['CMD-SHELL', 'redis-cli ${REDIS_PASSWORD:+-a ${REDIS_PASSWORD}} ping | grep PONG']

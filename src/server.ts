@@ -20,7 +20,7 @@ async function main() {
   spawnWorker();
   // Periodic stale-dispatch sweep; a failure is logged, never thrown.
   setInterval(() => {
-    recoverLostJobs().catch((err) => console.error('Recovery sweep failed:', err.message));
+    recoverLostJobs().catch((err) => console.error('Recovery sweep failed:', err instanceof Error ? err.message : err));
   }, 5 * 60 * 1000).unref();
   console.log(`API running on worker ${process.pid}`);
 }
