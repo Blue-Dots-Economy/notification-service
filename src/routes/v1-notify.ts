@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import type { Job } from 'src/types';
-import { recordAcceptedMany, type AcceptedRecord } from '../lib/audit/store';
+import { recordAcceptedMany } from '../lib/audit/store';
 import { toAcceptedRecord } from '../lib/audit/redact';
 import { stamp } from '../lib/audit/stamp';
 import { correlationIdFrom } from '../lib/correlation';
@@ -11,7 +11,7 @@ import { dedupe, releaseDedupe } from '../lib/dedupe';
 import * as metrics from '../lib/metrics';
 import { currentNetwork, NetworkNotConfigured } from '../lib/network';
 import { notifyBodyLimitBytes } from '../lib/providers/email/attachments';
-import { pushToPriority } from '../lib/queue';
+import { pushManyToPriority } from '../lib/queue';
 import { SendError } from '../lib/send/errors';
 import { claimIdempotency, completeIdempotency, fallbackKey, releaseIdempotency } from '../lib/send/idempotency';
 import { planSend, type SendPlan } from '../lib/send/plan';
@@ -47,18 +47,10 @@ function buildJobs(req: V1Request, plan: SendPlan, correlationHeader: unknown): 
       correlationId,
       redactValues: plan.redact,
       deliveryMode: plan.mode,
+      ...(plan.redact ? { variableNames: Object.keys(plan.variables) } : {}),
     },
   });
   return plan.mode === 'all' ? plan.deliveries.map((d) => make([d])) : [make(plan.deliveries)];
-}
-
-/** Redacted records keep variable NAMES (from the plan) and nothing derived from values. */
-function toRecords(jobs: Job[], plan: SendPlan, source: string): AcceptedRecord[] {
-  return jobs.map((job) => {
-    const rec = toAcceptedRecord(job, source);
-    if (plan.redact) rec.payload = { ...rec.payload, variable_names: Object.keys(plan.variables) };
-    return rec;
-  });
 }
 
 export async function v1NotifyRoutes(app: FastifyInstance) {
@@ -122,12 +114,12 @@ export async function v1NotifyRoutes(app: FastifyInstance) {
 
         const jobs = buildJobs(body, plan, req.headers['x-correlation-id']);
         const source = String(req.headers['x-ns-key'] ?? 'unknown');
-        const records = toRecords(jobs, plan, source);
+        const records = jobs.map((j) => toAcceptedRecord(j, source));
         const eventId = jobs[0]!.audit!.eventId;
 
         if (priority === 'realtime') {
           // Queue first: a slow or unavailable Postgres must never delay an OTP.
-          for (const job of jobs) await pushToPriority(job);
+          await pushManyToPriority(jobs);
           void recordAcceptedMany(records).catch((err) =>
             req.log.error({ err: describeDbError(err), event: eventId }, 'v1 urgent audit insert failed'),
           );
@@ -140,7 +132,7 @@ export async function v1NotifyRoutes(app: FastifyInstance) {
             return reply.code(503).send({ error: 'audit store unavailable' });
           }
           try {
-            for (const job of jobs) await pushToPriority(job);
+            await pushManyToPriority(jobs);
           } catch (err) {
             for (const job of jobs) await stamp(job, { status: 'failed', attemptNo: 1, error: 'enqueue failed' });
             throw err;

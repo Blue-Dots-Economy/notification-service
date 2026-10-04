@@ -47,7 +47,7 @@ export function toAcceptedRecord(job: Job, source: string): AcceptedRecord {
     channel: job.channel,
     templateId: job.template_id,
     payload: realtime
-      ? { to: job.to, variable_names: Object.keys(job.variables ?? {}) }
+      ? { to: job.to, variable_names: job.audit.variableNames ?? Object.keys(job.variables ?? {}) }
       : {
           to: job.to,
           variables: withoutAttachmentBodies(job.channel, job.variables),

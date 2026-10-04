@@ -19,6 +19,8 @@ export interface AuditIds {
   redactValues?: boolean;
   /** Absent = `single`. `all` events roll their status up across attempts. */
   deliveryMode?: DeliveryMode;
+  /** Variable NAMES of a redacted send (its job carries no values). */
+  variableNames?: string[];
 }
 
 export interface AcceptedRecord {

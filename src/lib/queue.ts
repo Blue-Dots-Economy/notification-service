@@ -127,7 +127,7 @@ export async function moveDueRetries(now = Date.now()): Promise<number> {
 
 /**
  * Enqueue many jobs, each on its own priority's queue, in one MULTI round trip
- * (recovery). Throws if any push failed, so the caller can roll back what it
+ * (recovery, v1 send). Throws if any push failed, so the caller can roll back what it
  * recorded.
  */
 export async function pushManyToPriority(jobs: Job[]): Promise<void> {
@@ -135,7 +135,7 @@ export async function pushManyToPriority(jobs: Job[]): Promise<void> {
   const tx = redis.multi();
   for (const job of jobs) tx.lpush(queueKeyFor(job.priority), JSON.stringify(job));
   const results = await tx.exec();
-  if (!results) throw new Error('Redis MULTI aborted while re-queueing');
+  if (!results) throw new Error('Redis MULTI aborted while enqueueing');
   const failed = results.find(([err]) => err);
   if (failed) throw failed[0];
 }
