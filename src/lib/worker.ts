@@ -1,5 +1,6 @@
 import { deferJob, pushDLQ, scheduleRetryWithMarker } from './queue';
-import { acquireSendToken, rateLimitDeferMs } from './rate_limit';
+import { acquireSendToken, bucketsFor, rateLimitDeferMs } from './rate_limit';
+import { providerTimeoutMs } from './providers/http';
 import { poolConfig, startPools } from './pools';
 import { providers } from './providers';
 import * as metrics from './metrics';
@@ -24,7 +25,21 @@ export async function processJob(job: Job) {
 
   // Before the attempt is counted: a rate-limited job has not been tried, so it
   // is deferred, not failed, and uses none of its retry budget.
-  if (provider && !(await acquireSendToken(job.channel, provider.vendor, job.priority))) {
+  let granted = true;
+  if (provider) {
+    try {
+      granted = await acquireSendToken(job.channel, provider.vendor, job.priority);
+    } catch (err) {
+      // The job is already popped: losing it to a Redis hiccup is worse than a
+      // short deferral. If this defer fails too, the throw propagates.
+      console.error(
+        `rate limit check failed for ${job.job_id}, deferring:`,
+        err instanceof Error ? err.message : String(err),
+      );
+      return deferJob(job, rateLimitDeferMs());
+    }
+  }
+  if (!granted) {
     await metrics.incr('ns_rate_limited_total', { channel: job.channel, priority: job.priority });
     return deferJob(job, rateLimitDeferMs());
   }
@@ -148,6 +163,17 @@ export async function processJob(job: Job) {
 }
 
 /**
+ * Parse every env value processJob reads per job. A bad value would otherwise
+ * throw after the job was popped and drop it, so the worker checks at boot and
+ * exits instead, like an invalid pool config.
+ */
+export function validateWorkerConfig(env: NodeJS.ProcessEnv = process.env): void {
+  for (const channel of Object.keys(providers)) bucketsFor(channel, env);
+  rateLimitDeferMs(env);
+  providerTimeoutMs(env);
+}
+
+/**
  * Keep the provider balance gauge fresh. Insufficient balance fails every send
  * permanently and looks exactly like a bad template from the outside, so it
  * needs its own signal rather than being inferred from the error stream. Runs
@@ -177,6 +203,7 @@ if (process.argv.includes('worker')) {
   // nothing drains. Crash loudly instead so the orchestrator restarts it.
   // Fail fast on bad pool config: a worker that cannot size its pools must not
   // start half-configured.
+  validateWorkerConfig();
   startPools(poolConfig());
 }
 
