@@ -191,7 +191,8 @@ The admin API under `/v1/admin/` is listed in [Admin API](#admin-api).
 
 Templates and routing policies are managed over HTTP. Every route needs the usual signed
 headers **and** a key id listed in `NS_ADMIN_KEY_IDS` (otherwise `403 admin scope required`).
-`NS_NETWORK` must be set (otherwise `503 network_not_configured`). Request bodies are strict:
+`NS_NETWORK` must be set (otherwise `503 network_not_configured`). A database failure answers
+`503 database_unavailable`; the query and its parameters are never logged or returned. Request bodies are strict:
 unknown keys return `400`.
 
 | Method | Path | Purpose |
