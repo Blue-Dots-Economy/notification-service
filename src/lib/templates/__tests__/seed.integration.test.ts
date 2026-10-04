@@ -12,16 +12,17 @@ import { listTemplates, createTemplateDraft } from '../repo';
 import { seedBuiltinTemplates } from '../seed';
 
 beforeAll(async () => { await runMigrations(); });
-afterAll(async () => { await closeDb(); });
+afterAll(async () => { delete process.env.SMS_LOGIN_OTP_TEMPLATE_ID; await closeDb(); });
 beforeEach(async () => {
   process.env.NS_NETWORK = 'test_net';
   delete process.env.SMS_LOGIN_OTP_BODY;
+  process.env.SMS_LOGIN_OTP_TEMPLATE_ID = 'flow-otp';
   sms.current = { name: 'sms', vendor: 'msg91', renders: 'provider', templates: { login_otp: 'flow-otp' }, bodies: undefined };
   await getPool().query(`DELETE FROM notification_policy; DELETE FROM template;`);
 });
 
 describe('seedBuiltinTemplates', () => {
-  it('seeds an active msg91 login_otp from the provider id', async () => {
+  it('seeds an active msg91 login_otp from SMS_LOGIN_OTP_TEMPLATE_ID', async () => {
     expect(await seedBuiltinTemplates()).toBe('seeded_active');
     const [t] = await listTemplates({ channel: 'sms', templateKey: 'login_otp' });
     expect(t).toMatchObject({ status: 'active', provider: 'msg91', providerTemplateId: 'flow-otp', createdBy: 'system:seed' });
@@ -40,6 +41,29 @@ describe('seedBuiltinTemplates', () => {
     expect(await seedBuiltinTemplates()).toBe('seeded_draft');
   });
 
+  it('never publishes msg91\'s hardcoded fallback id when SMS_LOGIN_OTP_TEMPLATE_ID is unset', async () => {
+    delete process.env.SMS_LOGIN_OTP_TEMPLATE_ID;
+    // The provider map still carries a literal fallback; the seed must ignore it.
+    sms.current = { ...sms.current, templates: { login_otp: '6896c26d6eb66c66340e1242' } };
+    expect(await seedBuiltinTemplates()).toBe('skipped_no_id');
+    expect(await listTemplates({ templateKey: 'login_otp' })).toHaveLength(0);
+    process.env.SMS_LOGIN_OTP_TEMPLATE_ID = '   ';
+    expect(await seedBuiltinTemplates()).toBe('skipped_no_id');
+    expect(await listTemplates({ templateKey: 'login_otp' })).toHaveLength(0);
+  });
+
+  it('seeds the new vendor and retires the old vendor\'s active row on a vendor flip', async () => {
+    expect(await seedBuiltinTemplates()).toBe('seeded_active');
+    sms.current = { name: 'sms', vendor: 'pinnacle', renders: 'ns', templates: { login_otp: '1107' }, bodies: { login_otp: '{{message}} is your OTP' } };
+    expect(await seedBuiltinTemplates()).toBe('seeded_active');
+    const rows = await listTemplates({ templateKey: 'login_otp' });
+    expect(rows).toHaveLength(2);
+    expect(rows.find((t) => t.provider === 'msg91')).toMatchObject({ status: 'retired', providerTemplateId: 'flow-otp' });
+    expect(rows.find((t) => t.provider === 'pinnacle')).toMatchObject({ status: 'active', providerTemplateId: '1107', version: 2 });
+    // A second boot on the new vendor leaves it alone.
+    expect(await seedBuiltinTemplates()).toBe('exists');
+  });
+
   it('never touches an existing login_otp', async () => {
     await createTemplateDraft({ channel: 'sms', templateKey: 'login_otp', providerTemplateId: 'admin-made' }, 'admin');
     expect(await seedBuiltinTemplates()).toBe('exists');
@@ -56,7 +80,7 @@ describe('seedBuiltinTemplates', () => {
     delete process.env.NS_NETWORK;
     expect(await seedBuiltinTemplates()).toBe('skipped_no_network');
     process.env.NS_NETWORK = 'test_net';
-    sms.current = { ...sms.current, templates: { login_otp: '' } };
+    sms.current = { name: 'sms', vendor: 'pinnacle', renders: 'ns', templates: { login_otp: '' }, bodies: { login_otp: '{{message}}' } };
     expect(await seedBuiltinTemplates()).toBe('skipped_no_id');
   });
 });

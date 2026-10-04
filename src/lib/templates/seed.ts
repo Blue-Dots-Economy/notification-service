@@ -7,10 +7,24 @@ import { createTemplateDraft, listTemplates, publishTemplate } from './repo';
 type SeedOutcome = 'seeded_active' | 'seeded_draft' | 'exists' | 'skipped_no_network' | 'skipped_no_id';
 
 /**
+ * The login_otp id this deployment explicitly configured for its SMS vendor, or
+ * undefined. Read from the environment directly rather than the provider map:
+ * msg91's map falls back to a hardcoded legacy flow id, which must never be
+ * published into the registry (the seed would never revisit it).
+ */
+function configuredLoginOtpId(sms: { vendor: string; templates: Record<string, string> }): string | undefined {
+  const id = sms.vendor === 'msg91' ? process.env.SMS_LOGIN_OTP_TEMPLATE_ID : sms.templates.login_otp;
+  return id?.trim() || undefined;
+}
+
+/**
  * Bring the one template NS already names — `login_otp` on SMS — into the
  * registry, so login OTP resolves through it from the first deploy. Runs every
- * boot and does nothing once any login_otp row exists: an admin's edits always
- * win over environment defaults.
+ * boot and does nothing once a login_otp row exists for the deployment's
+ * current SMS vendor: an admin's edits always win over environment defaults.
+ * If rows exist only for another vendor (the deployment switched vendor), the
+ * current vendor's configured template is seeded and published, which retires
+ * the old vendor's active row — its ids mean nothing to the new vendor.
  *
  * Replicas booting together serialise on a session advisory lock held on a
  * dedicated connection, so the existence check and the create+publish cannot
@@ -37,11 +51,11 @@ export async function seedBuiltinTemplates(): Promise<SeedOutcome> {
 }
 
 async function seedLocked(): Promise<SeedOutcome> {
-  const existing = await listTemplates({ channel: 'sms', templateKey: 'login_otp' });
-  if (existing.length > 0) return 'exists';
-
   const sms = providers.sms;
-  const id = sms?.templates.login_otp;
+  const existing = await listTemplates({ channel: 'sms', templateKey: 'login_otp' });
+  if (sms && existing.some((t) => t.provider === sms.vendor)) return 'exists';
+
+  const id = sms ? configuredLoginOtpId(sms) : undefined;
   if (!sms || !id) {
     console.log('login_otp is not configured for the SMS provider; template not seeded');
     return 'skipped_no_id';
