@@ -88,12 +88,13 @@ is for local runs only).
 | `DATABASE_USER` | required | |
 | `DATABASE_PASSWORD` | required | |
 | `DATABASE_PORT` | `5432` | |
-| `DATABASE_POOL_MAX` | `10` | |
+| `DATABASE_POOL_MAX` | `10` | Integer, at least 2 |
 | `DATABASE_CONNECT_TIMEOUT_MS` | `2000` | Connect wait |
 | `DATABASE_QUERY_TIMEOUT_MS` | `5000` | Client and server-side query timeout |
 | `DATABASE_SSL` | `disable` | `disable` or `require`; `require` verifies the certificate, so supply the CA via `NODE_EXTRA_CA_CERTS` |
 | `NS_NETWORK` | `unknown` | Network recorded on each event |
 | `PARTITION_MAINTENANCE_INTERVAL_MS` | 6 hours | Partition pre-creation interval |
+| `RECOVERY_MAX_AGE_HOURS` | `24` | Open sends older than this are marked failed by recovery, not re-sent |
 
 A normal-priority `/notify` that cannot be recorded returns
 `503 {"error": "audit store unavailable", "enqueued": false}` and the dedupe

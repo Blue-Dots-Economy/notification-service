@@ -37,7 +37,8 @@ This is a **Fastify notification service** that queues and asynchronously proces
    - Boot order: `loadSecrets` → migrations (advisory lock) → partition maintenance →
      `recoverLostJobs` → listen → fork worker. Nothing may touch a table before its migration
      lands, and recovery runs before the worker drains so recovered jobs join the queue in order.
-     Any failure exits non-zero. A periodic recovery sweep runs every 5 minutes after boot.
+     A failed migration or invalid config exits non-zero; a failed **boot recovery does not** — it
+     is logged and the periodic sweep (every 5 minutes) retries.
    - Spawns one background worker process
 
 2. **Request Pipeline** (e.g., `POST /notify`)
@@ -85,10 +86,29 @@ Postgres is the record of every send; Redis is only the dispatch queue. Code: `s
 - **Realtime is queue-first.** The audit write is fire-and-forget so a slow database never delays
   an OTP. It persists the recipient and variable **names only, never values**, and keeps no job
   copy, so realtime sends are **not recoverable** after a Redis loss (the user requests a new code).
+- **Redaction is sticky.** `/notify` sets `audit.redactValues` (true for realtime) on the job, and
+  `toAcceptedRecord` keys on it, not on the current priority: a DLQ replay of an OTP as `other`
+  still persists names only and no job copy. Jobs without the flag fall back to the priority.
+- If the Redis push fails after the record was written, the attempt is stamped `failed`
+  (`enqueue failed`, best-effort) before the error propagates, so recovery never sends it later.
+- `x-correlation-id` is trimmed and capped at **128** chars; blank falls back to the job id.
+- The persisted payload never holds email attachment bodies (filename, contentType and size
+  only). The **job copy keeps them**: recovery re-pushes that copy. Persisted `error` strings are
+  capped at 500 chars.
+- DB errors are logged through `describeDbError` (`src/lib/db/errors.ts`): Postgres code + driver
+  message only. `DrizzleQueryError.message` embeds every bound parameter (recipients, variables,
+  the job) and must never be logged.
 
 **Worker stamps are best-effort.** Realtime-priority stamps are fire-and-forget (never on the send
 path); normal-priority stamps are awaited but bounded by the pool timeouts. A failed stamp never
 turns a delivered message into a retry; it is counted in `ns_audit_write_failures_total{stage}`.
+
+**Attempt markers.** Right after deciding a job's fate and **before** the stamp, the worker writes
+`ns:attempt:<attemptId>` = `<sent|retry|failed>:<attemptNo>` (TTL 7 days, best-effort). The number
+is the attempt the matching stamp would write (`retry` → the next attempt), so a marker left by an
+earlier attempt never hides a later attempt's crash. A failed `sent` stamp therefore no longer
+leads to a re-send. A double failure (stamp fails **and** Redis loses the marker) can still
+re-send: delivery is at-least-once.
 
 **Status model.** Rows are upserted monotonically on `(attempt_no, status_rank)`, so a late or
 replayed stamp cannot move a row backwards. An event's status mirrors its *current* attempt, so it
@@ -97,11 +117,19 @@ can read `accepted` again when a retry is queued. A DLQ replay is a **new** atte
 
 **Recovery (`recoverLostJobs`).** `ns:epoch` in Redis means "Redis still has its data".
 - If it is missing, the holder of a short `ns:recovery` lock re-queues recoverable open attempts
-  last touched **before Redis started** (uses `INFO server` uptime), all inside one Postgres
-  transaction, and sets the epoch only after commit. NS therefore needs `INFO` allowed on Redis; a
-  cluster with `INFO` disabled crash-loops at boot when the epoch is missing, **including the
-  first deploy**.
-- Stale `dispatching` rows (> 10 min) are always re-queued: at-least-once by design.
+  last touched **before Redis started** (uses `INFO server` uptime) and sets the epoch only after
+  every batch committed. NS therefore needs `INFO` allowed on Redis; with `INFO` disabled every
+  recovery run fails while the epoch is missing (**including the first deploy**), so lost work is
+  never recovered.
+- Stale `dispatching` rows (> 10 min) are re-queued: at-least-once by design.
+- Every candidate (recoverable, with a job copy) is resolved in order: its **attempt marker**
+  (`sent`/`failed` → that state is stamped, `retry` → left alone, the job is in the retry set);
+  then **age** — created more than `RECOVERY_MAX_AGE_HOURS` (default 24) ago → marked `failed`
+  (`abandoned: not delivered within recovery window`), counted in `ns_recovery_abandoned_total`;
+  otherwise re-queued.
+- Work runs in keyset batches of 500 (`FOR UPDATE SKIP LOCKED`), each its own transaction with
+  `SET LOCAL statement_timeout = '60s'` and one Redis `MULTI` push; a failed push rolls back that
+  batch only. A connection whose `ROLLBACK` fails is destroyed (`release(err)`).
 - A `FLUSHALL` without a Redis restart is **not** fully recovered (only stale `dispatching` rows).
 - **Never delete `ns:epoch` by hand.** It triggers a full re-queue of open recoverable attempts,
   which sends them again.
@@ -112,10 +140,16 @@ can read `accepted` again when a retry is queued. A DLQ replay is a **new** atte
 their DDL lives in custom migrations (`drizzle/0000_audit_tables.sql`) and their query-side
 definitions in `src/lib/db/partitioned.ts`. Add new partitioned DDL with
 `pnpm db:generate --custom --name=<x>` and change `partitioned.ts` in the same commit. Never
-hand-edit generated migrations. `pg_partman` lives in schema `partman`; maintenance is driven by NS
+hand-edit generated migrations. Migrations run on a dedicated short-lived pool with **no**
+statement/query timeout (so the advisory-lock wait is unbounded too, intended); the service pool
+keeps its 5s bounds. `pg_partman` lives in schema `partman`; maintenance is driven by NS
 (`PARTITION_MAINTENANCE_INTERVAL_MS`, default 6h; no background worker, which would need a
-cluster-wide `shared_preload_libraries` change). There is no retention until #65, so nothing is
-dropped today.
+cluster-wide `shared_preload_libraries` change). Maintenance pre-makes partitions but does **not**
+move rows out of a default partition, and a row in the default for a future range makes
+`run_maintenance` skip that partition set. Each tick therefore runs
+`partman.check_default(p_exact_count := false)`, logs a warning and sets
+`ns_partition_default_rows{parent}` (1 = non-empty); move the rows with
+`partman.partition_data_proc`. There is no retention until #65, so nothing is dropped today.
 
 ### Request Signing (Authentication)
 
@@ -276,7 +310,8 @@ Required for persistence and Redis:
 - `REDIS_PASSWORD` — required; NS refuses to start without it. `REDIS_ALLOW_NO_AUTH=true` lifts that
   for **local/test only**.
 - `DATABASE_HOST`, `DATABASE_NAME`, `DATABASE_USER`, `DATABASE_PASSWORD` — all required (no
-  localhost fallback). `DATABASE_PORT` (5432), `DATABASE_POOL_MAX` (10).
+  localhost fallback). `DATABASE_PORT` (5432), `DATABASE_POOL_MAX` (10; integer **≥ 2** — the
+  migration lock session and the migrator each hold a connection).
 - `DATABASE_CONNECT_TIMEOUT_MS` (default 2000) and `DATABASE_QUERY_TIMEOUT_MS` (default 5000, used
   for both `query_timeout` and `statement_timeout`) bound every database wait, so an unreachable
   database cannot hold the worker loop.
@@ -284,6 +319,8 @@ Required for persistence and Redis:
   `require`. `require` **verifies** the certificate, so supply the RDS CA via `NODE_EXTRA_CA_CERTS`.
 - `NS_NETWORK` — optional until #62; recorded on each event, `unknown` when unset.
 - `PARTITION_MAINTENANCE_INTERVAL_MS` — optional, default 6h.
+- `RECOVERY_MAX_AGE_HOURS` — optional, default 24, positive integer (invalid fails boot). Open
+  recoverable sends older than this are marked failed by recovery instead of sent late.
 
 Required for providers (varies by implementation):
 - Email transport — **one** of `SMTP_AWS_SES=true` (+ AWS SESv2 credentials) or
@@ -339,7 +376,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 263 tests across 18 files. The unit suite runs in about a second because Redis
+vitest 4, 295 unit tests across 23 files (plus 35 integration tests). The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
@@ -399,6 +436,8 @@ live at scrape time rather than counted, so they cannot drift.
 | `ns_sms_provider_error_total` | counter | `provider`, `code` (`EC1003`, `HTTP_502`, `OTHER`) |
 | `ns_job_dlq_total` | counter | `channel`, `reason` |
 | `ns_audit_write_failures_total` | counter | `stage` (`dispatching`/`sent`/`queued`/`failed`) |
+| `ns_recovery_abandoned_total` | counter | — |
+| `ns_partition_default_rows` | gauge | `parent` (1 = default partition non-empty) |
 | `ns_provider_balance` | gauge | `provider` |
 | `ns_provider_balance_updated_at` | gauge | `provider` |
 | `ns_provider_balance_poll_failures_total` | counter | `provider`, `reason` |
