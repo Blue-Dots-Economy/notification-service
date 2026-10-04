@@ -1,5 +1,6 @@
 import Fastify from 'fastify';
 import { adminTemplateRoutes } from './routes/admin-templates';
+import { adminPolicyRoutes } from './routes/admin-policies';
 import { docsRoutes } from './routes/docs';
 import { metricsRoutes } from './routes/metrics';
 import { notifyRoutes } from './routes/notify';
@@ -13,6 +14,7 @@ const app = Fastify({ logger: true });
 
 app.register(docsRoutes);
 app.register(adminTemplateRoutes);
+app.register(adminPolicyRoutes);
 app.register(notifyRoutes);
 app.register(providerRoutes);
 app.register(metricsRoutes);
