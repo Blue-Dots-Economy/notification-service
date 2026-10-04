@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { check, integer, jsonb, pgTable, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { check, index, integer, jsonb, pgTable, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 
 /**
  * Tables drizzle-kit manages (db:generate diffs this file).
@@ -112,5 +112,8 @@ export const idempotencyKey = pgTable(
     response: jsonb('response'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [primaryKey({ columns: [t.network, t.key] })],
+  (t) => [
+    primaryKey({ columns: [t.network, t.key] }),
+    index('idempotency_key_created_at_idx').on(t.createdAt),
+  ],
 );
