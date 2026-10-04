@@ -6,9 +6,11 @@ import type { Job } from 'src/types';
 
 /**
  * Redis is the dispatch queue; Postgres is the record. A Redis that restarts
- * without its data (or is flushed) loses queued work silently. NS detects that
- * with an epoch key it writes once and never expires: absent epoch = lost data.
- * Redis must run with `noeviction` so the epoch key is never dropped.
+ * without its data loses queued work silently. NS detects that with an epoch
+ * key it writes once and never expires: absent epoch = Redis lost its data.
+ * Recovery keys off Redis uptime, so it covers a restart; a FLUSHALL without a
+ * restart is only partly recovered (stale `dispatching` rows). Redis must run
+ * with `noeviction` so the epoch key is never dropped.
  */
 export const REDIS_EPOCH_KEY = 'ns:epoch';
 export const REDIS_RECOVERY_LOCK_KEY = 'ns:recovery';

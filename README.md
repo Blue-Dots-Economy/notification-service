@@ -42,7 +42,8 @@ src/
 
 - Node.js 24+
 - pnpm
-- Redis 6+
+- Redis 6+ (password set, `noeviction`)
+- PostgreSQL 17 with `pg_partman` (the compose image in `docker/postgres` has it)
 - Provider credentials for the providers you enable
 
 ## Setup
@@ -54,11 +55,15 @@ cp example.env .env
 
 Fill `.env` with the credentials required by the provider implementations.
 
-Start Redis:
+Start Postgres and Redis:
 
 ```bash
-docker compose up redis
+docker compose up -d postgres redis
 ```
+
+The compose Postgres publishes host port 5432 (it collides with a local
+Postgres). `docker/postgres/init.sql` runs only on the first boot of the
+volume; run `docker volume rm notification-service-postgres` to re-init.
 
 Start the API and worker:
 
@@ -68,6 +73,34 @@ pnpm dev
 
 The API listens on `SERVER_PORT` or `3000` by default. `src/server.ts` also
 spawns one background worker process.
+
+### Persistence
+
+Postgres is the record of every send; Redis is only the queue. Migrations run
+on boot, and NS will not start without a reachable database. The `notification`
+database must exist first. Set `REDIS_PASSWORD` too (`REDIS_ALLOW_NO_AUTH=true`
+is for local runs only).
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `DATABASE_HOST` | required | |
+| `DATABASE_NAME` | required | `notification` |
+| `DATABASE_USER` | required | |
+| `DATABASE_PASSWORD` | required | |
+| `DATABASE_PORT` | `5432` | |
+| `DATABASE_POOL_MAX` | `10` | |
+| `DATABASE_CONNECT_TIMEOUT_MS` | `2000` | Connect wait |
+| `DATABASE_QUERY_TIMEOUT_MS` | `5000` | Client and server-side query timeout |
+| `DATABASE_SSL` | `disable` | `disable` or `require`; `require` verifies the certificate, so supply the CA via `NODE_EXTRA_CA_CERTS` |
+| `NS_NETWORK` | `unknown` | Network recorded on each event |
+| `PARTITION_MAINTENANCE_INTERVAL_MS` | 6 hours | Partition pre-creation interval |
+
+A normal-priority `/notify` that cannot be recorded returns
+`503 {"error": "audit store unavailable", "enqueued": false}` and the dedupe
+claim is released, so retrying the same request is accepted. Realtime sends
+are queued first and recorded best-effort (recipient and variable names only).
+If Redis loses its data, NS re-queues recoverable open sends from Postgres at
+boot; this needs `INFO` allowed on Redis.
 
 ## Mail Transport
 
@@ -558,7 +591,9 @@ Manual retry resets the job attempt count to `0` and moves the job from
 
 When `job_id` is provided and the job is not present in `queue:dlq`, the API
 returns `404`. When retrying a batch, malformed DLQ entries are counted as
-`skipped`.
+`skipped`. Each replay is counted on the job, and a job that has already been
+replayed 3 times is left in the DLQ and listed in `refused`; the rest of the
+batch still proceeds.
 
 Response:
 
@@ -567,6 +602,7 @@ Response:
   "retried": ["uuid"],
   "retried_count": 1,
   "skipped": 0,
+  "refused": [],
   "not_found": []
 }
 ```

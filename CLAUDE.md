@@ -4,26 +4,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-This is a **Fastify notification service** that queues and asynchronously processes multi-channel notifications (email, SMS, WhatsApp). The API validates requests up front, writes them to Redis, and a background worker processes them with retry logic and deduplication.
+This is a **Fastify notification service** that queues and asynchronously processes multi-channel notifications (email, SMS, WhatsApp). The API validates requests up front, records each send in Postgres, queues it in Redis, and a background worker processes it with retry logic and deduplication. Postgres is the record; Redis is the queue.
 
 ## Quick Commands
 
 **Development:**
 - `pnpm install` — Install dependencies
 - `pnpm dev` — Start API and worker with hot-reload (tsx watch)
-- `docker compose up redis` — Start Redis (required)
+- `docker compose up -d postgres redis` — Start Postgres and Redis (both required). The compose
+  Postgres publishes host port **5432**, which collides with a local Postgres. `docker/postgres/init.sql`
+  runs only on the first boot of the volume; `docker volume rm notification-service-postgres` to re-init.
+- `pnpm db:generate --custom --name=<x>` — new partitioned-table DDL (see Persistence)
 
 **Build & Run:**
 - `pnpm build` — Compile TypeScript to `dist/`
 - `pnpm start` — Run compiled server from `dist/server.js`
 
 **Testing:**
-- `pnpm test` — vitest, single run. No Docker or Redis needed: Redis is faked in-process
-  (`src/lib/__tests__/redis-fake.ts`)
+- `pnpm test` — vitest, single run. No Docker, Redis or Postgres needed: Redis is faked in-process
+  (`src/lib/__tests__/redis-fake.ts`) and the database layer is mocked
 - `pnpm test:watch` — vitest in watch mode
-- `pnpm test:integration` — needs a **real** Redis. Locally:
-  `redis-server --port 6399 --daemonize yes` then
-  `REDIS_PORT=6399 pnpm test:integration`. In CI, the `redis` service container
+- `pnpm test:integration` — needs a **real** Redis **and** Postgres. The exact local env is in the
+  header of `vitest.integration.config.ts`. In CI, the `redis` service container and a pg_partman
+  Postgres built from `docker/postgres`
 
 ## Architecture
 
@@ -31,13 +34,16 @@ This is a **Fastify notification service** that queues and asynchronously proces
 
 1. **API Server** (`src/server.ts`) — Listens on `SERVER_PORT` (default 3000)
    - Registers routes from `src/routes/`
-   - Loads secrets for HMAC auth
+   - Boot order: `loadSecrets` → migrations (advisory lock) → partition maintenance →
+     `recoverLostJobs` → listen → fork worker. Nothing may touch a table before its migration
+     lands, and recovery runs before the worker drains so recovered jobs join the queue in order.
+     Any failure exits non-zero. A periodic recovery sweep runs every 5 minutes after boot.
    - Spawns one background worker process
 
 2. **Request Pipeline** (e.g., `POST /notify`)
    - HMAC signature validation (`src/plugins/request-auth.ts`)
    - Payload validation via Zod schemas
-   - Enqueue to Redis
+   - Record in Postgres and enqueue to Redis (order depends on priority; see Persistence)
 
 3. **Background Worker** (`src/lib/worker.ts`)
    - Runs in a separate process spawned by server
@@ -65,6 +71,51 @@ The retry score is epoch **milliseconds**. `getQueueMetrics()` exposes `retry_ol
 raw epoch-ms timestamp, and `retry_eta_seconds` converted to **seconds** — it previously
 returned the raw millisecond difference despite its name, so a 30-second retry read as
 `30000` (fixed in #50, with a regression test).
+
+### Persistence
+
+Postgres is the record of every send; Redis is only the dispatch queue. Code: `src/lib/db/`
+(client, `migrate.ts`, `maintenance.ts`, `schema.ts`, `partitioned.ts`) and `src/lib/audit/`
+(`store.ts`, `stamp.ts`, `status.ts`, `redact.ts`, `recover.ts`).
+
+**`/notify` ordering.**
+- **Normal priority is record-before-queue.** If the record cannot be written the send is refused:
+  `503 {"error": "audit store unavailable", "enqueued": false}`, and the dedupe claim is
+  **released** so the caller's retry is accepted rather than answered as a duplicate.
+- **Realtime is queue-first.** The audit write is fire-and-forget so a slow database never delays
+  an OTP. It persists the recipient and variable **names only, never values**, and keeps no job
+  copy, so realtime sends are **not recoverable** after a Redis loss (the user requests a new code).
+
+**Worker stamps are best-effort.** Realtime-priority stamps are fire-and-forget (never on the send
+path); normal-priority stamps are awaited but bounded by the pool timeouts. A failed stamp never
+turns a delivered message into a retry; it is counted in `ns_audit_write_failures_total{stage}`.
+
+**Status model.** Rows are upserted monotonically on `(attempt_no, status_rank)`, so a late or
+replayed stamp cannot move a row backwards. An event's status mirrors its *current* attempt, so it
+can read `accepted` again when a retry is queued. A DLQ replay is a **new** attempt row (fresh
+`attemptId`, same event).
+
+**Recovery (`recoverLostJobs`).** `ns:epoch` in Redis means "Redis still has its data".
+- If it is missing, the holder of a short `ns:recovery` lock re-queues recoverable open attempts
+  last touched **before Redis started** (uses `INFO server` uptime), all inside one Postgres
+  transaction, and sets the epoch only after commit. NS therefore needs `INFO` allowed on Redis; a
+  cluster with `INFO` disabled crash-loops at boot when the epoch is missing, **including the
+  first deploy**.
+- Stale `dispatching` rows (> 10 min) are always re-queued: at-least-once by design.
+- A `FLUSHALL` without a Redis restart is **not** fully recovered (only stale `dispatching` rows).
+- **Never delete `ns:epoch` by hand.** It triggers a full re-queue of open recoverable attempts,
+  which sends them again.
+- Redis must run with `maxmemory-policy noeviction` so the epoch key is never evicted (the compose
+  default is `noeviction`; the shared production Redis already uses it).
+
+**Schema and migrations.** The audit tables are partitioned and excluded from `drizzle.config.ts`;
+their DDL lives in custom migrations (`drizzle/0000_audit_tables.sql`) and their query-side
+definitions in `src/lib/db/partitioned.ts`. Add new partitioned DDL with
+`pnpm db:generate --custom --name=<x>` and change `partitioned.ts` in the same commit. Never
+hand-edit generated migrations. `pg_partman` lives in schema `partman`; maintenance is driven by NS
+(`PARTITION_MAINTENANCE_INTERVAL_MS`, default 6h; no background worker, which would need a
+cluster-wide `shared_preload_libraries` change). There is no retention until #65, so nothing is
+dropped today.
 
 ### Request Signing (Authentication)
 
@@ -186,12 +237,13 @@ See README for the full request/response contract.
 - `providers.ts` — Provider discovery endpoints
 - `metrics.ts` — Queue metrics endpoint (HMAC-authed JSON) **and** `/metrics`,
   the unauthenticated Prometheus scrape endpoint
-- `retry.ts` — Manual DLQ retry endpoint
+- `retry.ts` — Manual DLQ retry endpoint (`refused` in the response; see DLQ replay cap)
 
 **Library** (`src/lib/`):
 - `queue.ts` — Redis queue and retry helpers
 - `metrics.ts` — Redis-backed Prometheus counters/gauges (see below)
 - `worker.ts` — Background job processor loop
+- `db/`, `audit/` — Postgres client, migrations, partition maintenance, audit store, stamps, recovery (see Persistence)
 - `auth/secrets.ts` — Load signing secrets from the JSON file at `INTERNAL_SECRETS_JSON`
 - `providers/` — Provider implementations (auto-loaded)
 - `utils/openapi.ts` — OpenAPI document builder
@@ -219,6 +271,19 @@ Required for API operation:
 - `INTERNAL_SECRETS_JSON` — **path to a JSON file**, not an inline secret. `loadSecrets()`
   reads it at boot and throws if the variable is unset. Shape:
   `{"jobstack": {"secret": "ns_jobstack_secret-key"}}`
+
+Required for persistence and Redis:
+- `REDIS_PASSWORD` — required; NS refuses to start without it. `REDIS_ALLOW_NO_AUTH=true` lifts that
+  for **local/test only**.
+- `DATABASE_HOST`, `DATABASE_NAME`, `DATABASE_USER`, `DATABASE_PASSWORD` — all required (no
+  localhost fallback). `DATABASE_PORT` (5432), `DATABASE_POOL_MAX` (10).
+- `DATABASE_CONNECT_TIMEOUT_MS` (default 2000) and `DATABASE_QUERY_TIMEOUT_MS` (default 5000, used
+  for both `query_timeout` and `statement_timeout`) bound every database wait, so an unreachable
+  database cannot hold the worker loop.
+- `DATABASE_SSL` — `disable` (default; parity with the other services on the shared RDS) or
+  `require`. `require` **verifies** the certificate, so supply the RDS CA via `NODE_EXTRA_CA_CERTS`.
+- `NS_NETWORK` — optional until #62; recorded on each event, `unknown` when unset.
+- `PARTITION_MAINTENANCE_INTERVAL_MS` — optional, default 6h.
 
 Required for providers (varies by implementation):
 - Email transport — **one** of `SMTP_AWS_SES=true` (+ AWS SESv2 credentials) or
@@ -274,8 +339,8 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 3, 164 tests across 13 files. The whole suite runs in well under a second because Redis
-is a **fake**, not a container.
+vitest 4, 263 tests across 18 files. The unit suite runs in about a second because Redis
+is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
 connection on import and keeps the test process alive until vitest times out. `vi.mock` resolves
@@ -299,7 +364,7 @@ backoff ladder (5s → 10 → 20 → 40) and DLQ-on-exhaustion. It mocks `../que
 about which queue call is made, not Redis behaviour) and must mock `../providers`, which
 auto-discovers by `require`-ing each `index.js` and so is not importable from source.
 
-`queue.integration.test.ts` runs against a **real** Redis via `pnpm test:integration`, covering
+The integration suite (`pnpm test:integration`) needs a **real** Redis and Postgres (`docker compose up -d postgres`). `queue.integration.test.ts` covers
 the one thing a fake cannot: that `popScheduledRetries` claims atomically. Against the old
 two-round-trip implementation, eight concurrent claimers returned **400 claims for 50 jobs** —
 every retry sent eight times.
@@ -308,6 +373,13 @@ every retry sent eight times.
 - `mainLoop`'s priority ordering (realtime → due retries → other) — it is an infinite loop.
 - Provider implementations against the real vendors (SES/Twilio/MSG91/Pinnacle network calls).
   The SMS adapters are covered at the request/response boundary with `fetch` stubbed.
+
+### DLQ replay cap
+
+`MAX_REPLAYS = 3` (`src/lib/queue.ts`). Each DLQ replay increments the job's `replays`; once it has been replayed 3 times, a further
+replay is refused. The drain **skips** capped entries (they stay in the DLQ),
+reports them in `refused`, and continues, so one capped job cannot block the rest. `/failed/retry`
+responds `{retried, retried_count, skipped, refused, not_found}`.
 
 ## Observability
 
@@ -454,9 +526,9 @@ Import helpers from `src/lib/queue.ts`:
 ## Deployment Notes
 
 - **Worker process:** One worker is spawned alongside the API server in the same Node process. For scale, spawn separate worker processes pointing to the same Redis instance.
-- **Redis requirement:** Redis 6+ (uses sorted sets for retries, lists for queues).
-- **Stateless API:** The server itself is stateless; all state is in Redis. Multiple API instances can run behind a load balancer.
-- **Docker:** `Dockerfile` and `docker-compose.yaml` included. Compose also starts Redis service.
+- **Redis requirement:** Redis 6+ (uses sorted sets for retries, lists for queues), `noeviction`, `INFO` allowed, password set.
+- **Postgres requirement:** the `notification` database must exist (bluedots-automation's common-services bootstrap creates it) **before this image is deployed**; NS exits at boot without it. Migrations run on boot under an advisory lock, so multiple API instances can start together behind a load balancer. The pod needs the RDS CA in `NODE_EXTRA_CA_CERTS` if `DATABASE_SSL=require`.
+- **Docker:** `Dockerfile` and `docker-compose.yaml` included. Compose also starts Postgres (pg_partman image from `docker/postgres`) and Redis.
 - **Node 24** — `dhi.io/node:24-alpine-dev` for the build/prod-deps stages and
   `dhi.io/node:24-alpine` for the runtime (three stages, not two — the runtime has
   no shell, so the production install happens in `prod-deps` and is copied in),
