@@ -6,8 +6,8 @@ import { renderTemplate } from '../lib/templates/render';
 import * as repo from '../lib/templates/repo';
 import { channelVendor } from '../lib/templates/vendors';
 import { TemplateError } from '../lib/templates/errors';
-import { requestAuth } from '../plugins/request-auth';
-import { requireAdmin } from '../plugins/require-admin';
+import { principalLabel } from '../lib/auth/principal';
+import { authenticate } from '../plugins/auth';
 import { sendAdminError } from './admin-errors';
 import { clearResolveCache } from '../lib/send/resolver-cache';
 
@@ -70,10 +70,8 @@ export function serializeTemplate(t: TemplateRow) {
   };
 }
 
-const actorOf = (headers: Record<string, unknown>) => String(headers['x-ns-key']);
-
 export async function adminTemplateRoutes(app: FastifyInstance) {
-  const preHandler = [requestAuth, requireAdmin];
+  const preHandler = authenticate({ scope: 'templates:admin' });
 
   app.get('/v1/admin/templates', { preHandler }, async (req, reply) => {
     const q = ListQuery.safeParse(req.query);
@@ -98,7 +96,7 @@ export async function adminTemplateRoutes(app: FastifyInstance) {
     try {
       const row = await repo.createTemplateDraft(
         { channel, templateKey: template_key, locale, ...toPatch(rest) },
-        actorOf(req.headers),
+        principalLabel(req.principal),
       );
       return reply.code(201).send(serializeTemplate(row));
     } catch (err) { return sendAdminError(reply, err); }
@@ -117,7 +115,7 @@ export async function adminTemplateRoutes(app: FastifyInstance) {
     const p = IdParams.safeParse(req.params);
     if (!p.success) return reply.code(400).send(z.formatError(p.error));
     try {
-      const row = await repo.publishTemplate(p.data.id, actorOf(req.headers));
+      const row = await repo.publishTemplate(p.data.id, principalLabel(req.principal));
       clearResolveCache(); // this pod sees the change now; others within the cache TTL
       return serializeTemplate(row);
     } catch (err) { return sendAdminError(reply, err); }

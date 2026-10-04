@@ -4,7 +4,11 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 // End to end over real Postgres + Redis: accept → queue → worker → audit.
 // Only the vendor (an SMS double that renders on the provider side, like
 // MSG91 Flow) and the HMAC check are stubbed.
-vi.mock('../../plugins/request-auth', () => ({ requestAuth: async () => {} }));
+vi.mock('../../plugins/auth', () => ({
+  authenticate: () => async (req: any) => {
+    req.principal = { kind: 'hmac', id: 'test-key', scopes: new Set(['notify:send', 'templates:admin']) };
+  },
+}));
 const sms = vi.hoisted(() => ({
   sendRendered: vi.fn(async (_args: unknown) => ({ ok: true as const, provider_message_id: 'pm-1' })),
 }));
@@ -19,7 +23,6 @@ vi.mock('../../lib/providers', () => ({
 }));
 
 process.env.NS_NETWORK = 'test_net';
-delete process.env.NS_ADMIN_KEY_IDS;
 
 const Fastify = (await import('fastify')).default;
 const redis = (await import('../../lib/redis')).default;

@@ -10,7 +10,8 @@ import { isOtpTemplate, toAcceptedRecord } from '../lib/audit/redact';
 import { stamp } from '../lib/audit/stamp';
 import { describeDbError } from '../lib/db/errors';
 import { urgentDefaultDeadlineS } from '../lib/deadline';
-import { requestAuth } from '../plugins/request-auth';
+import { principalLabel } from '../lib/auth/principal';
+import { authenticate } from '../plugins/auth';
 import { correlationIdFrom, MAX_CORRELATION_ID_LENGTH } from '../lib/correlation';
 import { notifyBodyLimitBytes } from '../lib/providers/email/attachments';
 
@@ -38,7 +39,7 @@ export async function notifyRoutes(app: FastifyInstance) {
   app.route({
     url: '/notify',
     method: 'POST',
-    preHandler: requestAuth,
+    preHandler: authenticate({ scope: 'notify:send', legacyHmacV1: true }),
     // Fastify's 1 MB default would reject every attachment-bearing request
     // (base64 inflates a 5 MB file to ~6.7 MB), so this route — and only this
     // route — is raised to the derived attachment budget. /failed/retry and the
@@ -99,7 +100,7 @@ export async function notifyRoutes(app: FastifyInstance) {
           redactValues: priority === 'realtime' || isOtpTemplate(body.template_id),
         },
       };
-      const source = String(req.headers['x-ns-key'] ?? 'unknown');
+      const source = principalLabel(req.principal);
       const record = toAcceptedRecord(job, source);
 
       if (priority === 'realtime') {

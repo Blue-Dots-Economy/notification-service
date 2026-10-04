@@ -1,7 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import * as queue from '../lib/queue';
-import { requestAuth } from '../plugins/request-auth';
+import { authenticate } from '../plugins/auth';
 
 const RetryFailedJobsSchema = z.object({
   job_id: z.string().optional(),
@@ -10,7 +10,7 @@ const RetryFailedJobsSchema = z.object({
 });
 
 export async function retryRoutes(app: FastifyInstance) {
-  app.post('/failed/retry', { preHandler: requestAuth }, async (req, reply) => {
+  app.post('/failed/retry', { preHandler: authenticate({ scope: 'templates:admin' }) }, async (req, reply) => {
     const parsed = RetryFailedJobsSchema.safeParse(req.body ?? {});
     if (!parsed.success)
       return reply.code(400).send(z.formatError(parsed.error));
