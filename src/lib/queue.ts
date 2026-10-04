@@ -165,6 +165,27 @@ export async function scheduleRetry(job: Job, delaySeconds: number) {
 }
 
 /**
+ * Schedule a retry and write its attempt marker in ONE MULTI, so the marker
+ * exists if and only if the retry is in the set. Written separately, a crash
+ * between the two would leave a `retry` marker for a job that was never
+ * scheduled, and recovery would skip that job forever. Throws if any command
+ * failed, like scheduleRetry.
+ */
+export async function scheduleRetryWithMarker(
+  job: Job,
+  delaySeconds: number,
+  marker?: { key: string; value: string; ttlSeconds: number },
+): Promise<void> {
+  const timestamp = Date.now() + delaySeconds * 1000;
+  const tx = redis.multi().zadd(RETRY_ZSET, timestamp.toString(), JSON.stringify(job));
+  if (marker) tx.set(marker.key, marker.value, 'EX', marker.ttlSeconds);
+  const results = await tx.exec();
+  if (!results) throw new Error('Redis MULTI aborted while scheduling a retry');
+  const failed = results.find(([err]) => err);
+  if (failed) throw failed[0];
+}
+
+/**
  * Claim-and-remove of due retries, in one atomic step.
  *
  * ZRANGEBYSCORE then ZREM of exactly the members returned, inside a single Lua

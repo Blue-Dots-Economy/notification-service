@@ -227,6 +227,14 @@ export class RedisFake {
         queued.push(() => this.lpush(key, value));
         return chain;
       },
+      zadd: (key: string, score: string | number, member: string) => {
+        queued.push(() => this.zadd(key, score, member));
+        return chain;
+      },
+      set: (key: string, value: string, ex: 'EX', ttlSeconds: number) => {
+        queued.push(() => this.set(key, value, ex, ttlSeconds));
+        return chain;
+      },
       llen: (key: string) => {
         queued.push(() => this.llen(key));
         return chain;

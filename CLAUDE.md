@@ -103,8 +103,11 @@ Postgres is the record of every send; Redis is only the dispatch queue. Code: `s
 path); normal-priority stamps are awaited but bounded by the pool timeouts. A failed stamp never
 turns a delivered message into a retry; it is counted in `ns_audit_write_failures_total{stage}`.
 
-**Attempt markers.** Right after deciding a job's fate and **before** the stamp, the worker writes
-`ns:attempt:<attemptId>` = `<sent|retry|failed>:<attemptNo>` (TTL 7 days, best-effort). The number
+**Attempt markers.** The worker writes `ns:attempt:<attemptId>` = `<sent|retry|failed>:<attemptNo>`
+(TTL 7 days). `sent`/`failed` are written right after the fate is decided and **before** the stamp
+(best-effort). `retry` is written **after** the `queued` stamp, in the **same MULTI** as the
+retry-set ZADD (`queue.scheduleRetryWithMarker`), so the marker exists iff the retry is scheduled:
+a crash before the MULTI leaves no marker and recovery re-queues the job. The number
 is the attempt the matching stamp would write (`retry` → the next attempt), so a marker left by an
 earlier attempt never hides a later attempt's crash. A failed `sent` stamp therefore no longer
 leads to a re-send. A double failure (stamp fails **and** Redis loses the marker) can still

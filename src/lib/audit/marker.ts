@@ -11,6 +11,10 @@ import type { Job } from 'src/types';
  * of re-queueing. A double failure (stamp fails AND Redis loses the marker)
  * can still re-send — delivery is at-least-once.
  *
+ * `sent`/`failed` are written on their own, best-effort. `retry` is written in
+ * the same MULTI as the retry-set ZADD (queue.scheduleRetryWithMarker), so it
+ * exists if and only if the retry was scheduled.
+ *
  * Value is `<fate>:<attemptNo>`, where attemptNo is the attempt number the
  * matching stamp would write (`retry` stamps the NEXT attempt as queued), so a
  * marker left by an earlier attempt never masks a later attempt's crash.
@@ -21,6 +25,17 @@ export const ATTEMPT_MARKER_TTL_SECONDS = 7 * 24 * 60 * 60;
 
 export function attemptMarkerKey(attemptId: string): string {
   return `ns:attempt:${attemptId}`;
+}
+
+/** Key/value/TTL of a marker, for callers that write it inside their own MULTI. */
+export function attemptMarker(
+  job: Job,
+  fate: AttemptFate,
+  attemptNo: number,
+): { key: string; value: string; ttlSeconds: number } | undefined {
+  const attemptId = job.audit?.attemptId;
+  if (!attemptId) return undefined;
+  return { key: attemptMarkerKey(attemptId), value: `${fate}:${attemptNo}`, ttlSeconds: ATTEMPT_MARKER_TTL_SECONDS };
 }
 
 /** Best-effort: never throws, so it can never change a send's outcome. */

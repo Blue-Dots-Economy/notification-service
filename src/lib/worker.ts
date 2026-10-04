@@ -3,7 +3,7 @@ import {
   popOther,
   popScheduledRetries,
   pushDLQ,
-  scheduleRetry,
+  scheduleRetryWithMarker,
 } from './queue';
 import { providers } from './providers';
 import * as metrics from './metrics';
@@ -11,7 +11,7 @@ import { Job } from 'src/types';
 import { ProviderSendResult } from 'src/types/provider';
 import { loadSecrets } from './auth/secrets';
 import { stamp } from './audit/stamp';
-import { markAttempt } from './audit/marker';
+import { attemptMarker, markAttempt } from './audit/marker';
 
 const MAX_RETRIES = 5;
 
@@ -124,11 +124,12 @@ export async function processJob(job: Job) {
     const delay = 5 * Math.pow(2, job.attempt - 1);
     console.log(`Retry scheduled in ${delay}s:`, job.job_id);
 
-    // Marker before stamp: if the stamp fails the row stays `dispatching`, and
-    // the marker tells recovery the job is already in the retry set.
-    await markAttempt(job, 'retry', job.attempt + 1);
+    // Stamp, then the retry ZADD and the `retry` marker in one MULTI: the
+    // marker exists iff the retry is scheduled, so if the stamp failed and the
+    // row stays `dispatching`, recovery leaves it to the retry set — and if the
+    // process dies before the MULTI, there is no marker and recovery re-queues.
     await stamp(job, { status: 'queued', attemptNo: job.attempt + 1, error: res.error });
-    return scheduleRetry(job, delay);
+    return scheduleRetryWithMarker(job, delay, attemptMarker(job, 'retry', job.attempt + 1));
   }
 
   // Marker before stamp: a failed `sent` stamp must not let recovery re-send.

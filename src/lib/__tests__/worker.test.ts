@@ -17,11 +17,15 @@ const { stamp } = vi.hoisted(() => ({ stamp: vi.fn(async () => {}) }));
 vi.mock('../audit/stamp', () => ({ stamp }));
 
 const { markAttempt } = vi.hoisted(() => ({ markAttempt: vi.fn(async () => {}) }));
-vi.mock('../audit/marker', () => ({ markAttempt }));
+vi.mock('../audit/marker', () => ({
+  markAttempt,
+  attemptMarker: (j: Job, fate: string, n: number) =>
+    j.audit ? { key: `ns:attempt:${j.audit.attemptId}`, value: `${fate}:${n}`, ttlSeconds: 604800 } : undefined,
+}));
 
 vi.mock('../queue', () => ({
   pushDLQ: vi.fn(async () => 1),
-  scheduleRetry: vi.fn(async () => 1),
+  scheduleRetryWithMarker: vi.fn(async () => 1),
   popRealtime: vi.fn(async () => null),
   popOther: vi.fn(async () => null),
   popScheduledRetries: vi.fn(async () => []),
@@ -89,7 +93,7 @@ describe('processJob — routing', () => {
   it('does not retry or dead-letter a delivered job', async () => {
     await processJob(job());
 
-    expect(queue.scheduleRetry).not.toHaveBeenCalled();
+    expect(queue.scheduleRetryWithMarker).not.toHaveBeenCalled();
     expect(queue.pushDLQ).not.toHaveBeenCalled();
   });
 
@@ -98,7 +102,7 @@ describe('processJob — routing', () => {
 
     expect(send).not.toHaveBeenCalled();
     expect(queue.pushDLQ).toHaveBeenCalledTimes(1);
-    expect(queue.scheduleRetry).not.toHaveBeenCalled();
+    expect(queue.scheduleRetryWithMarker).not.toHaveBeenCalled();
   });
 
   it('dead-letters an unknown template without attempting a send', async () => {
@@ -153,7 +157,7 @@ describe('processJob — backoff ladder on failure', () => {
       await processJob(j);
 
       expect(j.attempt).toBe(expectedAttempt);
-      expect(queue.scheduleRetry).toHaveBeenCalledWith(j, expectedDelay);
+      expect(queue.scheduleRetryWithMarker).toHaveBeenCalledWith(j, expectedDelay, undefined);
       expect(queue.pushDLQ).not.toHaveBeenCalled();
     },
   );
@@ -165,7 +169,7 @@ describe('processJob — backoff ladder on failure', () => {
 
     expect(j.attempt).toBe(5);
     expect(queue.pushDLQ).toHaveBeenCalledWith(j);
-    expect(queue.scheduleRetry).not.toHaveBeenCalled();
+    expect(queue.scheduleRetryWithMarker).not.toHaveBeenCalled();
   });
 
   it('dead-letters a job that somehow arrives past the limit', async () => {
@@ -174,7 +178,7 @@ describe('processJob — backoff ladder on failure', () => {
     await processJob(j);
 
     expect(queue.pushDLQ).toHaveBeenCalledTimes(1);
-    expect(queue.scheduleRetry).not.toHaveBeenCalled();
+    expect(queue.scheduleRetryWithMarker).not.toHaveBeenCalled();
   });
 
   it('gives four retries before the DLQ — 5s, 10s, 20s, 40s', async () => {
@@ -183,7 +187,7 @@ describe('processJob — backoff ladder on failure', () => {
     for (let i = 0; i < 5; i += 1) await processJob(j);
 
     expect(
-      (queue.scheduleRetry as unknown as { mock: { calls: unknown[][] } }).mock.calls.map(
+      (queue.scheduleRetryWithMarker as unknown as { mock: { calls: unknown[][] } }).mock.calls.map(
         (c) => c[1],
       ),
     ).toEqual([5, 10, 20, 40]);
@@ -215,7 +219,7 @@ describe('processJob — body resolution (providers that cannot render)', () => 
     expect(queue.pushDLQ).toHaveBeenCalledTimes(1);
     // Must not leak through as a raw id: the vendor would answer with a generic
     // "invalid template" and hide that this is simply unapproved copy.
-    expect(queue.scheduleRetry).not.toHaveBeenCalled();
+    expect(queue.scheduleRetryWithMarker).not.toHaveBeenCalled();
   });
 });
 
@@ -226,7 +230,7 @@ describe('processJob — permanent failures', () => {
     await processJob(job());
 
     expect(queue.pushDLQ).toHaveBeenCalledTimes(1);
-    expect(queue.scheduleRetry).not.toHaveBeenCalled();
+    expect(queue.scheduleRetryWithMarker).not.toHaveBeenCalled();
   });
 
   it('still retries a failure that is not marked permanent', async () => {
@@ -234,7 +238,7 @@ describe('processJob — permanent failures', () => {
 
     await processJob(job());
 
-    expect(queue.scheduleRetry).toHaveBeenCalledTimes(1);
+    expect(queue.scheduleRetryWithMarker).toHaveBeenCalledTimes(1);
     expect(queue.pushDLQ).not.toHaveBeenCalled();
   });
 
@@ -243,7 +247,7 @@ describe('processJob — permanent failures', () => {
 
     await processJob(job());
 
-    expect(queue.scheduleRetry).toHaveBeenCalledTimes(1);
+    expect(queue.scheduleRetryWithMarker).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -310,7 +314,7 @@ describe('processJob — a provider that throws must not lose the job', () => {
 
     await processJob(job());
 
-    expect(queue.scheduleRetry).toHaveBeenCalledTimes(1);
+    expect(queue.scheduleRetryWithMarker).toHaveBeenCalledTimes(1);
     expect(queue.pushDLQ).not.toHaveBeenCalled();
   });
 
@@ -372,12 +376,17 @@ describe('processJob attempt markers', () => {
     expect(markAttempt.mock.invocationCallOrder[0]).toBeLessThan(stamp.mock.invocationCallOrder[sentStamp]!);
   });
 
-  it('marks retry with the next attempt number before the queued stamp', async () => {
+  it('stamps queued, then schedules the retry and its marker together (no separate marker write)', async () => {
     send.mockResolvedValueOnce({ ok: false, error: 'timeout' });
-    await processJob(job());
-    expect(markAttempt).toHaveBeenCalledWith(expect.anything(), 'retry', 2);
-    expect(markAttempt.mock.invocationCallOrder[0]).toBeLessThan(stamp.mock.invocationCallOrder.at(-1)!);
-    expect(queue.scheduleRetry).toHaveBeenCalled();
+    const audit = { eventId: 'e', attemptId: 'att-1', createdAt: '2026-10-04T00:00:00.000Z', correlationId: 'c' };
+    await processJob(job({ audit }));
+    expect(markAttempt).not.toHaveBeenCalled();
+    expect(queue.scheduleRetryWithMarker).toHaveBeenCalledWith(expect.anything(), 5, {
+      key: 'ns:attempt:att-1', value: 'retry:2', ttlSeconds: 604800,
+    });
+    expect(stamp.mock.invocationCallOrder.at(-1)!).toBeLessThan(
+      vi.mocked(queue.scheduleRetryWithMarker).mock.invocationCallOrder[0]!,
+    );
   });
 
   it('marks failed on every dead-letter path', async () => {

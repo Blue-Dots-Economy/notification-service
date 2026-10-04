@@ -201,6 +201,49 @@ describe('getQueueMetrics', () => {
   });
 });
 
+describe('scheduleRetryWithMarker', () => {
+  const marker = { key: 'ns:attempt:a1', value: 'retry:2', ttlSeconds: 604800 };
+
+  it('issues the retry ZADD and the marker SET in one MULTI', async () => {
+    const multi = vi.spyOn(redis, 'multi');
+    const zadd = vi.spyOn(redis, 'zadd');
+    try {
+      await queue.scheduleRetryWithMarker(job({ job_id: 'r1' }), 10, marker);
+      expect(multi).toHaveBeenCalledTimes(1);
+      expect(zadd).toHaveBeenCalledTimes(1); // via the MULTI, not a separate call
+    } finally {
+      multi.mockRestore();
+      zadd.mockRestore();
+    }
+    expect(await redis.zcard('queue:retry')).toBe(1);
+    expect(await redis.get('ns:attempt:a1')).toBe('retry:2');
+  });
+
+  it('leaves neither the retry nor the marker when the MULTI fails', async () => {
+    const multi = vi.spyOn(redis, 'multi').mockImplementationOnce(() => {
+      const chain = {
+        zadd: () => chain,
+        set: () => chain,
+        exec: async () => { throw new Error('connection lost'); },
+      };
+      return chain as never;
+    });
+    try {
+      await expect(queue.scheduleRetryWithMarker(job({ job_id: 'r2' }), 10, marker)).rejects.toThrow('connection lost');
+    } finally {
+      multi.mockRestore();
+    }
+    expect(await redis.get('ns:attempt:a1')).toBeNull();
+    expect(await redis.zcard('queue:retry')).toBe(0);
+  });
+
+  it('schedules without a marker when the job has no audit ids', async () => {
+    await queue.scheduleRetryWithMarker(job({ job_id: 'r3' }), 10, undefined);
+    expect(await redis.zcard('queue:retry')).toBe(1);
+    expect(redis.strings.size).toBe(0);
+  });
+});
+
 describe('pushOtherMany', () => {
   it('pushes every job to the other queue in order', async () => {
     await queue.pushOtherMany([job({ job_id: 'm1' }), job({ job_id: 'm2' })]);
