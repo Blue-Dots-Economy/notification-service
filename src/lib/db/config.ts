@@ -36,6 +36,9 @@ export function loadDbConfig(env: NodeJS.ProcessEnv = process.env): PoolConfig {
   const port = positiveInt(env, 'DATABASE_PORT', 5432);
   const connectionTimeoutMillis = positiveInt(env, 'DATABASE_CONNECT_TIMEOUT_MS', 2000);
   const queryTimeout = positiveInt(env, 'DATABASE_QUERY_TIMEOUT_MS', 5000);
+  // Floor of 2: the migration lock session and the migrator each hold one.
+  const poolMax = positiveInt(env, 'DATABASE_POOL_MAX', 10);
+  if (poolMax < 2) throw new Error(`DATABASE_POOL_MAX must be at least 2, got '${env.DATABASE_POOL_MAX}'`);
 
   const ssl = (env.DATABASE_SSL ?? 'disable').trim().toLowerCase();
   if (ssl !== 'disable' && ssl !== 'require') {
@@ -49,7 +52,7 @@ export function loadDbConfig(env: NodeJS.ProcessEnv = process.env): PoolConfig {
     user: env.DATABASE_USER,
     password: env.DATABASE_PASSWORD,
     ssl: ssl === 'require' ? { rejectUnauthorized: true } : false,
-    max: Number(env.DATABASE_POOL_MAX ?? 10),
+    max: poolMax,
     connectionTimeoutMillis,
     query_timeout: queryTimeout,
     statement_timeout: queryTimeout,

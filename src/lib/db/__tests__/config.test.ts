@@ -53,4 +53,15 @@ describe('loadDbConfig', () => {
     expect(() => loadDbConfig({ ...base, DATABASE_CONNECT_TIMEOUT_MS: 'abc' })).toThrow('DATABASE_CONNECT_TIMEOUT_MS');
     expect(() => loadDbConfig({ ...base, DATABASE_QUERY_TIMEOUT_MS: '0' })).toThrow('DATABASE_QUERY_TIMEOUT_MS');
   });
+
+  it('reads DATABASE_POOL_MAX', () => {
+    expect(loadDbConfig({ ...base, DATABASE_POOL_MAX: '4' }).max).toBe(4);
+  });
+
+  it('rejects a DATABASE_POOL_MAX below 2 or not an integer', () => {
+    expect(() => loadDbConfig({ ...base, DATABASE_POOL_MAX: '1' })).toThrow('DATABASE_POOL_MAX must be at least 2');
+    expect(() => loadDbConfig({ ...base, DATABASE_POOL_MAX: 'abc' })).toThrow('DATABASE_POOL_MAX');
+    expect(() => loadDbConfig({ ...base, DATABASE_POOL_MAX: '2.5' })).toThrow('DATABASE_POOL_MAX');
+    expect(() => loadDbConfig({ ...base, DATABASE_POOL_MAX: '0' })).toThrow('DATABASE_POOL_MAX');
+  });
 });
