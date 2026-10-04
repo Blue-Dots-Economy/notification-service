@@ -48,25 +48,37 @@ This is a **Fastify notification service** that queues and asynchronously proces
 
 3. **Background Worker** (`src/lib/worker.ts`)
    - Runs in a separate process spawned by server
-   - Processes jobs from Redis queues in priority order:
-     1. Realtime queue (high priority, short block)
-     2. Due retry jobs from retry sorted set
-     3. Other queue (normal priority)
-   - Retries failed sends with exponential backoff
-   - Moves exhausted retries to dead-letter queue
+   - Runs worker pools, one per priority (urgent, normal, bulk), each loop on its own blocking
+     Redis connection, plus a retry scheduler that moves due retries back into their own queue
+   - Takes a vendor-quota token before every send; a denied job is deferred, not failed
+   - Retries failed sends with exponential backoff; expires jobs past their deadline
+   - Moves exhausted or permanently failed non-redacted jobs to the dead-letter queue
+   - See *Priority isolation* below
 
 ### Redis Queues
 
-Four Redis structures drive the queue model:
+Five Redis structures drive the queue model:
 
 ```
-queue:realtime  → List of high-priority jobs
-queue:other     → List of normal-priority jobs
-queue:retry     → Sorted set for delayed retries (score = Date.now() + delay, epoch MS)
+queue:realtime  → List of urgent jobs (internal priority `realtime`)
+queue:other     → List of normal jobs (internal priority `other`)
+queue:bulk      → List of bulk jobs
+queue:retry     → Sorted set for delayed retries and deferrals (score = Date.now() + delay, epoch MS)
 queue:dlq       → List of dead-letter jobs (max retries exhausted)
 ```
 
-The worker checks `queue:realtime` first but only blocks briefly, preventing starvation of `queue:other` and due retries.
+Each queue has its own pool of loops (`src/lib/pools.ts`), sized by
+`WORKER_URGENT_CONCURRENCY`, `WORKER_NORMAL_CONCURRENCY` and `WORKER_BULK_CONCURRENCY`
+(defaults 2 / 2 / 1; a value that is not a positive integer makes the worker exit at boot).
+Every loop owns one blocking connection (`redis.duplicate()`): a `BRPOP` blocks its connection,
+so a shared one would let a bulk pop hold up an urgent pop. A long bulk send therefore blocks only
+its own loop. Per-connection Redis errors are logged at most once a minute per message, with no
+values.
+
+The retry scheduler (one per worker) moves due members of `queue:retry` back to the queue of their
+own priority in one atomic Lua step, at most `RETRY_BATCH` (1000) per call, so a retry never
+changes pool. A queue or retry entry that is not JSON, or has no string `job_id`, is dead-lettered
+raw and logged without its content, never lost.
 
 The retry score is epoch **milliseconds**. `getQueueMetrics()` exposes `retry_oldest` as that
 raw epoch-ms timestamp, and `retry_eta_seconds` converted to **seconds** — it previously
@@ -370,7 +382,10 @@ skipped when `NS_NETWORK` is unset; a template that fails publish validation is 
 **Library** (`src/lib/`):
 - `queue.ts` — Redis queue and retry helpers
 - `metrics.ts` — Redis-backed Prometheus counters/gauges (see below)
-- `worker.ts` — Background job processor loop
+- `worker.ts` — `processJob` (deadline, quota, send, retry/DLQ decision) and worker boot
+- `pools.ts` — Per-priority worker pools and the retry scheduler
+- `rate_limit.ts` — Split shared/reserved vendor quota
+- `deadline.ts` — Deadline and redaction helpers
 - `db/`, `audit/` — Postgres client, migrations, partition maintenance, audit store, stamps, recovery (see Persistence)
 - `auth/secrets.ts` — Load signing secrets from the JSON file at `INTERNAL_SECRETS_JSON`
 - `providers/` — Provider implementations (auto-loaded)
@@ -477,7 +492,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 378 unit tests across 34 files (plus 63 integration tests). The unit suite runs in about a second because Redis
+vitest 4, 423 unit tests across 38 files (plus 82 integration tests). The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
@@ -508,9 +523,48 @@ two-round-trip implementation, eight concurrent claimers returned **400 claims f
 every retry sent eight times.
 
 **Deliberately not covered yet:**
-- `mainLoop`'s priority ordering (realtime → due retries → other) — it is an infinite loop.
 - Provider implementations against the real vendors (SES/Twilio/MSG91/Pinnacle network calls).
   The SMS adapters are covered at the request/response boundary with `fetch` stubbed.
+
+### Priority isolation
+
+A bulk send must not delay an OTP, and it must not exhaust the vendor quota an OTP needs. Three
+mechanisms (`src/lib/pools.ts`, `rate_limit.ts`, `deadline.ts`, `worker.ts`):
+
+**Split vendor quota.** Every send, from `/notify`, retries and DLQ replays alike, takes a token
+first. Each channel and vendor has two token buckets, `rl:<channel>:<vendor>:shared` and
+`rl:<channel>:<vendor>:reserved`. Urgent takes `shared` first, then `reserved`; normal and bulk
+take `shared` only, so they can never consume the reserve. A denied job is **deferred** back to
+`queue:retry` after `RATE_LIMIT_DEFER_MS` (default 250) plus up to 50% jitter, and the attempt is
+**not** counted: a rate-limited job has not been tried. A token-check error (Redis hiccup) defers
+the same way rather than dropping the popped job. The refill is clamped to the bucket capacity and
+the key TTL is at least the time to refill, so an idle bucket expires cleanly.
+
+| Variable | Default | |
+|---|---|---|
+| `RATE_<CH>_PER_SEC` | sms 100, email 100, whatsapp 100 | Vendor rate, tokens per second; may be fractional |
+| `RATE_<CH>_BURST` | sms 40, email 50, whatsapp 10 | Bucket size |
+| `RATE_URGENT_SHARE` | `0.2` | Reserved fraction of rate and burst; `0 < share < 1` |
+| `RATE_LIMIT_DEFER_MS` | `250` | Deferral before jitter |
+| `PROVIDER_TIMEOUT_MS` | `10000` | Cap on every vendor call (HTTP, SMTP/SES, Pinnacle balance poll); a timeout is a retryable failure |
+| `URGENT_DEFAULT_DEADLINE_S` | `600` | Deadline the legacy `/notify` gives `realtime` jobs |
+
+`validateWorkerConfig` parses all of these at worker boot, and `server.ts` checks the deadline at
+API boot. A bad value exits the process; a value parsed per job would throw after the job was
+popped and drop it.
+
+**Deadlines.** `Job.deadline` is an absolute epoch-ms. Legacy `/notify` sets it for `realtime` jobs
+to now plus `URGENT_DEFAULT_DEADLINE_S`. `processJob` checks it first, and again before every
+deferral and before scheduling a retry. A job past its deadline is never sent: marker `failed`,
+status `expired` (the error keeps the last provider error, `deadline passed: <error>`),
+`ns_job_expired_total`, and never the DLQ. An OTP that arrives late is worse than none.
+
+**Redacted jobs are never dead-lettered.** A job with `audit.redactValues` (else `realtime`)
+that would dead-letter instead ends `failed`, with the marker set, and is counted in
+`ns_job_dropped_total{channel,reason}`; a DLQ entry would keep a live code at rest.
+`dropOrDeadLetter` in `worker.ts` is the only DLQ writer in the worker, and the log lines say
+`dropped (redacted, no DLQ)` or `→ DLQ` to match, with job ids only. Rollout: OTP jobs
+dead-lettered before this change stay in `queue:dlq` until ops inspect and clear them.
 
 ### DLQ replay cap
 
@@ -542,7 +596,10 @@ live at scrape time rather than counted, so they cannot drift.
 | `ns_provider_balance` | gauge | `provider` |
 | `ns_provider_balance_updated_at` | gauge | `provider` |
 | `ns_provider_balance_poll_failures_total` | counter | `provider`, `reason` |
-| `ns_queue_depth` | gauge | `queue` (`realtime`/`other`/`retry_count`/`dlq`) |
+| `ns_rate_limited_total` | counter | `channel`, `priority` |
+| `ns_job_expired_total` | counter | `channel` |
+| `ns_job_dropped_total` | counter | `channel`, `reason` |
+| `ns_queue_depth` | gauge | `queue` (`realtime`/`other`/`bulk`/`retry_count`/`dlq`) |
 | `ns_retry_eta_seconds` | gauge | — |
 
 Two constraints on this exposition that are easy to undo:

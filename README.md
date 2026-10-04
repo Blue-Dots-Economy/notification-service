@@ -95,6 +95,18 @@ is for local runs only).
 | `NS_NETWORK` | `unknown` | Network recorded on each event |
 | `PARTITION_MAINTENANCE_INTERVAL_MS` | 6 hours | Partition pre-creation interval |
 | `RECOVERY_MAX_AGE_HOURS` | `24` | Open sends older than this are marked failed by recovery, not re-sent |
+| `WORKER_URGENT_CONCURRENCY` | `2` | Urgent loops, each on its own Redis connection; must be a positive integer |
+| `WORKER_NORMAL_CONCURRENCY` | `2` | Normal loops |
+| `WORKER_BULK_CONCURRENCY` | `1` | Bulk loops |
+| `RATE_<CHANNEL>_PER_SEC` | `sms` 100, `email` 100, `whatsapp` 100 | Vendor rate for `SMS`, `EMAIL`, `WHATSAPP`; may be fractional |
+| `RATE_<CHANNEL>_BURST` | `sms` 40, `email` 50, `whatsapp` 10 | Bucket size |
+| `RATE_URGENT_SHARE` | `0.2` | Share of the quota only urgent sends can use; `0 < share < 1` |
+| `RATE_LIMIT_DEFER_MS` | `250` | Wait before a rate-limited job is retried (plus up to 50% jitter); the attempt is not counted |
+| `PROVIDER_TIMEOUT_MS` | `10000` | Cap on every vendor call; a timeout is a retryable failure |
+| `URGENT_DEFAULT_DEADLINE_S` | `600` | An urgent job older than this is expired unsent, never dead-lettered |
+
+An invalid value in any of these exits the worker at boot rather than dropping jobs later. Urgent
+sends take the shared quota first, then the reserved share; normal and bulk use the shared quota only.
 
 A normal-priority `/notify` that cannot be recorded returns
 `503 {"error": "audit store unavailable", "enqueued": false}` and the dedupe
