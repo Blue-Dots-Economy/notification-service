@@ -1,4 +1,6 @@
 import { ZodType } from 'zod';
+import type { Rendered } from '../lib/templates/render';
+import type { Email_attachment } from '../lib/providers/email/sendMailCore';
 
 export interface ProviderTemplateMap {
   [templateId: string]: string;
@@ -38,6 +40,22 @@ export interface ProviderSendArgs {
   job_id?: string;
 }
 
+/** Content NS already rendered and validated (Send API v1). */
+export interface RenderedSendArgs {
+  to: string;
+  rendered: Rendered;
+  providerTemplateId: string | null;
+  /** Per-template DLT identifiers; a non-null value overrides the env config. */
+  dlt?: {
+    senderId?: string | null;
+    dltEntityId?: string | null;
+    dltHeaderId?: string | null;
+    dltTagId?: string | null;
+  };
+  email?: { cc?: string[]; replyTo?: string; attachments?: Email_attachment[] };
+  job_id?: string;
+}
+
 export interface ProviderDefinition {
   name: string;
   /**
@@ -74,4 +92,9 @@ export interface ProviderDefinition {
   allowRawTemplateId?: boolean;
   schema: ZodType<any>;
   send: (payload: ProviderSendArgs) => Promise<ProviderSendResult>;
+  /**
+   * Send content NS already rendered and validated (Send API v1). Never re-render.
+   * A rendered mode or channel this vendor cannot send is a permanent failure.
+   */
+  sendRendered?: (args: RenderedSendArgs) => Promise<ProviderSendResult>;
 }
