@@ -11,6 +11,7 @@ const VariableSpecSchema = z
     raw: z.boolean().default(false),
     urlHosts: z.array(z.string().min(1).max(253)).min(1).optional(),
   })
+  .strict()
   .refine((s) => s.type === 'url' || s.urlHosts === undefined, {
     message: 'urlHosts applies only to url variables',
     path: ['urlHosts'],

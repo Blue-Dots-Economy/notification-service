@@ -19,6 +19,10 @@ function code(fn: () => unknown): string | undefined {
 }
 
 describe('VariableContractSchema', () => {
+  it('rejects unknown keys in a variable spec', () => {
+    expect(VariableContractSchema.safeParse([{ name: 'a', bogus: true }]).success).toBe(false);
+  });
+
   it('fills defaults', () => {
     expect(VariableContractSchema.parse([{ name: 'name' }])).toEqual([
       { name: 'name', required: true, type: 'string', sensitive: false, raw: false },
