@@ -256,7 +256,11 @@ ns_curl POST "/v1/admin/templates/$ID/publish" -d '{}'
 
 Email variables are HTML-escaped unless declared `raw: true`. Variable `type` is `string`,
 `number` or `url`; a `url` must be `http(s)` and, with `urlHosts`, on an allowed host
-(subdomains match).
+(subdomains match). A variable used inside an `href` or `src` attribute must be `type: "url"`,
+and publish rejects malformed tokens such as `{{ name }}`.
+
+Keep `NS_ADMIN_KEY_IDS` empty in production until request bodies are covered by the signature
+(HMAC v2, #62).
 
 ## Queue Model
 
@@ -571,7 +575,8 @@ template ids** (#86/#532/#535). Two ways to pass `template_id`:
 
 - **Named template** — `login_otp` is the one key in the SMS provider metadata. Its
   MSG91 flow id comes from `SMS_LOGIN_OTP_TEMPLATE_ID` (a built-in default applies
-  if unset), so it is deployment-specific per MSG91 account.
+  if unset), so it is deployment-specific per MSG91 account. The template registry's boot
+  seed only uses an explicitly set `SMS_LOGIN_OTP_TEMPLATE_ID`, never the built-in default.
 - **Raw DLT flow id** — any other `template_id` is passed through verbatim to MSG91
   (the SMS provider sets `allowRawTemplateId`). Signalstack sends its per-event
   DLT-approved flow ids directly this way; they need no entry in the templates map.

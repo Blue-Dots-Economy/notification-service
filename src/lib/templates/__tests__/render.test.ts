@@ -46,6 +46,12 @@ describe('renderTemplate — email', () => {
     expect(r.subject).toBe('Hello A Bcc: x@y.z');
   });
 
+  it('collapses control characters, NEL and Unicode line separators in the subject', () => {
+    const r = renderTemplate(t, 'ns', { name: 'A\u2028B\u2029C\x00D\u0085E\x7fF\t\vG' });
+    if (r.mode !== 'ns' || r.channel !== 'email') throw new Error('unreachable');
+    expect(r.subject).toBe('Hello A B C D E F G');
+  });
+
   it('renders an absent optional variable as empty', () => {
     const r = renderTemplate(t, 'ns', { name: 'A' });
     if (r.mode !== 'ns' || r.channel !== 'email') throw new Error('unreachable');

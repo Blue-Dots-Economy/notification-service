@@ -326,10 +326,15 @@ declared, every declared variable is used) and again on each send, **before** an
   one trailing dot tolerated. The stored and rendered value is the normalised `url.href`, so what
   was validated is what is sent.
 - Error messages name variables, never their values.
+- Publish also rejects any `{{` or `}}` that is not part of a valid `{{name}}` token, e.g.
+  `{{ name }}` (`undeclared_token`, `details: { malformed: true }`, all channels; checked before the
+  token/contract match so the error names the real problem), and requires every token inside an
+  email `href`/`src` attribute value (quoted or unquoted) to be declared `type: 'url'`
+  (`invalid_contract` naming the variable): HTML-escaping a string does not stop `javascript:`.
 
 **Rendering** (`render.ts`). Email HTML-escapes every variable by default; `raw: true` is the
-reviewable opt-out and is valid on email only. Subjects collapse CR/LF to a space, so a variable
-cannot inject headers. SMS bodies are stored byte-exact (the DLT operator matches on them). The
+reviewable opt-out and is valid on email only. Subjects collapse every run of C0 controls, DEL, NEL
+(U+0085) and U+2028/U+2029 to one space, so a variable cannot inject headers. SMS bodies are stored byte-exact (the DLT operator matches on them). The
 rendered SMS length is checked against 2000 (TXT) or 750 (UNI), chosen by the *rendered* text, so a
 non-GSM variable cannot push a TXT-sized body past the UNI limit. Vendor-rendered templates pass the
 provider template id and the validated variables.
@@ -344,7 +349,10 @@ tries candidates in order; `all` fans out.
 **Admin scope.** `/v1/admin/templates` and `/v1/admin/policies` need a valid HMAC signature
 (`requestAuth`) **and** the key id in `NS_ADMIN_KEY_IDS`, else `403 {"error":"admin scope required"}`.
 Editing a DLT-registered template has a compliance blast radius a sending credential must not
-carry. Interim until Keycloak admin roles (#62). Request bodies (including each variable spec) are strict, so unknown keys → `400`; list query params are not strict.
+carry. Interim until Keycloak admin roles (#62). **Keep `NS_ADMIN_KEY_IDS` empty in production
+until HMAC v2 (#62) signs request bodies**: the current signature covers method, path, timestamp and
+nonce but not the body, so whoever can see a signed admin request in flight can send a different
+template or policy under its headers. Request bodies (including each variable spec) are strict, so unknown keys → `400`; list query params are not strict.
 Errors: `404 not_found`, `409 invalid_state`, `422` for any other rule violation, `503
 network_not_configured`, and `503 database_unavailable` for anything else (`sendAdminError`). That
 last path logs only `describeDbError(err)` and returns a fixed body: a `DrizzleQueryError` message
@@ -353,9 +361,14 @@ default 500 handler, which would log and return it. `POST .../preview` renders a
 variables and sends nothing.
 
 **`login_otp` seeding** (`seed.ts`, called from `server.ts` after recovery). At boot the SMS
-`login_otp` template is created and published from the provider's configured template id and body,
-with contract `message` (required, sensitive). It **never overwrites** any existing `login_otp` row
-of any status, so an admin's edits always win over environment defaults. Replicas booting together
+`login_otp` template is created and published from the **explicitly configured** id for the current
+vendor, with the provider's body and contract `message` (required, sensitive): msg91 reads
+`SMS_LOGIN_OTP_TEMPLATE_ID` directly (the provider map's hardcoded fallback flow id is never
+seeded), pinnacle reads `PINNACLE_LOGIN_OTP_TEMPLATE_ID` via its provider map; unset or blank →
+`skipped_no_id`. Existence is checked **per vendor**: any `login_otp` row (any status/locale) whose
+`provider` is the current vendor → `exists`, never overwritten, so an admin's edits always win over
+environment defaults. If rows exist only for another vendor (the deployment switched vendor), the
+current vendor's template is created and published, which retires the old vendor's active row. Replicas booting together
 serialise on a session advisory lock. Seeding is non-fatal (logged, never blocks listen) and is
 skipped when `NS_NETWORK` is unset; a template that fails publish validation is left as a draft.
 
@@ -447,7 +460,8 @@ Required for providers (varies by implementation):
   named template; a blank id dead-letters with "named but not configured".
 - `SMS_LOGIN_OTP_TEMPLATE_ID` — MSG91 flow id for the legacy `login_otp` template.
   Read in `src/lib/providers/sms/msg91.ts`; optional, with a back-compat default of
-  the previously-hardcoded id. Per-event DLT flow ids are sent raw and need no env
+  the previously-hardcoded id for the legacy send path. The boot seed uses only the env value
+  and seeds nothing when it is unset. Per-event DLT flow ids are sent raw and need no env
   (see `allowRawTemplateId`). Note: `MSG91_TEMPLATE_ID` in `example.env` is unused —
   the code never reads it; use `SMS_LOGIN_OTP_TEMPLATE_ID` instead.
 - Twilio credentials for WhatsApp
@@ -479,7 +493,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 372 unit tests across 33 files (plus 61 integration tests). The unit suite runs in about a second because Redis
+vitest 4, 378 unit tests across 34 files (plus 63 integration tests). The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real

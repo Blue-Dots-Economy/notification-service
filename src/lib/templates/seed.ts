@@ -38,15 +38,23 @@ export async function seedBuiltinTemplates(): Promise<SeedOutcome> {
     throw e;
   }
   const client = await getPool().connect();
+  let releaseErr: Error | undefined;
   try {
     await client.query(`SELECT pg_advisory_lock(hashtext('notification-service:seed'))`);
     try {
       return await seedLocked();
     } finally {
-      await client.query(`SELECT pg_advisory_unlock(hashtext('notification-service:seed'))`);
+      try {
+        await client.query(`SELECT pg_advisory_unlock(hashtext('notification-service:seed'))`);
+      } catch (e) {
+        // The session may still hold the lock: hand the error to release so
+        // the pool destroys this connection instead of reusing it.
+        releaseErr = e instanceof Error ? e : new Error(String(e));
+        throw e;
+      }
     }
   } finally {
-    client.release();
+    client.release(releaseErr);
   }
 }
 

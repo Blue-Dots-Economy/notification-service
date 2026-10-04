@@ -49,4 +49,35 @@ describe('validateForPublish', () => {
     expect(codeOf(() => validateForPublish(row({ bodyText: '{{a}}', variables: [v({ name: 'a', raw: true })] }), pinnacle))).toBe('invalid_contract');
     expect(codeOf(() => validateForPublish(row({ provider: 'msg91', variables: [{ name: 'a-b' } as VariableSpec] }), msg91))).toBe('invalid_contract');
   });
+  it('rejects a malformed token on every channel', () => {
+    const smtp = { vendor: 'smtp', renders: 'ns' as const };
+    const email = row({ channel: 'email', provider: 'smtp', providerTemplateId: null, subject: 'S', variables: [v({ name: 'name' })] });
+    const err = (() => { try { validateForPublish({ ...email, bodyHtml: '<p>Hi {{ name }}</p>' }, smtp); } catch (e) { return e as TemplateError; } })();
+    expect(err).toMatchObject({ code: 'undeclared_token', details: { malformed: true } });
+    expect(codeOf(() => validateForPublish({ ...email, subject: 'Hi {{name}', bodyHtml: '<p>{{name}}</p>' }, smtp))).toBe('undeclared_token');
+    expect(codeOf(() => validateForPublish({ ...email, bodyHtml: '<p>{{name}}</p>', bodyText: 'x }} y' }, smtp))).toBe('undeclared_token');
+    expect(codeOf(() => validateForPublish(row({ bodyText: 'Hi {{ name }}', variables: [v({ name: 'name' })] }), pinnacle))).toBe('undeclared_token');
+    expect(codeOf(() => validateForPublish(row({ provider: 'msg91', bodyText: 'Hi {{na-me}}' }), msg91))).toBe('undeclared_token');
+    expect(codeOf(() => validateForPublish({ ...email, bodyHtml: '<p>{{name}}</p>' }, smtp))).toBeUndefined();
+  });
+  it('requires href/src variables in email html to be url-typed', () => {
+    const smtp = { vendor: 'smtp', renders: 'ns' as const };
+    const email = row({ channel: 'email', provider: 'smtp', providerTemplateId: null, subject: 'S' });
+    const withVar = (bodyHtml: string, type: VariableSpec['type']) =>
+      codeOf(() => validateForPublish({ ...email, bodyHtml, variables: [v({ name: 'link', type })] }, smtp));
+    for (const html of [
+      '<a href="{{link}}">x</a>',
+      "<a href='{{link}}'>x</a>",
+      '<a href={{link}}>x</a>',
+      '<img SRC = "https://cdn/{{link}}">',
+    ]) {
+      expect(withVar(html, 'string')).toBe('invalid_contract');
+      expect(withVar(html, 'url')).toBeUndefined();
+    }
+    const err = (() => { try { validateForPublish({ ...email, bodyHtml: '<a href="{{link}}">x</a>', variables: [v({ name: 'link' })] }, smtp); } catch (e) { return e as TemplateError; } })();
+    expect(err?.message).toContain('link');
+    expect(err?.details).toEqual({ variable: 'link' });
+    // Outside an attribute value a string variable is fine.
+    expect(withVar('<a href="https://x.test">{{link}}</a>', 'string')).toBeUndefined();
+  });
 });
