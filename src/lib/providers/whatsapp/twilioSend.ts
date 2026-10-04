@@ -1,3 +1,5 @@
+import { isTimeoutError, providerTimeoutMs } from '../http';
+
 type TwilioResponse = {
   sid: string;
   status: string;
@@ -26,7 +28,7 @@ export async function sendWhatsAppMessage(
   to: string,
   contentSid: string,
   variables?: Record<string, any>
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; error?: string; retryable?: boolean }> {
   const accountSid = process.env.TWILIO_ACCOUNT_SID!;
   const authToken = process.env.TWILIO_AUTH_TOKEN!;
   const messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID!;
@@ -43,15 +45,22 @@ export async function sendWhatsAppMessage(
   if (variables) {
     params.append('ContentVariables', JSON.stringify(variables));
   }
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization:
-        'Basic ' + Buffer.from(`${accountSid}:${authToken}`).toString('base64'),
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: params.toString(),
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization:
+          'Basic ' + Buffer.from(`${accountSid}:${authToken}`).toString('base64'),
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: params.toString(),
+      signal: AbortSignal.timeout(providerTimeoutMs()),
+    });
+  } catch (err) {
+    if (isTimeoutError(err)) return { ok: false, error: 'provider timeout', retryable: true };
+    throw err;
+  }
 
   if (!response.ok) {
     const errText = await response.text();

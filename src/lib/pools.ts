@@ -1,6 +1,6 @@
 import type Redis from 'ioredis';
 import redis from './redis';
-import { moveDueRetries, popFrom } from './queue';
+import { moveDueRetries, popFrom, RETRY_BATCH } from './queue';
 import type { Job, Priority } from 'src/types';
 
 export interface PoolConfig {
@@ -14,8 +14,8 @@ const ENV: Record<Priority, string> = {
   other: 'WORKER_NORMAL_CONCURRENCY',
   bulk: 'WORKER_BULK_CONCURRENCY',
 };
+const ERROR_LOG_INTERVAL_MS = 60_000;
 const DEFAULTS: PoolConfig = { realtime: 2, other: 2, bulk: 1 };
-const SCHEDULER_BATCH = 1000; // moveDueRetries claims at most this many per call
 
 export function poolConfig(env: NodeJS.ProcessEnv = process.env): PoolConfig {
   const out = { ...DEFAULTS };
@@ -65,12 +65,25 @@ export function startPools(
       // Lazy require: worker.ts imports this module, so a top-level import would be a load-time cycle.
       (require('./worker') as typeof import('./worker')).processJob(job));
   let running = true;
+  const lastLogged = new Map<Redis, Map<string, number>>();
+  // A down Redis emits an error per reconnect attempt; log each distinct
+  // message at most once a minute per connection so it stays readable.
+  const logRedisError = (conn: Redis, priority: Priority, err: Error) => {
+    const seen = lastLogged.get(conn) ?? new Map<string, number>();
+    lastLogged.set(conn, seen);
+    const now = Date.now();
+    const last = seen.get(err.message);
+    if (last !== undefined && now - last < ERROR_LOG_INTERVAL_MS) return;
+    seen.set(err.message, now);
+    console.error(`pool ${priority} redis error: ${err.message}`);
+  };
   const conns: Redis[] = [];
   const loops: Promise<void>[] = [];
 
   for (const priority of Object.keys(config) as Priority[]) {
     for (let i = 0; i < config[priority]; i++) {
       const conn = connect();
+      conn.on('error', (err: Error) => logRedisError(conn, priority, err));
       conns.push(conn);
       loops.push(
         (async () => {
@@ -96,7 +109,7 @@ export function startPools(
       while (running) {
         try {
           // A full batch means more may be due: go again before sleeping.
-          if ((await moveDueRetries()) >= SCHEDULER_BATCH) continue;
+          if ((await moveDueRetries()) >= RETRY_BATCH) continue;
         } catch (err) {
           console.error('retry scheduler failed:', err instanceof Error ? err.message : String(err));
         }
