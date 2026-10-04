@@ -244,6 +244,29 @@ describe('recoverLostJobs', () => {
       expect(rows[0].n).toBe(1201);
     });
 
+    it('fixes the epoch-lost cutoff once: rows written by live traffic mid-run are not re-queued', async () => {
+      // Uptime 0 puts the Redis start at "now", so a per-batch now() cutoff
+      // would sweep up any row written while the run is in progress.
+      const info = vi.spyOn(redis, 'info').mockResolvedValue('uptime_in_seconds:0\r\n' as never);
+      const old = [rec('other'), rec('other')];
+      for (const r of old) { await recordAccepted(r); await backdate(r); }
+      await redis.del(REDIS_EPOCH_KEY);
+      const live = rec('other', new Date(Date.now() + 60_000)); // sorts after the cursor
+      vi.mocked(pushOtherMany).mockImplementationOnce(async (jobs) => {
+        pushed.push(...jobs);
+        await recordAccepted(live); // committed between batch 1 and batch 2
+        await new Promise((r) => setTimeout(r, 20));
+      });
+      try {
+        expect(await recoverLostJobs({ batchSize: 1 })).toMatchObject({ epochLost: true, requeued: 2 });
+      } finally {
+        info.mockRestore();
+      }
+      const ids = pushed.map((j) => (j as { job_id: string }).job_id);
+      expect(ids).not.toContain((live.job as { job_id: string }).job_id);
+      expect(await row(live)).toMatchObject({ status: 'queued', attempt_no: 1 });
+    });
+
     it('a failure in a later batch keeps earlier batches committed and leaves the epoch unset', async () => {
       for (let i = 0; i < 3; i++) {
         const r = rec('other');

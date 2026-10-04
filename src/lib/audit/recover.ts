@@ -65,6 +65,15 @@ async function redisUptimeSeconds(): Promise<number> {
   return Number(m[1]);
 }
 
+/** `now() - uptime` on the database clock, as exact Postgres text. */
+async function redisStartedAt(uptimeSeconds: number): Promise<string> {
+  const { rows } = await getPool().query<{ cutoff: string }>(
+    `SELECT (now() - make_interval(secs => $1::numeric))::text AS cutoff`,
+    [uptimeSeconds],
+  );
+  return rows[0]!.cutoff;
+}
+
 interface Candidate {
   id: string;
   /**
@@ -123,7 +132,10 @@ export async function recoverLostJobs(
 
   try {
     const epochLost = gotLock && !(await redis.exists(REDIS_EPOCH_KEY));
-    const uptimeSeconds = epochLost ? await redisUptimeSeconds() : 0;
+    // The epoch-lost cutoff is fixed ONCE as an absolute timestamp. Evaluating
+    // `now() - uptime` per batch would let it drift forward with the run, and a
+    // later batch would pick up rows live traffic wrote after the Redis start.
+    const epochCutoff = epochLost ? await redisStartedAt(await redisUptimeSeconds()) : null;
 
     const total: RecoveryResult = { epochLost, requeued: 0, marked: 0, abandoned: 0 };
     // Keyset cursor: rows left untouched (retry markers) are never revisited.
@@ -132,7 +144,7 @@ export async function recoverLostJobs(
       id: '00000000-0000-0000-0000-000000000000',
     };
     for (;;) {
-      const batch = await recoverBatch({ epochLost, staleMs, uptimeSeconds, maxAgeHours, batchSize, cursor });
+      const batch = await recoverBatch({ epochCutoff, staleMs, maxAgeHours, batchSize, cursor });
       total.requeued += batch.requeued;
       total.marked += batch.marked;
       total.abandoned += batch.abandoned;
@@ -156,9 +168,9 @@ export async function recoverLostJobs(
 }
 
 async function recoverBatch(p: {
-  epochLost: boolean;
+  /** Absolute Redis start time (Postgres text) when the epoch was lost; else null. */
+  epochCutoff: string | null;
   staleMs: number;
-  uptimeSeconds: number;
   maxAgeHours: number;
   batchSize: number;
   cursor: { createdAt: string; id: string };
@@ -172,20 +184,20 @@ async function recoverBatch(p: {
 
     const { rows } = await q<Candidate>(
       `SELECT id, created_at::text AS created_at, notification_event_id, attempt_no, job,
-              created_at < now() - make_interval(hours => $4::int) AS too_old
+              created_at < now() - make_interval(hours => $3::int) AS too_old
          FROM delivery_attempt
         WHERE recoverable
           AND job IS NOT NULL
           AND (
-            ($1::boolean AND status IN ('queued', 'dispatching')
-               AND updated_at < now() - make_interval(secs => $3::numeric))
+            ($1::timestamptz IS NOT NULL AND status IN ('queued', 'dispatching')
+               AND updated_at < $1::timestamptz)
             OR (status = 'dispatching' AND updated_at < now() - make_interval(secs => $2::numeric / 1000))
           )
-          AND (created_at, id) > ($5::timestamptz, $6::uuid)
+          AND (created_at, id) > ($4::timestamptz, $5::uuid)
         ORDER BY created_at, id
-        LIMIT $7
+        LIMIT $6
         FOR UPDATE SKIP LOCKED`,
-      [p.epochLost, p.staleMs, p.uptimeSeconds, p.maxAgeHours, p.cursor.createdAt, p.cursor.id, p.batchSize],
+      [p.epochCutoff, p.staleMs, p.maxAgeHours, p.cursor.createdAt, p.cursor.id, p.batchSize],
     );
 
     const markers = await readAttemptMarkers(rows.map((r) => r.id));

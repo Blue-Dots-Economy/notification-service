@@ -118,7 +118,9 @@ can read `accepted` again when a retry is queued. A DLQ replay is a **new** atte
 **Recovery (`recoverLostJobs`).** `ns:epoch` in Redis means "Redis still has its data".
 - If it is missing, the holder of a short `ns:recovery` lock re-queues recoverable open attempts
   last touched **before Redis started** (uses `INFO server` uptime) and sets the epoch only after
-  every batch committed. NS therefore needs `INFO` allowed on Redis; with `INFO` disabled every
+  every batch committed. The cutoff (`now() - uptime`) is computed **once** before the first batch
+  as an absolute timestamp; a per-batch `now()` would drift forward and re-queue rows that live
+  traffic wrote during the run. NS therefore needs `INFO` allowed on Redis; with `INFO` disabled every
   recovery run fails while the epoch is missing (**including the first deploy**), so lost work is
   never recovered.
 - Stale `dispatching` rows (> 10 min) are re-queued: at-least-once by design.
