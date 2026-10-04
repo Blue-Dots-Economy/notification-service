@@ -2,7 +2,7 @@ import { fork } from 'node:child_process';
 import { deferJob, pushDLQ, scheduleRetryWithMarker } from './queue';
 import { acquireSendToken, bucketsFor, rateLimitDeferMs } from './rate_limit';
 import { providerTimeoutMs } from './providers/http';
-import { poolConfig, startPools } from './pools';
+import { poolConfig, startPools, type Deferred } from './pools';
 import { providers } from './providers';
 import * as metrics from './metrics';
 import { Job } from 'src/types';
@@ -19,6 +19,16 @@ async function expire(job: Job, attemptNo: number, cause?: string) {
   await metrics.incr('ns_job_expired_total', { channel: job.channel });
   await markAttempt(job, 'failed', attemptNo);
   await stamp(job, { status: 'expired', attemptNo, error: cause ? `deadline passed: ${cause}` : 'deadline passed' });
+}
+
+/**
+ * Put a job back without counting an attempt and tell the pool loop how long
+ * it waits: the bucket (or Redis) said no, so popping again at once would only
+ * spin on the same denial.
+ */
+async function defer(job: Job, wait: number): Promise<Deferred> {
+  await deferJob(job, wait);
+  return { deferredMs: wait };
 }
 
 /** Log wording that matches what dropOrDeadLetter will do with the job. */
@@ -48,6 +58,8 @@ async function dropOrDeadLetter(job: Job, reason: string, error?: string) {
  * for another attempt with exponential backoff, or moved to the dead-letter queue.
  *
  * Exported for tests. The worker pools are the only production caller.
+ * Returns `{ deferredMs }` when the job was deferred (rate limit or a failed
+ * token check) so the pool loop backs off; other outcomes return as before.
  *
  * @param job - The job to attempt. Its `attempt` counter is incremented in place.
  */
@@ -71,14 +83,14 @@ export async function processJob(job: Job) {
       );
       const wait = rateLimitDeferMs();
       if (wouldExpire(job, wait)) return expire(job, (job.attempt ?? 0) + 1);
-      return deferJob(job, wait);
+      return defer(job, wait);
     }
   }
   if (!granted) {
     await metrics.incr('ns_rate_limited_total', { channel: job.channel, priority: job.priority });
     const wait = rateLimitDeferMs();
     if (wouldExpire(job, wait)) return expire(job, (job.attempt ?? 0) + 1);
-    return deferJob(job, wait);
+    return defer(job, wait);
   }
 
   job.attempt = (job.attempt ?? 0) + 1;
