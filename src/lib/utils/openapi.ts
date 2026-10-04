@@ -32,7 +32,7 @@ const adminErrors = {
   '422': errorBody(
     'A template or policy rule was violated (vendor_mismatch, incomplete_template, undeclared_token, unused_variable, body_too_long, invalid_contract, unknown_channel, missing_variable, unknown_variable, invalid_variable)'
   ),
-  '503': errorBody('network_not_configured: NS_NETWORK is not set'),
+  '503': errorBody('network_not_configured: NS_NETWORK is not set; database_unavailable: the template/policy store could not be reached'),
 };
 
 const jsonBody = (schema: unknown) => ({

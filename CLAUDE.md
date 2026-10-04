@@ -330,7 +330,10 @@ tries candidates in order; `all` fans out.
 Editing a DLT-registered template has a compliance blast radius a sending credential must not
 carry. Interim until Keycloak admin roles (#62). Request bodies (including each variable spec) are strict, so unknown keys → `400`; list query params are not strict.
 Errors: `404 not_found`, `409 invalid_state`, `422` for any other rule violation, `503
-network_not_configured`. `POST .../preview` renders a template of any status with the supplied
+network_not_configured`, and `503 database_unavailable` for anything else (`sendAdminError`). That
+last path logs only `describeDbError(err)` and returns a fixed body: a `DrizzleQueryError` message
+embeds the SQL and every bound parameter (template bodies included), so it must never reach Fastify's
+default 500 handler, which would log and return it. `POST .../preview` renders a template of any status with the supplied
 variables and sends nothing.
 
 **`login_otp` seeding** (`seed.ts`, called from `server.ts` after recovery). At boot the SMS

@@ -89,6 +89,26 @@ describe('admin template routes', () => {
     expect(codes).toEqual([404, 409, 422, 503]);
   });
 
+  it('answers a database failure with 503 and never leaks the query or its params', async () => {
+    const drizzleErr = Object.assign(
+      new Error('Failed query: insert into "template" ("body_text") values ($1)\nparams: SECRET-BODY'),
+      { name: 'DrizzleQueryError', query: 'insert into "template" ...', params: ['SECRET-BODY'], cause: Object.assign(new Error('connection terminated'), { code: '57P01' }) },
+    );
+    repo.publishTemplate.mockRejectedValueOnce(drizzleErr);
+    const lines: string[] = [];
+    const app = Fastify({ logger: { level: 'error', stream: { write: (l: string) => { lines.push(l); } } } });
+    await app.register(adminTemplateRoutes);
+    await app.ready();
+    const res = await app.inject({ method: 'POST', url: `/v1/admin/templates/${ID}/publish`, headers: admin });
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toEqual({ error: 'database_unavailable' });
+    expect(res.body).not.toContain('SECRET');
+    const logged = lines.join('\n');
+    expect(logged).toContain('[57P01] connection terminated');
+    expect(logged).not.toContain('SECRET');
+    expect(logged).not.toContain('Failed query');
+  });
+
   it('previews a render with the supplied variables', async () => {
     repo.getTemplate.mockResolvedValue(row);
     const res = await (await build()).inject({
