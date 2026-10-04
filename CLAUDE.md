@@ -38,8 +38,13 @@ This is a **Fastify notification service** that queues and asynchronously proces
      `recoverLostJobs` → listen → fork worker. Nothing may touch a table before its migration
      lands, and recovery runs before the worker drains so recovered jobs join the queue in order.
      A failed migration or invalid config exits non-zero; a failed **boot recovery does not** — it
-     is logged and the periodic sweep (every 5 minutes) retries.
-   - Spawns one background worker process
+     is logged and the periodic sweep (every 5 minutes) retries. Config validation
+     (`validateBootConfig`, `src/lib/boot-config.ts`) includes the **worker's** pool, rate-limit,
+     deadline and timeout settings, so a typo such as `RATE_SMS_BURST=abc` fails the API boot
+     before listen instead of killing only the forked worker.
+   - Spawns one background worker process. If the worker exits for any reason, the API exits
+     with its code (1 if it was killed by a signal), so the orchestrator restarts the pod: there
+     is never a healthy-looking API queueing work that nothing drains.
 
 2. **Request Pipeline** (e.g., `POST /notify`)
    - HMAC signature validation (`src/plugins/request-auth.ts`)
@@ -69,7 +74,7 @@ queue:dlq       → List of dead-letter jobs (max retries exhausted)
 
 Each queue has its own pool of loops (`src/lib/pools.ts`), sized by
 `WORKER_URGENT_CONCURRENCY`, `WORKER_NORMAL_CONCURRENCY` and `WORKER_BULK_CONCURRENCY`
-(defaults 2 / 2 / 1; a value that is not a positive integer makes the worker exit at boot).
+(defaults 2 / 2 / 1; a value that is not a positive integer fails the API boot).
 Every loop owns one blocking connection (`redis.duplicate()`): a `BRPOP` blocks its connection,
 so a shared one would let a bulk pop hold up an urgent pop. A long bulk send therefore blocks only
 its own loop. Per-connection Redis errors are logged at most once a minute per message, with no
@@ -78,7 +83,9 @@ values.
 The retry scheduler (one per worker) moves due members of `queue:retry` back to the queue of their
 own priority in one atomic Lua step, at most `RETRY_BATCH` (1000) per call, so a retry never
 changes pool. A queue or retry entry that is not JSON, or has no string `job_id`, is dead-lettered
-raw and logged without its content, never lost.
+raw and logged without its content, never lost. This includes malformed `queue:realtime`
+entries: a raw entry cannot be classified as redacted, so it is the one way an urgent payload can
+reach the DLQ (only a non-NS writer could produce one).
 
 The retry score is epoch **milliseconds**. `getQueueMetrics()` exposes `retry_oldest` as that
 raw epoch-ms timestamp, and `retry_eta_seconds` converted to **seconds** — it previously
@@ -151,7 +158,9 @@ can read `accepted` again when a retry is queued. A DLQ replay is a **new** atte
   (`sent`/`failed` → that state is stamped, `retry` → left alone, the job is in the retry set);
   then **age** — created more than `RECOVERY_MAX_AGE_HOURS` (default 24) ago → marked `failed`
   (`abandoned: not delivered within recovery window`), counted in `ns_recovery_abandoned_total`;
-  otherwise re-queued.
+  otherwise re-queued onto **its own priority's queue** (`pushManyToPriority`: one `MULTI`, each
+  job to `QUEUE_KEYS[job.priority]`, an unknown name to `queue:other`), so a recovered job never
+  changes pool.
 - Work runs in keyset batches of 500 (`FOR UPDATE SKIP LOCKED`), each its own transaction with
   `SET LOCAL statement_timeout = '60s'` and one Redis `MULTI` push; a failed push rolls back that
   batch only. A connection whose `ROLLBACK` fails is destroyed (`release(err)`).
@@ -517,7 +526,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 423 unit tests across 38 files (plus 82 integration tests). The unit suite runs in about a second because Redis
+vitest 4, 441 unit tests across 39 files (plus 84 integration tests). The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
@@ -563,7 +572,14 @@ take `shared` only, so they can never consume the reserve. A denied job is **def
 `queue:retry` after `RATE_LIMIT_DEFER_MS` (default 250) plus up to 50% jitter, and the attempt is
 **not** counted: a rate-limited job has not been tried. A token-check error (Redis hiccup) defers
 the same way rather than dropping the popped job. The refill is clamped to the bucket capacity and
-the key TTL is at least the time to refill, so an idle bucket expires cleanly.
+the key TTL is at least the time to refill, so an idle bucket expires cleanly. The bucket's stored
+`ts` only moves forward (`max(ts, now)`): with clock skew between worker pods, or EVALs arriving
+out of order, an older `now` would otherwise rewind it and re-credit the same gap (2 ms of skew
+measured 15 grants against a 10/s limit before the fix).
+
+**Deferral backoff.** `processJob` returns `{ deferredMs }` when it defers a job, and the pool
+loop waits that long before its next pop, so a loop denied a token idles ~250–375 ms instead of
+re-popping and re-denying in a tight loop. Every other outcome returns as before.
 
 | Variable | Default | |
 |---|---|---|
@@ -574,9 +590,14 @@ the key TTL is at least the time to refill, so an idle bucket expires cleanly.
 | `PROVIDER_TIMEOUT_MS` | `10000` | Cap on every vendor call (HTTP, SMTP/SES, Pinnacle balance poll); a timeout is a retryable failure |
 | `URGENT_DEFAULT_DEADLINE_S` | `600` | Deadline the legacy `/notify` gives `realtime` jobs |
 
-`validateWorkerConfig` parses all of these at worker boot, and `server.ts` checks the deadline at
-API boot. A bad value exits the process; a value parsed per job would throw after the job was
-popped and drop it.
+`validateWorkerConfig` parses all of these at worker boot, and the API parses them (plus the pool
+sizes) before listen via `validateBootConfig`. A bad value exits the process; a value parsed per
+job would throw after the job was popped and drop it.
+
+**Ops note — urgent pool sizing.** A hung vendor holds an urgent loop for up to
+`PROVIDER_TIMEOUT_MS` (10 s) per job. With the default 2 urgent loops, a vendor that hangs on every
+call caps urgent throughput at ~0.2 jobs/s; size `WORKER_URGENT_CONCURRENCY` for the urgent rate
+you need times the timeout, or lower the timeout.
 
 **Deadlines.** `Job.deadline` is an absolute epoch-ms. Legacy `/notify` sets it for `realtime` jobs
 to now plus `URGENT_DEFAULT_DEADLINE_S`. `processJob` checks it first, and again before every
@@ -589,7 +610,9 @@ that would dead-letter instead ends `failed`, with the marker set, and is counte
 `ns_job_dropped_total{channel,reason}`; a DLQ entry would keep a live code at rest.
 `dropOrDeadLetter` in `worker.ts` is the only DLQ writer in the worker, and the log lines say
 `dropped (redacted, no DLQ)` or `→ DLQ` to match, with job ids only. Rollout: OTP jobs
-dead-lettered before this change stay in `queue:dlq` until ops inspect and clear them.
+dead-lettered before this change stay in `queue:dlq` until ops inspect and clear them. During the
+rollout window, pods still on the pre-priority-isolation build ignore deadlines and still
+dead-letter OTPs; all of them must be gone before bulk sends are accepted (Plan C2).
 
 ### DLQ replay cap
 
