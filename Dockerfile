@@ -67,11 +67,11 @@ USER node
 
 EXPOSE 3001
 
-# No dedicated /health route exists; docs.ts's unauthenticated GET / (the API
-# reference page) is the only route neither behind HMAC auth nor a mutating
-# POST, so it's what's checked. Exec form + node's global fetch(), since the
+# No dedicated /health route exists; GET /metrics is always registered,
+# unauthenticated and content-free, so it's what's checked (the docs routes
+# are off unless NS_DOCS_ENABLED=true). Exec form + node's global fetch(), since the
 # hardened runtime has no shell/curl/wget. (Trivy DS-0026)
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD ["node", "-e", "fetch(`http://127.0.0.1:${process.env.SERVER_PORT||3000}/`).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  CMD ["node", "-e", "fetch(`http://127.0.0.1:${process.env.SERVER_PORT||3000}/metrics`).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
 
 CMD ["node", "dist/server.js"]
