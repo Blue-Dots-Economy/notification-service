@@ -49,6 +49,23 @@ export async function pushToPriority(job: Job): Promise<void> {
 }
 
 /**
+ * Push `job` onto its priority queue and write `marker` in the same MULTI, so
+ * the marker exists if and only if the job was queued (the fall-through
+ * counterpart of scheduleRetryWithMarker). Throws if any command failed.
+ */
+export async function pushToPriorityWithMarker(
+  job: Job,
+  marker?: { key: string; value: string; ttlSeconds: number },
+): Promise<void> {
+  const tx = redis.multi().lpush(queueKeyFor(job.priority), JSON.stringify(job));
+  if (marker) tx.set(marker.key, marker.value, 'EX', marker.ttlSeconds);
+  const results = await tx.exec();
+  if (!results) throw new Error('Redis MULTI aborted while queueing a job');
+  const failed = results.find(([err]) => err);
+  if (failed) throw failed[0];
+}
+
+/**
  * Blocking pop for one priority on the caller's own connection. BRPOP holds its
  * connection until it returns, so every pool loop owns a dedicated connection —
  * sharing one would let a bulk pop hold up an urgent one.

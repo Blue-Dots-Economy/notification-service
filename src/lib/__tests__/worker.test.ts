@@ -39,6 +39,7 @@ vi.mock('../queue', () => ({
   deferJob: vi.fn(async () => {}),
   pushDLQ: vi.fn(async () => 1),
   pushToPriority: vi.fn(async () => {}),
+  pushToPriorityWithMarker: vi.fn(async () => {}),
   scheduleRetryWithMarker: vi.fn(async () => 1),
   popRealtime: vi.fn(async () => null),
   popOther: vi.fn(async () => null),
@@ -648,7 +649,7 @@ describe('v1 jobs', () => {
     v1: { mode, deliveries: [d('sms'), d('email')], index: 0, email: { cc: ['x@y.z'] } },
     audit: { eventId: 'e', attemptId: 'a1', createdAt: 'c', correlationId: 'c', deliveryMode: mode, ...audit },
   });
-  const pushed = () => vi.mocked(queue.pushToPriority).mock.calls[0]![0] as Job;
+  const pushed = () => vi.mocked(queue.pushToPriorityWithMarker).mock.calls[0]![0] as Job;
 
   it('sends pre-rendered content via sendRendered', async () => {
     await processJob(v1Job() as never);
@@ -681,7 +682,7 @@ describe('v1 jobs', () => {
     smsSendRendered.mockResolvedValueOnce({ ok: false, error: 'timeout' });
     await processJob(v1Job() as never);
     expect(queue.scheduleRetryWithMarker).toHaveBeenCalledWith(expect.objectContaining({ attempt: 1 }), 5, expect.anything());
-    expect(queue.pushToPriority).not.toHaveBeenCalled();
+    expect(queue.pushToPriorityWithMarker).not.toHaveBeenCalled();
   });
 
   it('first_available falls through on permanent failure', async () => {
@@ -691,7 +692,9 @@ describe('v1 jobs', () => {
       expect.objectContaining({ audit: expect.objectContaining({ attemptId: 'a1' }) }),
       expect.objectContaining({ status: 'failed', error: 'bad' }),
     );
-    expect(markAttempt).toHaveBeenCalledWith(expect.objectContaining({ audit: expect.objectContaining({ attemptId: 'a1' }) }), 'failed', 1);
+    // a1's failed marker is written in the same MULTI as a2's push, never on its own.
+    expect(markAttempt).not.toHaveBeenCalledWith(expect.objectContaining({ audit: expect.objectContaining({ attemptId: 'a1' }) }), 'failed', 1);
+    expect(queue.pushToPriorityWithMarker).toHaveBeenCalledWith(expect.anything(), { key: 'ns:attempt:a1', value: 'failed:1', ttlSeconds: 604800 });
     const next = pushed();
     expect(next).toMatchObject({ channel: 'email', to: 'a@b.c', template_id: 'k_email', attempt: 0, v1: { index: 1 } });
     expect(next.audit!.attemptId).not.toBe('a1');
@@ -700,6 +703,20 @@ describe('v1 jobs', () => {
     expect(incr).toHaveBeenCalledWith('ns_send_fallthrough_total', { from: 'sms', to: 'email' });
     expect(queue.pushDLQ).not.toHaveBeenCalled();
     expect(incr).not.toHaveBeenCalledWith('ns_job_dlq_total', expect.anything());
+  });
+
+  it('fall-through order: stamp a2 queued → MULTI {push a2, a1 marker} → stamp a1 failed', async () => {
+    smsSendRendered.mockResolvedValueOnce({ ok: false, retryable: false, error: 'bad' });
+    await processJob(v1Job() as never);
+    const next = pushed();
+    const stampOrder = (attemptId: string, status: string) => {
+      const i = stamp.mock.calls.findIndex(([j, u]) => (j as Job).audit!.attemptId === attemptId && (u as { status: string }).status === status);
+      expect(i).toBeGreaterThanOrEqual(0);
+      return stamp.mock.invocationCallOrder[i]!;
+    };
+    const push = vi.mocked(queue.pushToPriorityWithMarker).mock.invocationCallOrder[0]!;
+    expect(stampOrder(next.audit!.attemptId, 'queued')).toBeLessThan(push);
+    expect(push).toBeLessThan(stampOrder('a1', 'failed'));
   });
 
   it('first_available falls through once retries are exhausted', async () => {
@@ -734,23 +751,35 @@ describe('v1 jobs', () => {
   });
 
   it('a fall-through past the deadline expires instead of pushing', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const start = Date.now();
     smsSendRendered.mockImplementationOnce(async () => {
-      await new Promise((r) => setTimeout(r, 5));
+      vi.setSystemTime(start + 10_000); // the send outlives the deadline
       return { ok: false, retryable: false, error: 'bad' };
     });
-    await processJob({ ...v1Job(), deadline: Date.now() + 2 } as never);
-    expect(queue.pushToPriority).not.toHaveBeenCalled();
+    try {
+      await processJob({ ...v1Job(), deadline: start + 5_000 } as never);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(queue.pushToPriorityWithMarker).not.toHaveBeenCalled();
     expect(queue.pushDLQ).not.toHaveBeenCalled();
     expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'expired', error: 'deadline passed: bad' }));
   });
 
   it('a failed push closes the new attempt and propagates', async () => {
     smsSendRendered.mockResolvedValueOnce({ ok: false, retryable: false, error: 'bad' });
-    vi.mocked(queue.pushToPriority).mockRejectedValueOnce(new Error('redis down'));
+    vi.mocked(queue.pushToPriorityWithMarker).mockRejectedValueOnce(new Error('redis down'));
     await expect(processJob(v1Job() as never)).rejects.toThrow('redis down');
-    expect(stamp).toHaveBeenLastCalledWith(
+    expect(stamp).toHaveBeenCalledWith(
       expect.objectContaining({ channel: 'email' }),
       { status: 'failed', attemptNo: 1, error: 'enqueue failed' },
+    );
+    // a1 is closed too (marker + stamp), as before the MULTI change.
+    expect(markAttempt).toHaveBeenCalledWith(expect.objectContaining({ audit: expect.objectContaining({ attemptId: 'a1' }) }), 'failed', 1);
+    expect(stamp).toHaveBeenLastCalledWith(
+      expect.objectContaining({ audit: expect.objectContaining({ attemptId: 'a1' }) }),
+      expect.objectContaining({ status: 'failed', attemptNo: 1, error: 'bad' }),
     );
   });
 
@@ -758,7 +787,7 @@ describe('v1 jobs', () => {
     emailSendRendered.mockResolvedValueOnce({ ok: false, retryable: false, error: 'bad' });
     const job = { ...v1Job(), channel: 'email', to: 'a@b.c', v1: { ...v1Job().v1, index: 1 } };
     await processJob(job as never);
-    expect(queue.pushToPriority).not.toHaveBeenCalled();
+    expect(queue.pushToPriorityWithMarker).not.toHaveBeenCalled();
     expect(queue.pushDLQ).toHaveBeenCalled();
 
     vi.clearAllMocks();
@@ -805,7 +834,7 @@ describe('v1 jobs', () => {
   ])('%s fails permanently instead of crashing', async (_label, v1) => {
     await expect(processJob({ ...v1Job(), v1 } as never)).resolves.not.toThrow();
     expect(smsSendRendered).not.toHaveBeenCalled();
-    expect(queue.pushToPriority).not.toHaveBeenCalled();
+    expect(queue.pushToPriorityWithMarker).not.toHaveBeenCalled();
     expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'failed' }));
     expect(incr).toHaveBeenCalledWith('ns_job_dlq_total', expect.objectContaining({ reason: 'invalid_delivery' }));
   });
@@ -813,14 +842,14 @@ describe('v1 jobs', () => {
   it('all-mode jobs never fall through', async () => {
     smsSendRendered.mockResolvedValueOnce({ ok: false, retryable: false, error: 'bad' });
     await processJob({ ...v1Job('all'), v1: { mode: 'all', deliveries: [d('sms')], index: 0 } } as never);
-    expect(queue.pushToPriority).not.toHaveBeenCalled();
+    expect(queue.pushToPriorityWithMarker).not.toHaveBeenCalled();
     expect(queue.pushDLQ).toHaveBeenCalled();
   });
 
   it('an all-mode job is never advanced even if it somehow holds two deliveries', async () => {
     smsSendRendered.mockResolvedValueOnce({ ok: false, retryable: false, error: 'bad' });
     await processJob(v1Job('all') as never);
-    expect(queue.pushToPriority).not.toHaveBeenCalled();
+    expect(queue.pushToPriorityWithMarker).not.toHaveBeenCalled();
   });
 
   it('an expired v1 job is never sent', async () => {
