@@ -38,6 +38,7 @@ vi.mock('../rate_limit', async () => {
 vi.mock('../queue', () => ({
   deferJob: vi.fn(async () => {}),
   pushDLQ: vi.fn(async () => 1),
+  pushToPriority: vi.fn(async () => {}),
   scheduleRetryWithMarker: vi.fn(async () => 1),
   popRealtime: vi.fn(async () => null),
   popOther: vi.fn(async () => null),
@@ -50,6 +51,9 @@ vi.mock('../queue', () => ({
 const send = vi.fn(
   async () => ({ ok: true }) as { ok: boolean; error?: string; retryable?: boolean }
 );
+type SendResult = { ok: boolean; error?: string; retryable?: boolean; provider_message_id?: string };
+const smsSendRendered = vi.fn(async (_args: unknown): Promise<SendResult> => ({ ok: true }));
+const emailSendRendered = vi.fn(async (_args: unknown): Promise<SendResult> => ({ ok: true }));
 vi.mock('../providers', () => ({
   providers: {
     email: {
@@ -58,6 +62,7 @@ vi.mock('../providers', () => ({
       templates: { welcome: 'provider-template-123' },
       schema: { safeParse: () => ({ success: true, data: {} }) },
       send,
+      sendRendered: emailSendRendered,
     },
     // Mirrors the SMS shape: raw ids pass through, one named template carries a
     // provider-owned body, and a named template with no id is the "DLT approval
@@ -68,6 +73,15 @@ vi.mock('../providers', () => ({
       templates: { login_otp: 'DLT-1', pending_case: '', blank_body: 'DLT-2' },
       bodies: { login_otp: '{{message}} is your OTP', blank_body: '' },
       allowRawTemplateId: true,
+      schema: { safeParse: () => ({ success: true, data: {} }) },
+      send,
+      sendRendered: smsSendRendered,
+    },
+    // A channel whose provider predates sendRendered.
+    whatsapp: {
+      name: 'whatsapp',
+      vendor: 'twilio',
+      templates: {},
       schema: { safeParse: () => ({ success: true, data: {} }) },
       send,
     },
@@ -93,6 +107,8 @@ const job = (over: Partial<Job> = {}): Job => ({
 beforeEach(() => {
   vi.clearAllMocks();
   send.mockResolvedValue({ ok: true });
+  smsSendRendered.mockResolvedValue({ ok: true });
+  emailSendRendered.mockResolvedValue({ ok: true });
   acquireSendToken.mockResolvedValue(true);
 });
 
@@ -613,5 +629,202 @@ describe('deadlines and redacted jobs', () => {
 describe('validateWorkerConfig — deadline', () => {
   it('rejects a bad URGENT_DEFAULT_DEADLINE_S', () => {
     expect(() => validateWorkerConfig({ URGENT_DEFAULT_DEADLINE_S: '-5' })).toThrow('URGENT_DEFAULT_DEADLINE_S');
+  });
+});
+
+describe('v1 jobs', () => {
+  const d = (channel: string) => ({
+    channel,
+    to: channel === 'email' ? 'a@b.c' : '+919999999999',
+    templateKey: `k_${channel}`,
+    provider: channel === 'email' ? 'smtp' : 'msg91',
+    providerTemplateId: 'f',
+    rendered: { mode: 'provider', channel, providerTemplateId: 'f', variables: {} },
+    dlt: { senderId: null, dltEntityId: null, dltHeaderId: null, dltTagId: null },
+  });
+  const v1Job = (mode = 'first_available', audit: Record<string, unknown> = {}) => ({
+    job_id: 'j', channel: 'sms', priority: 'other', to: '+919999999999', template_id: 'k_sms', variables: { name: 'A' },
+    v1: { mode, deliveries: [d('sms'), d('email')], index: 0, email: { cc: ['x@y.z'] } },
+    audit: { eventId: 'e', attemptId: 'a1', createdAt: 'c', correlationId: 'c', deliveryMode: mode, ...audit },
+  });
+  const pushed = () => vi.mocked(queue.pushToPriority).mock.calls[0]![0] as Job;
+
+  it('sends pre-rendered content via sendRendered', async () => {
+    await processJob(v1Job() as never);
+    expect(smsSendRendered).toHaveBeenCalledWith(expect.objectContaining({ to: '+919999999999', providerTemplateId: 'f', job_id: 'j', email: undefined }));
+    expect(send).not.toHaveBeenCalled();
+    expect(markAttempt).toHaveBeenCalledWith(expect.anything(), 'sent', 1);
+    expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'sent', attemptNo: 1 }));
+  });
+
+  it('passes the email extras to an email delivery only', async () => {
+    await processJob({ ...v1Job(), channel: 'email', v1: { ...v1Job().v1, index: 1 } } as never);
+    expect(emailSendRendered).toHaveBeenCalledWith(expect.objectContaining({ to: 'a@b.c', email: { cc: ['x@y.z'] } }));
+  });
+
+  it('takes the token for the delivery channel and vendor, deferring like legacy jobs', async () => {
+    acquireSendToken.mockResolvedValueOnce(false);
+    const res = await processJob(v1Job() as never);
+    expect(acquireSendToken).toHaveBeenCalledWith('sms', 'msg91', 'other');
+    expect(res).toEqual({ deferredMs: 321 });
+    expect(smsSendRendered).not.toHaveBeenCalled();
+  });
+
+  it('defers when the token check throws', async () => {
+    vi.spyOn(console, 'error').mockImplementationOnce(() => {});
+    acquireSendToken.mockRejectedValueOnce(new Error('redis down'));
+    expect(await processJob(v1Job() as never)).toEqual({ deferredMs: 321 });
+  });
+
+  it('retries a retryable failure as today', async () => {
+    smsSendRendered.mockResolvedValueOnce({ ok: false, error: 'timeout' });
+    await processJob(v1Job() as never);
+    expect(queue.scheduleRetryWithMarker).toHaveBeenCalledWith(expect.objectContaining({ attempt: 1 }), 5, expect.anything());
+    expect(queue.pushToPriority).not.toHaveBeenCalled();
+  });
+
+  it('first_available falls through on permanent failure', async () => {
+    smsSendRendered.mockResolvedValueOnce({ ok: false, retryable: false, error: 'bad' });
+    await processJob(v1Job() as never);
+    expect(stamp).toHaveBeenCalledWith(
+      expect.objectContaining({ audit: expect.objectContaining({ attemptId: 'a1' }) }),
+      expect.objectContaining({ status: 'failed', error: 'bad' }),
+    );
+    expect(markAttempt).toHaveBeenCalledWith(expect.objectContaining({ audit: expect.objectContaining({ attemptId: 'a1' }) }), 'failed', 1);
+    const next = pushed();
+    expect(next).toMatchObject({ channel: 'email', to: 'a@b.c', template_id: 'k_email', attempt: 0, v1: { index: 1 } });
+    expect(next.audit!.attemptId).not.toBe('a1');
+    expect(next.audit).toMatchObject({ eventId: 'e', deliveryMode: 'first_available' });
+    expect(stamp).toHaveBeenCalledWith(next, { status: 'queued', attemptNo: 1 });
+    expect(incr).toHaveBeenCalledWith('ns_send_fallthrough_total', { from: 'sms', to: 'email' });
+    expect(queue.pushDLQ).not.toHaveBeenCalled();
+    expect(incr).not.toHaveBeenCalledWith('ns_job_dlq_total', expect.anything());
+  });
+
+  it('first_available falls through once retries are exhausted', async () => {
+    smsSendRendered.mockResolvedValueOnce({ ok: false, error: 'timeout' });
+    await processJob({ ...v1Job(), attempt: 4 } as never);
+    expect(queue.scheduleRetryWithMarker).not.toHaveBeenCalled();
+    expect(pushed()).toMatchObject({ channel: 'email', attempt: 0, v1: { index: 1 } });
+  });
+
+  it('the new attempt row carries the ADVANCED job, so recovery resends the next delivery', async () => {
+    const { toAcceptedRecord } = await vi.importActual<typeof import('../audit/redact')>('../audit/redact');
+    smsSendRendered.mockResolvedValueOnce({ ok: false, retryable: false, error: 'bad' });
+    await processJob(v1Job() as never);
+    const rec = toAcceptedRecord(pushed(), 'worker');
+    expect(rec).toMatchObject({ channel: 'email', templateId: 'k_email', recoverable: true });
+    expect(rec.ids.attemptId).toBe(pushed().audit!.attemptId);
+    expect(rec.ids.deliveryMode).toBe('first_available');
+    expect((rec.job as unknown as Job).v1!.index).toBe(1);
+    expect((rec.job as unknown as Job).channel).toBe('email');
+  });
+
+  it('a redacted fall-through keeps names only and no job copy', async () => {
+    const { toAcceptedRecord } = await vi.importActual<typeof import('../audit/redact')>('../audit/redact');
+    smsSendRendered.mockResolvedValueOnce({ ok: false, retryable: false, error: 'bad' });
+    await processJob({ ...v1Job('first_available', { redactValues: true, variableNames: ['code'] }), variables: {} } as never);
+    const next = pushed();
+    expect(next.audit).toMatchObject({ redactValues: true, variableNames: ['code'], deliveryMode: 'first_available' });
+    const rec = toAcceptedRecord(next, 'worker');
+    expect(rec.job).toBeUndefined();
+    expect(rec.recoverable).toBe(false);
+    expect(rec.payload).toEqual({ to: 'a@b.c', variable_names: ['code'] });
+  });
+
+  it('a fall-through past the deadline expires instead of pushing', async () => {
+    smsSendRendered.mockImplementationOnce(async () => {
+      await new Promise((r) => setTimeout(r, 5));
+      return { ok: false, retryable: false, error: 'bad' };
+    });
+    await processJob({ ...v1Job(), deadline: Date.now() + 2 } as never);
+    expect(queue.pushToPriority).not.toHaveBeenCalled();
+    expect(queue.pushDLQ).not.toHaveBeenCalled();
+    expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'expired', error: 'deadline passed: bad' }));
+  });
+
+  it('a failed push closes the new attempt and propagates', async () => {
+    smsSendRendered.mockResolvedValueOnce({ ok: false, retryable: false, error: 'bad' });
+    vi.mocked(queue.pushToPriority).mockRejectedValueOnce(new Error('redis down'));
+    await expect(processJob(v1Job() as never)).rejects.toThrow('redis down');
+    expect(stamp).toHaveBeenLastCalledWith(
+      expect.objectContaining({ channel: 'email' }),
+      { status: 'failed', attemptNo: 1, error: 'enqueue failed' },
+    );
+  });
+
+  it('the last delivery failing permanently dead-letters (or drops when redacted)', async () => {
+    emailSendRendered.mockResolvedValueOnce({ ok: false, retryable: false, error: 'bad' });
+    const job = { ...v1Job(), channel: 'email', to: 'a@b.c', v1: { ...v1Job().v1, index: 1 } };
+    await processJob(job as never);
+    expect(queue.pushToPriority).not.toHaveBeenCalled();
+    expect(queue.pushDLQ).toHaveBeenCalled();
+
+    vi.clearAllMocks();
+    emailSendRendered.mockResolvedValueOnce({ ok: false, retryable: false, error: 'bad' });
+    await processJob({ ...job, audit: { ...job.audit, redactValues: true } } as never);
+    expect(queue.pushDLQ).not.toHaveBeenCalled();
+    expect(incr).toHaveBeenCalledWith('ns_job_dropped_total', { channel: 'email', reason: 'permanent_failure' });
+    expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'failed' }));
+  });
+
+  it('a vendor change since accept fails permanently', async () => {
+    const job = v1Job('all');
+    job.v1.deliveries = [d('sms')];
+    job.v1.deliveries[0]!.provider = 'pinnacle';
+    await processJob(job as never);
+    expect(smsSendRendered).not.toHaveBeenCalled();
+    expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'failed', error: 'vendor changed since accept' }));
+    expect(queue.pushDLQ).toHaveBeenCalled();
+  });
+
+  it('a vendor change on a first_available delivery falls through', async () => {
+    const job = v1Job();
+    job.v1.deliveries[0]!.provider = 'pinnacle';
+    await processJob(job as never);
+    expect(smsSendRendered).not.toHaveBeenCalled();
+    expect(pushed()).toMatchObject({ channel: 'email', v1: { index: 1 } });
+  });
+
+  it('a provider without sendRendered fails permanently', async () => {
+    await processJob({ ...v1Job('all'), channel: 'whatsapp', v1: { mode: 'all', deliveries: [{ ...d('whatsapp'), provider: 'twilio' }], index: 0 } } as never);
+    expect(send).not.toHaveBeenCalled();
+    expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'failed', error: 'rendered send unsupported' }));
+  });
+
+  it('an unknown delivery channel fails permanently', async () => {
+    await processJob({ ...v1Job('all'), v1: { mode: 'all', deliveries: [d('pigeon')], index: 0 } } as never);
+    expect(incr).toHaveBeenCalledWith('ns_job_dlq_total', expect.objectContaining({ reason: 'unknown_channel' }));
+  });
+
+  it.each([
+    ['an index out of range', { mode: 'first_available', deliveries: [d('sms')], index: 3 }],
+    ['a negative index', { mode: 'first_available', deliveries: [d('sms'), d('email')], index: -1 }],
+    ['missing deliveries', { mode: 'first_available', index: 0 }],
+  ])('%s fails permanently instead of crashing', async (_label, v1) => {
+    await expect(processJob({ ...v1Job(), v1 } as never)).resolves.not.toThrow();
+    expect(smsSendRendered).not.toHaveBeenCalled();
+    expect(queue.pushToPriority).not.toHaveBeenCalled();
+    expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'failed' }));
+    expect(incr).toHaveBeenCalledWith('ns_job_dlq_total', expect.objectContaining({ reason: 'invalid_delivery' }));
+  });
+
+  it('all-mode jobs never fall through', async () => {
+    smsSendRendered.mockResolvedValueOnce({ ok: false, retryable: false, error: 'bad' });
+    await processJob({ ...v1Job('all'), v1: { mode: 'all', deliveries: [d('sms')], index: 0 } } as never);
+    expect(queue.pushToPriority).not.toHaveBeenCalled();
+    expect(queue.pushDLQ).toHaveBeenCalled();
+  });
+
+  it('an all-mode job is never advanced even if it somehow holds two deliveries', async () => {
+    smsSendRendered.mockResolvedValueOnce({ ok: false, retryable: false, error: 'bad' });
+    await processJob(v1Job('all') as never);
+    expect(queue.pushToPriority).not.toHaveBeenCalled();
+  });
+
+  it('an expired v1 job is never sent', async () => {
+    await processJob({ ...v1Job(), deadline: Date.now() - 1 } as never);
+    expect(smsSendRendered).not.toHaveBeenCalled();
+    expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'expired' }));
   });
 });

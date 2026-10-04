@@ -96,6 +96,10 @@ const HELP: Record<string, [type: string, help: string]> = {
   ],
   ns_rate_limited_total: ['counter', 'Sends deferred because no vendor token was available, by channel and priority.'],
   ns_send_rejected_total: ['counter', 'POST /v1/notify sends refused at planning, by kind and code.'],
+  ns_send_fallthrough_total: [
+    'counter',
+    'first_available sends that moved to their next channel after a delivery failed, by from and to channel.',
+  ],
   ns_audit_write_failures_total: [
     'counter',
     'Best-effort audit status writes that failed, by stage (the status being written).',
