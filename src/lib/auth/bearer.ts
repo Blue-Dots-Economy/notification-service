@@ -18,9 +18,23 @@ export type BearerResult =
  * trailing slash). Every service shares the realm, so the audience AND an
  * allowlisted `azp` are both required.
  */
+function assertHttpUrl(name: string, value: string): void {
+  let protocol: string;
+  try {
+    protocol = new URL(value).protocol;
+  } catch {
+    throw new Error(`${name} must be a valid http(s) URL`);
+  }
+  if (protocol !== 'http:' && protocol !== 'https:') throw new Error(`${name} must be an http(s) URL`);
+}
+
 export function bearerConfig(env: NodeJS.ProcessEnv = process.env): BearerConfig | null {
   const issuer = env.NS_KEYCLOAK_ISSUER?.trim();
   if (!issuer) return null;
+  if (issuer.endsWith('/')) {
+    throw new Error('NS_KEYCLOAK_ISSUER must equal the token iss exactly, with no trailing slash');
+  }
+  assertHttpUrl('NS_KEYCLOAK_ISSUER', issuer);
   const allowedAzp = new Set(
     (env.NS_AUTH_ALLOWED_AZP ?? '').split(',').map((s) => s.trim()).filter(Boolean),
   );
@@ -29,7 +43,7 @@ export function bearerConfig(env: NodeJS.ProcessEnv = process.env): BearerConfig
   }
   const jwksUri =
     env.NS_KEYCLOAK_JWKS_URI?.trim() || `${issuer.replace(/\/+$/, '')}/protocol/openid-connect/certs`;
-  new URL(jwksUri); // throws on an invalid URI, failing the boot
+  assertHttpUrl('NS_KEYCLOAK_JWKS_URI', jwksUri);
   return { issuer, jwksUri, audience: env.NS_AUTH_AUDIENCE?.trim() || 'notification-service', allowedAzp };
 }
 
@@ -68,7 +82,7 @@ function scopesFrom(payload: JWTPayload, audience: string): Set<Scope> {
 
 /** A key-set fetch that failed (Keycloak down or slow) — not a bad token. */
 function keySetUnavailable(jose: Jose, err: unknown): boolean {
-  if (err instanceof jose.errors.JWKSTimeout) return true;
+  if (err instanceof jose.errors.JWKSTimeout || err instanceof jose.errors.JWKSInvalid) return true;
   if (!(err instanceof jose.errors.JOSEError)) return true; // fetch/network errors
   // jose reports a non-200 key-set response with the base JOSEError class.
   return Object.getPrototypeOf(err) === jose.errors.JOSEError.prototype;
@@ -83,6 +97,7 @@ export async function verifyBearer(token: string, cfg: BearerConfig): Promise<Be
       audience: cfg.audience,
       algorithms: ['RS256', 'PS256', 'ES256'],
       clockTolerance: 30,
+      requiredClaims: ['exp', 'sub'],
     }));
   } catch (err) {
     if (err instanceof jose.errors.JWTExpired) return { ok: false, status: 401, error: 'Token expired' };
@@ -90,13 +105,13 @@ export async function verifyBearer(token: string, cfg: BearerConfig): Promise<Be
     return { ok: false, status: 401, error: 'Token invalid' };
   }
   // Access tokens only: Keycloak marks them typ=Bearer.
-  if (typeof payload.typ === 'string' && payload.typ !== 'Bearer') {
+  if (payload.typ !== 'Bearer') {
     return { ok: false, status: 401, error: 'Token invalid' };
   }
   const azp = typeof payload.azp === 'string' ? payload.azp : undefined;
   if (!azp || !cfg.allowedAzp.has(azp)) return { ok: false, status: 401, error: 'Token client not accepted' };
   // Service-account (client_credentials) tokens carry client_id; a person's token
   // is identified by client and subject.
-  const id = typeof payload.client_id === 'string' ? azp : `${azp}:${payload.sub ?? 'unknown'}`;
+  const id = payload.client_id === azp ? azp : `${azp}:${payload.sub}`;
   return { ok: true, principal: { kind: 'bearer', id, scopes: scopesFrom(payload, cfg.audience) } };
 }
