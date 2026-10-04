@@ -79,6 +79,12 @@ export class RedisFake {
   }
 
   /** SET key value EX ttl NX — `'OK'` on success, null when the key exists. */
+  async del(...keys: string[]): Promise<number> {
+    let n = 0;
+    for (const k of keys) if (this.strings.delete(k)) n++;
+    return n;
+  }
+
   async set(
     key: string,
     value: string,

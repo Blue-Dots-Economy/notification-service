@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { dedupe } from '../lib/dedupe';
+import { dedupe, releaseDedupe } from '../lib/dedupe';
 import { buildDedupeKey } from '../lib/dedupe_key';
 import { providers } from '../lib/providers';
 import * as queue from '../lib/queue';
@@ -97,7 +97,7 @@ export async function notifyRoutes(app: FastifyInstance) {
         // Queue first: a slow or unavailable Postgres must never delay an OTP.
         await queue.pushRealtime(job);
         void recordAccepted(record).catch((err) =>
-          req.log.error({ err: err.message, job_id }, 'realtime audit insert failed'),
+          req.log.error({ err: (err as Error)?.message ?? String(err), job_id }, 'realtime audit insert failed'),
         );
         return reply.send({ job_id, enqueued: true });
       }
@@ -109,6 +109,11 @@ export async function notifyRoutes(app: FastifyInstance) {
         await recordAccepted(record);
       } catch (err) {
         req.log.error({ err: (err as Error).message, job_id }, 'audit insert failed; refusing send');
+        // Release the claim so a retry is not suppressed as a duplicate of a
+        // send that was never queued. Best-effort: never changes the 503.
+        await releaseDedupe(key).catch((e) =>
+          req.log.error({ err: (e as Error)?.message ?? String(e), job_id }, 'dedupe release failed'),
+        );
         return reply.code(503).send({ error: 'audit store unavailable', enqueued: false });
       }
       await queue.pushOther(job);

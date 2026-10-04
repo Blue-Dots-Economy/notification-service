@@ -7,7 +7,11 @@ vi.mock('../../plugins/request-auth', () => ({ requestAuth: async () => {} }));
 // dependency-free module and is used for real, so these tests exercise the key
 // the route actually derives.
 const dedupe = vi.fn(async (_key: string, _ttl?: number) => true);
-vi.mock('../../lib/dedupe', () => ({ dedupe: (key: string, ttl?: number) => dedupe(key, ttl) }));
+const releaseDedupe = vi.fn(async (_key: string) => {});
+vi.mock('../../lib/dedupe', () => ({
+  dedupe: (key: string, ttl?: number) => dedupe(key, ttl),
+  releaseDedupe: (key: string) => releaseDedupe(key),
+}));
 
 const { recordAccepted } = vi.hoisted(() => ({ recordAccepted: vi.fn(async (_rec: unknown) => {}) }));
 vi.mock('../../lib/audit/store', () => ({ recordAccepted }));
@@ -77,6 +81,7 @@ beforeEach(() => {
   pushRealtime.mockClear();
   pushOther.mockClear();
   dedupe.mockClear();
+  releaseDedupe.mockReset().mockResolvedValue(undefined);
   dedupe.mockImplementation(async () => true);
 });
 
@@ -197,5 +202,29 @@ describe('/notify audit', () => {
     const res = await signedNotify({ ...body(), priority: 'realtime' });
     expect(res.statusCode).toBe(200);
     expect(pushRealtime).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases the dedupe claim on 503, so the same request is accepted on retry', async () => {
+    const claimed = new Set<string>();
+    dedupe.mockImplementation(async (k: string) => !claimed.has(k) && !!claimed.add(k));
+    releaseDedupe.mockImplementation(async (k: string) => void claimed.delete(k));
+    const payload = { ...body(), dedupe_id: 'x-1' };
+
+    recordAccepted.mockRejectedValueOnce(new Error('db down'));
+    expect((await signedNotify(payload)).statusCode).toBe(503);
+    expect(releaseDedupe).toHaveBeenCalledWith('x-1');
+
+    const retry = await signedNotify(payload);
+    expect(retry.statusCode).toBe(200);
+    expect(retry.json()).toMatchObject({ enqueued: true });
+    expect(recordAccepted).toHaveBeenCalledTimes(2);
+    expect(pushOther).toHaveBeenCalledTimes(1);
+  });
+
+  it('still answers 503 when releasing the claim fails', async () => {
+    recordAccepted.mockRejectedValueOnce(new Error('db down'));
+    releaseDedupe.mockRejectedValueOnce(new Error('redis down'));
+    const res = await signedNotify(body());
+    expect(res.statusCode).toBe(503);
   });
 });
