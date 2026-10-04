@@ -70,4 +70,34 @@ describe('multi-delivery events', () => {
     await upsertAttempt(b!, { status: 'sent', attemptNo: 1 });
     expect((await eventStatus(a!)).status).toBe('sent');
   });
+
+  it('first_available: a1 failed, a2 queued → the event reflects a2 (accepted)', async () => {
+    const [a, b] = records(2, 'first_available');
+    await recordAcceptedMany([a!]);
+    await upsertAttempt(a!, { status: 'failed', attemptNo: 1, error: 'x' });
+    expect((await eventStatus(a!)).status).toBe('failed');
+    await upsertAttempt(b!, { status: 'queued', attemptNo: 1 });
+    expect((await eventStatus(a!)).status).toBe('accepted');
+    await upsertAttempt(b!, { status: 'dispatching', attemptNo: 1 });
+    expect((await eventStatus(a!)).status).toBe('dispatching');
+  });
+
+  it('first_available: a late failure of the earlier attempt never moves a sent event back', async () => {
+    const [a, b] = records(2, 'first_available');
+    await recordAcceptedMany([a!]);
+    await upsertAttempt(a!, { status: 'dispatching', attemptNo: 1 });
+    for (const status of ['queued', 'dispatching', 'sent'] as const) await upsertAttempt(b!, { status, attemptNo: 1 });
+    await upsertAttempt(a!, { status: 'failed', attemptNo: 1, error: 'late' });
+    expect((await eventStatus(a!)).status).toBe('sent');
+    await upsertAttempt(b!, { status: 'delivered', attemptNo: 1 });
+    expect((await eventStatus(a!)).status).toBe('delivered');
+  });
+
+  it('first_available: every attempt closed without success → the latest-closed attempt wins', async () => {
+    const [a, b] = records(2, 'first_available');
+    await recordAcceptedMany([a!]);
+    await upsertAttempt(a!, { status: 'failed', attemptNo: 1, error: 'x' });
+    await upsertAttempt(b!, { status: 'expired', attemptNo: 1 });
+    expect((await eventStatus(a!)).status).toBe('expired');
+  });
 });

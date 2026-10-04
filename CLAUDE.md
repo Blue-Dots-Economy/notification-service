@@ -133,8 +133,8 @@ Postgres is the record of every send; Redis is only the dispatch queue. Code: `s
 path); normal-priority stamps are awaited but bounded by the pool timeouts. A failed stamp never
 turns a delivered message into a retry; it is counted in `ns_audit_write_failures_total{stage}`.
 
-**Attempt markers.** The worker writes `ns:attempt:<attemptId>` = `<sent|retry|failed>:<attemptNo>`
-(TTL 7 days). `sent`/`failed` are written right after the fate is decided and **before** the stamp
+**Attempt markers.** The worker writes `ns:attempt:<attemptId>` = `<sent|retry|failed|expired>:<attemptNo>`
+(TTL 7 days). `sent`/`failed`/`expired` are written right after the fate is decided and **before** the stamp
 (best-effort). `retry` is written in the **same MULTI** as the retry-set ZADD
 (`queue.scheduleRetryWithMarker`), so the marker exists iff the retry is scheduled, and the
 `queued` stamp comes **after** that MULTI: the row stays `dispatching` until the retry is in Redis,
@@ -149,7 +149,12 @@ re-send: delivery is at-least-once.
 **Status model.** Rows are upserted monotonically on `(attempt_no, status_rank)`, so a late or
 replayed stamp cannot move a row backwards. An event's status mirrors its *current* attempt, so it
 can read `accepted` again when a retry is queued. A DLQ replay is a **new** attempt row (fresh
-`attemptId`, same event).
+`attemptId`, same event) and **clears the job's deadline** (an explicit operator action; redacted
+jobs never reach the DLQ). Multi-attempt events (`delivery_mode` `all` / `first_available`) are
+rolled up from all their attempts by `rollUpEvent` (`store.ts`), under a `FOR UPDATE` lock on the
+event row, from both `upsertAttempt` and recovery: `all` → `partially_delivered` when mixed;
+`first_available` → `sent`/`delivered` if **any** attempt reached it (never back to `failed`),
+else the latest attempt (open first, then most recently completed: attempts share `created_at`).
 
 **Recovery (`recoverLostJobs`).** `ns:epoch` in Redis means "Redis still has its data".
 - If it is missing, the holder of a short `ns:recovery` lock re-queues recoverable open attempts
@@ -161,7 +166,7 @@ can read `accepted` again when a retry is queued. A DLQ replay is a **new** atte
   never recovered.
 - Stale `dispatching` rows (> 10 min) are re-queued: at-least-once by design.
 - Every candidate (recoverable, with a job copy) is resolved in order: its **attempt marker**
-  (`sent`/`failed` → that state is stamped, `retry` → left alone, the job is in the retry set);
+  (`sent`/`failed`/`expired` → that state is stamped and the event rolled up, `retry` → left alone, the job is in the retry set);
   then **age** — created more than `RECOVERY_MAX_AGE_HOURS` (default 24) ago → marked `failed`
   (`abandoned: not delivered within recovery window`), counted in `ns_recovery_abandoned_total`;
   otherwise re-queued onto **its own priority's queue** (`pushManyToPriority`: one `MULTI`, each
@@ -608,7 +613,7 @@ you need times the timeout, or lower the timeout.
 
 **Deadlines.** `Job.deadline` is an absolute epoch-ms. Legacy `/notify` sets it for `realtime` jobs
 to now plus `URGENT_DEFAULT_DEADLINE_S`. `processJob` checks it first, and again before every
-deferral and before scheduling a retry. A job past its deadline is never sent: marker `failed`,
+deferral and before scheduling a retry. A job past its deadline is never sent: marker `expired`,
 status `expired` (the error keeps the last provider error, `deadline passed: <error>`),
 `ns_job_expired_total`, and never the DLQ. An OTP that arrives late is worse than none.
 

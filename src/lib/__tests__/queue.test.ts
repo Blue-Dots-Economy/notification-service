@@ -349,6 +349,17 @@ describe('retryFailedJobs replay accounting', () => {
     expect(replayed.audit.correlationId).toBe('corr-1');
   });
 
+  it('clears the deadline on a replayed job (operator action), in both drain modes', async () => {
+    const past = Date.now() - 60_000;
+    await queue.pushDLQ(job({ job_id: 'late-1', deadline: past }));
+    await queue.retryFailedJobs({ jobId: 'late-1' });
+    await queue.pushDLQ(job({ job_id: 'late-2', deadline: past }));
+    await queue.retryFailedJobs({ limit: 1 });
+    const replayed = (await redis.lrange('queue:other', 0, -1)).map((r) => JSON.parse(r) as Job);
+    expect(replayed.map((j) => j.job_id).sort()).toEqual(['late-1', 'late-2']);
+    for (const j of replayed) expect(j).not.toHaveProperty('deadline');
+  });
+
   it('replays a job without audit without adding one', async () => {
     await queue.pushDLQ(job({ job_id: 'n' }));
     await queue.retryFailedJobs({ jobId: 'n' });
