@@ -74,8 +74,11 @@ vi.mock('../providers', () => ({
   },
 }));
 
+const { fork } = vi.hoisted(() => ({ fork: vi.fn() }));
+vi.mock('node:child_process', () => ({ fork }));
+
 const queue = await import('../queue');
-const { processJob, validateWorkerConfig } = await import('../worker');
+const { processJob, spawnWorker, validateWorkerConfig } = await import('../worker');
 
 const job = (over: Partial<Job> = {}): Job => ({
   job_id: 'job-1',
@@ -105,6 +108,48 @@ describe('validateWorkerConfig', () => {
     ['PROVIDER_TIMEOUT_MS', 'x'],
   ])('throws naming %s', (key, value) => {
     expect(() => validateWorkerConfig({ [key]: value })).toThrow(key);
+  });
+});
+
+describe('spawnWorker', () => {
+  it('exits the API with the worker exit code when the worker dies', async () => {
+    const { EventEmitter } = await import('node:events');
+    const child = new EventEmitter();
+    fork.mockReturnValueOnce(child);
+    const exit = vi.fn() as unknown as (code: number) => never;
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    spawnWorker(exit);
+    expect(fork).toHaveBeenCalledWith(expect.any(String), ['worker']);
+    expect(exit).not.toHaveBeenCalled();
+
+    child.emit('exit', 3, null);
+    expect(exit).toHaveBeenCalledWith(3);
+  });
+
+  it('exits non-zero when the worker was killed by a signal', async () => {
+    const { EventEmitter } = await import('node:events');
+    const child = new EventEmitter();
+    fork.mockReturnValueOnce(child);
+    const exit = vi.fn() as unknown as (code: number) => never;
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    spawnWorker(exit);
+    child.emit('exit', null, 'SIGKILL');
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it('defaults to process.exit', async () => {
+    const { EventEmitter } = await import('node:events');
+    const child = new EventEmitter();
+    fork.mockReturnValueOnce(child);
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    spawnWorker();
+    child.emit('exit', 2, null);
+    expect(exitSpy).toHaveBeenCalledWith(2);
+    exitSpy.mockRestore();
   });
 });
 
