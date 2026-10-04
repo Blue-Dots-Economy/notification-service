@@ -5,6 +5,7 @@ import { runMigrations } from './lib/db/migrate.js';
 import { startPartitionMaintenance } from './lib/db/maintenance.js';
 import { recoverAtBoot, recoverLostJobs, recoveryMaxAgeHours } from './lib/audit/recover.js';
 import { describeDbError } from './lib/db/errors.js';
+import { seedBuiltinTemplates } from './lib/templates/seed.js';
 
 const PORT = process.env.SERVER_PORT || `3000`;
 
@@ -20,6 +21,10 @@ async function main() {
   // Before the worker starts draining, so recovered jobs join the queue in order.
   // Not fatal: the periodic sweep below retries within 5 minutes.
   await recoverAtBoot();
+  // Non-fatal: a seeding problem must never keep NS from sending.
+  await seedBuiltinTemplates()
+    .then((outcome) => console.log(`Built-in templates: ${outcome}`))
+    .catch((err) => console.error('Built-in template seeding failed:', describeDbError(err)));
   await app.listen({ port: parseInt(PORT) || 3000, host: '0.0.0.0' });
   spawnWorker();
   // Periodic stale-dispatch sweep; a failure is logged, never thrown.
