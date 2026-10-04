@@ -58,6 +58,7 @@ ENV NODE_ENV=production
 COPY --from=prod-deps /app/node_modules ./node_modules
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY --from=builder /app/dist ./dist
+COPY drizzle ./drizzle
 
 # Drop root: the hardened base ships a uid-1000 `node` user. The app only
 # reads /app (world-readable) and writes nothing to disk (all state is in Redis),
