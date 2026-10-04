@@ -19,7 +19,7 @@ const MAX_RETRIES = 5;
 /** Past its deadline: never sent. Terminal, and never dead-lettered. */
 async function expire(job: Job, attemptNo: number, cause?: string) {
   await metrics.incr('ns_job_expired_total', { channel: job.channel });
-  await markAttempt(job, 'failed', attemptNo);
+  await markAttempt(job, 'expired', attemptNo);
   await stamp(job, { status: 'expired', attemptNo, error: cause ? `deadline passed: ${cause}` : 'deadline passed' });
 }
 

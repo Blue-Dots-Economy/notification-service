@@ -22,6 +22,12 @@ describe('attempt markers', () => {
     expect(m.has('missing')).toBe(false);
   });
 
+  it('round-trips the expired fate', async () => {
+    await markAttempt(job, 'expired', 3);
+    expect(await redis.get(attemptMarkerKey('a1'))).toBe('expired:3');
+    expect((await readAttemptMarkers(['a1'])).get('a1')).toEqual({ fate: 'expired', attemptNo: 3 });
+  });
+
   it('never throws when Redis fails', async () => {
     const set = redis.set.bind(redis);
     redis.set = (async () => { throw new Error('down'); }) as never;

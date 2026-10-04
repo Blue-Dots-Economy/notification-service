@@ -542,7 +542,8 @@ describe('deadlines and redacted jobs', () => {
     await processJob(smsJob({ priority: 'realtime', deadline: Date.now() - 1 }));
     expect(send).not.toHaveBeenCalled();
     expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'expired' }));
-    expect(markAttempt).toHaveBeenCalledWith(expect.anything(), 'failed', expect.any(Number));
+    expect(markAttempt).toHaveBeenCalledWith(expect.anything(), 'expired', 1);
+    expect(markAttempt).not.toHaveBeenCalledWith(expect.anything(), 'failed', expect.anything());
     expect(incr).toHaveBeenCalledWith('ns_job_expired_total', { channel: 'sms' });
     expect(queue.pushDLQ).not.toHaveBeenCalled();
   });
@@ -826,5 +827,6 @@ describe('v1 jobs', () => {
     await processJob({ ...v1Job(), deadline: Date.now() - 1 } as never);
     expect(smsSendRendered).not.toHaveBeenCalled();
     expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'expired' }));
+    expect(markAttempt).toHaveBeenLastCalledWith(expect.anything(), 'expired', 1);
   });
 });

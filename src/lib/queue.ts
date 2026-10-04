@@ -179,6 +179,10 @@ async function requeueFailedJob(raw: string, priority: Priority) {
     priority,
     attempt: 0,
     next_attempt_at: undefined,
+    // A replay is an explicit operator action: the original deadline (if any)
+    // no longer applies, or a replayed job would only expire. Redacted (OTP)
+    // jobs never reach the DLQ, so this cannot revive a stale code.
+    deadline: undefined,
     replays: (job.replays ?? 0) + 1,
     // A replay is a new delivery attempt: it gets its own attempt id so its
     // status writes are not rejected as older than the stored failed attempt.
