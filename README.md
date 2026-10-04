@@ -190,7 +190,8 @@ Every endpoint below requires signed auth headers.
 ```text
 GET  /                    # Scalar API reference HTML
 GET  /openapi.json        # OpenAPI document
-POST /notify              # Enqueue a notification
+POST /notify              # Enqueue a notification (legacy)
+POST /v1/notify           # Send API v1: policy-routed or template-key send
 GET  /providers           # List providers and complete payload examples
 GET  /providers/:name     # Find one provider by name
 GET  /metrics/queue       # Queue depths and retry/DLQ metrics
@@ -338,6 +339,64 @@ Example secret configuration:
   }
 }
 ```
+
+## Send API v1
+
+```text
+POST /v1/notify
+```
+
+Send by `event_type` (a published policy picks the channels) or by `template_key` plus `channel`.
+Content is rendered and validated before the request is accepted. The network and the email sender
+(`EMAIL_FROM_ADDRESS`, `EMAIL_FROM_NAME`) are server configuration, never request fields; unknown
+keys return `400`.
+
+```json
+{
+  "event_type": "login_otp",
+  "to": { "phone": "+918888888888" },
+  "variables": { "message": "987654" },
+  "priority": "urgent",
+  "idempotency_key": "login-8f3a"
+}
+```
+
+```json
+{
+  "notification_event_id": "7b0e5c1e-...",
+  "correlation_id": "7b0e5c1e-...",
+  "status": "accepted",
+  "mode": "first_available",
+  "deliveries": [{ "channel": "sms" }]
+}
+```
+
+| Field | Rule |
+|---|---|
+| `event_type` / `template_key` | Exactly one. `template_key` needs `channel`; `event_type` forbids it |
+| `to` | `email` and/or E.164 `phone`; at least one |
+| `variables` | Checked against the planned templates' contracts |
+| `priority` | `urgent`, `normal` (default) or `bulk` |
+| `idempotency_key` | 1-128 chars. A repeat returns `200` with the original response |
+| `deadline` | ISO-8601 with offset, in the future, at most 24 h ahead |
+| `cc`, `reply_to`, `attachments` | Email only |
+
+| Status | Meaning |
+|---|---|
+| `200` | Repeat of an `idempotency_key`: the original response |
+| `202` | Accepted; delivery is asynchronous |
+| `400` | Invalid request or `invalid_deadline` |
+| `409` | `idempotency_in_progress`, or `duplicate-fallback` (same content within 5 s and no key) |
+| `422` | `{ error, kind, message, details? }`; `kind` is `caller` or `configuration` |
+| `503` | `network_not_configured`, or `audit store unavailable` (normal/bulk) |
+
+`422` codes. `caller`: `missing_variable`, `unknown_variable`, `invalid_variable`,
+`no_reachable_channel`. `configuration`: `not_found`, `vendor_mismatch`, `incomplete_template`,
+`body_too_long`, `unknown_channel`, `no_policy`. Messages name variables, never their values.
+
+Urgent sends and sends using a template with a `sensitive` variable are redacted: only variable names
+are stored, and they are never dead-lettered. See `CLAUDE.md` (Send API v1) for planning, fallthrough,
+deadline and idempotency rules.
 
 ## Queue A Notification
 
