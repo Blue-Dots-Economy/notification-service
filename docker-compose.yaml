@@ -6,12 +6,20 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     environment:
       SERVER_PORT: $SERVER_PORT
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_PASSWORD: $REDIS_PASSWORD
       INTERNAL_SECRETS_JSON: $INTERNAL_SECRETS_JSON
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_NAME: notification
+      DATABASE_USER: notification
+      DATABASE_PASSWORD: notification
+      DATABASE_SSL: disable
       #Providers
       SMTP_AWS_SES: ${SMTP_AWS_SES}
       AWS_REGION: ${AWS_REGION}
@@ -58,6 +66,25 @@ services:
       - notification-service-redis:/data
     networks:
       - notification-service-net
+  postgres:
+    container_name: notification-service-postgres
+    build: ./docker/postgres
+    environment:
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      # -h 127.0.0.1 probes over TCP. The image's first-boot init server listens
+      # on the unix socket only, so a socket probe reports ready before init.sql
+      # has run.
+      test: ['CMD-SHELL', 'pg_isready -h 127.0.0.1 -U postgres -d notification']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - '5432:5432'
+    volumes:
+      - notification-service-postgres:/var/lib/postgresql/data
+    networks:
+      - notification-service-net
 networks:
   notification-service-net:
     name: notification-service-net
@@ -65,3 +92,5 @@ networks:
 volumes:
   notification-service-redis:
     name: notification-service-redis
+  notification-service-postgres:
+    name: notification-service-postgres
