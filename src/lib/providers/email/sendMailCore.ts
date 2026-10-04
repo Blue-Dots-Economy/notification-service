@@ -18,7 +18,7 @@ interface Email_request {
   replyTo?: string;
   to: string;
   subject: string;
-  /** At least one of `html` / `text` is required. */
+  /** Legacy /notify always sends `html`; v1 (sendRendered) sends `html` and/or `text`. */
   html?: string;
   text?: string;
   activationUrl?: string;
@@ -145,8 +145,6 @@ export async function sendMail({
     }
   }
 
-  if (!html && !text) throw new Error('sendMail needs html or text');
-
   await initTransporter();
 
   try {
@@ -167,8 +165,13 @@ export async function sendMail({
       // legitimate unescaped `>` from visible copy — "Score > 90" became
       // "Score  90" and "A => B" became "A = B" — which silently corrupts the
       // plain-text body of ordinary mail. See the mailer test.
-      text: text ?? (html ? html.replace(/<[^>]+>/g, '').replace(/</g, '') : undefined),
-      ...(html ? { html } : {}),
+      //
+      // Without `text` (legacy /notify) this is exactly the original behaviour:
+      // text derived from `html`, `html` passed as given. sendRendered checks
+      // that a v1 email has a body before it gets here.
+      ...(text === undefined
+        ? { text: (html as string).replace(/<[^>]+>/g, '').replace(/</g, ''), html }
+        : { text, ...(html ? { html } : {}) }),
       // Decoded here rather than passing `encoding: 'base64'` so nodemailer
       // handles the transfer encoding itself for whatever transport is active
       // (the SES transport re-encodes into raw MIME).

@@ -100,7 +100,7 @@ describe('POST /v1/notify end to end', () => {
       `SELECT delivery_mode, status, payload, payload::text AS payload_text
          FROM notification_event WHERE id = $1`, [eventId]);
     expect(event).toMatchObject({ delivery_mode: 'single', status: 'sent' });
-    expect(event.payload).toMatchObject({ variable_names: ['message'] });
+    expect(event.payload).toMatchObject({ to: { phone: PHONE }, variable_names: ['message'] });
     expect(event.payload_text).not.toContain(OTP);
   });
 

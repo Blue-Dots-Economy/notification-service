@@ -161,4 +161,17 @@ describe('emailProvider.send', () => {
     });
     expect(sendMailSpy.mock.calls[0][0]).not.toHaveProperty('attachments');
   });
+
+  // Legacy /notify behaviour is unchanged by the v1 html-or-text work: an empty
+  // html still sends (an empty body), it is not turned into a thrown error.
+  it('legacy send with an empty html still sends, as before v1', async () => {
+    const res = await emailProvider.send({
+      to: 'support@example.com',
+      template_id: 'BASIC_EMAIL',
+      variables: { ...base, html: '' },
+    });
+    expect(res).toEqual({ ok: true });
+    expect(sendMailSpy).toHaveBeenCalledTimes(1);
+    expect(sendMailSpy.mock.calls[0][0]).toMatchObject({ html: '', text: '' });
+  });
 });

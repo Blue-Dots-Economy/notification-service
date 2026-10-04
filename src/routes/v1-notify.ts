@@ -24,12 +24,15 @@ const FALLBACK_TTL_S = 5;
 function buildJobs(req: V1Request, plan: SendPlan, correlationHeader: unknown): Job[] {
   const eventId = randomUUID();
   const createdAt = new Date().toISOString();
-  const correlationId = correlationIdFrom(correlationHeader, eventId);
+  // A correlation_id in the body wins over the x-correlation-id header.
+  const correlationId = correlationIdFrom(req.correlation_id || correlationHeader, eventId);
   const priority = PRIORITY_MAP[req.priority];
   const email =
     req.cc || req.reply_to || req.attachments
       ? { cc: req.cc, replyTo: req.reply_to, attachments: req.attachments }
       : undefined;
+  const recipients: Record<string, string> = {};
+  for (const [k, v] of Object.entries(req.to)) if (typeof v === 'string') recipients[k] = v;
   const make = (deliveries: SendPlan['deliveries']): Job => ({
     job_id: randomUUID(),
     channel: deliveries[0]!.channel,
@@ -39,7 +42,13 @@ function buildJobs(req: V1Request, plan: SendPlan, correlationHeader: unknown): 
     // Redacted sends carry no values anywhere the audit layer can see.
     variables: plan.redact ? {} : plan.variables,
     ...(plan.deadline !== undefined ? { deadline: plan.deadline } : {}),
-    v1: { mode: plan.mode, deliveries, index: 0, ...(email ? { email } : {}) },
+    v1: {
+      mode: plan.mode,
+      deliveries,
+      index: 0,
+      // Email extras ride only on a job that can deliver by email.
+      ...(email && deliveries.some((d) => d.channel === 'email') ? { email } : {}),
+    },
     audit: {
       eventId,
       attemptId: randomUUID(),
@@ -47,6 +56,7 @@ function buildJobs(req: V1Request, plan: SendPlan, correlationHeader: unknown): 
       correlationId,
       redactValues: plan.redact,
       deliveryMode: plan.mode,
+      recipients,
       ...(plan.redact ? { variableNames: Object.keys(plan.variables) } : {}),
     },
   });
@@ -148,9 +158,13 @@ export async function v1NotifyRoutes(app: FastifyInstance) {
           deliveries: plan.deliveries.map((d) => ({ channel: d.channel })),
         };
         if (body.idempotency_key) {
-          await completeIdempotency(network, body.idempotency_key, priority, response).catch((err) =>
-            req.log.error({ err: describeDbError(err), event: eventId }, 'idempotency completion failed'),
-          );
+          // One retry. If both fail the send still stands (it is queued); the
+          // claim stays pending, so a repeat answers 409 idempotency_in_progress
+          // until the 15-minute claim window passes and the key is reclaimable.
+          const complete = () => completeIdempotency(network, body.idempotency_key!, priority, response);
+          await complete()
+            .catch(() => complete())
+            .catch((err) => req.log.error({ err: describeDbError(err), event: eventId }, 'idempotency completion failed'));
         }
         released = true; // accepted: the claim now stands
         return reply.code(202).send(response);
