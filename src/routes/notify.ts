@@ -9,6 +9,7 @@ import { recordAccepted } from '../lib/audit/store';
 import { toAcceptedRecord } from '../lib/audit/redact';
 import { stamp } from '../lib/audit/stamp';
 import { describeDbError } from '../lib/db/errors';
+import { urgentDefaultDeadlineS } from '../lib/deadline';
 import { requestAuth } from '../plugins/request-auth';
 import { notifyBodyLimitBytes } from '../lib/providers/email/attachments';
 
@@ -92,6 +93,7 @@ export async function notifyRoutes(app: FastifyInstance) {
         job_id,
         ...body,
         priority,
+        ...(priority === 'realtime' ? { deadline: Date.now() + urgentDefaultDeadlineS() * 1000 } : {}),
         audit: {
           eventId: randomUUID(),
           attemptId: randomUUID(),

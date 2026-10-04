@@ -9,8 +9,33 @@ import { ProviderSendResult } from 'src/types/provider';
 import { loadSecrets } from './auth/secrets';
 import { stamp } from './audit/stamp';
 import { attemptMarker, markAttempt } from './audit/marker';
+import { isExpired, isRedacted, urgentDefaultDeadlineS, wouldExpire } from './deadline';
 
 const MAX_RETRIES = 5;
+
+/** Past its deadline: never sent. Terminal, and never dead-lettered. */
+async function expire(job: Job, attemptNo: number) {
+  await metrics.incr('ns_job_expired_total', { channel: job.channel });
+  await markAttempt(job, 'failed', attemptNo);
+  await stamp(job, { status: 'expired', attemptNo, error: 'deadline passed' });
+}
+
+/**
+ * Where a job goes when it cannot be sent. Redacted (OTP) jobs are never put in
+ * the DLQ: a dead-letter entry would keep a live code at rest. They end
+ * `failed` and are counted as dropped instead.
+ */
+async function dropOrDeadLetter(job: Job, reason: string, error?: string) {
+  const attemptNo = job.attempt ?? 1;
+  await markAttempt(job, 'failed', attemptNo);
+  await stamp(job, { status: 'failed', attemptNo, error: error ?? reason });
+  if (isRedacted(job)) {
+    await metrics.incr('ns_job_dropped_total', { channel: job.channel, reason });
+    return;
+  }
+  await metrics.incr('ns_job_dlq_total', { channel: job.channel, reason });
+  return pushDLQ(job);
+}
 
 /**
  * Runs one job through its provider, then decides its fate: delivered, scheduled
@@ -21,6 +46,8 @@ const MAX_RETRIES = 5;
  * @param job - The job to attempt. Its `attempt` counter is incremented in place.
  */
 export async function processJob(job: Job) {
+  if (isExpired(job)) return expire(job, (job.attempt ?? 0) + 1);
+
   const provider = providers[job.channel];
 
   // Before the attempt is counted: a rate-limited job has not been tried, so it
@@ -36,22 +63,23 @@ export async function processJob(job: Job) {
         `rate limit check failed for ${job.job_id}, deferring:`,
         err instanceof Error ? err.message : String(err),
       );
-      return deferJob(job, rateLimitDeferMs());
+      const wait = rateLimitDeferMs();
+      if (wouldExpire(job, wait)) return expire(job, (job.attempt ?? 0) + 1);
+      return deferJob(job, wait);
     }
   }
   if (!granted) {
     await metrics.incr('ns_rate_limited_total', { channel: job.channel, priority: job.priority });
-    return deferJob(job, rateLimitDeferMs());
+    const wait = rateLimitDeferMs();
+    if (wouldExpire(job, wait)) return expire(job, (job.attempt ?? 0) + 1);
+    return deferJob(job, wait);
   }
 
   job.attempt = (job.attempt ?? 0) + 1;
 
   if (!provider) {
-    await metrics.incr('ns_job_dlq_total', { channel: job.channel, reason: 'unknown_channel' });
     console.log('Unknown provider, sending to DLQ:', job.job_id, job.channel);
-    await markAttempt(job, 'failed', job.attempt);
-    await stamp(job, { status: 'failed', attemptNo: job.attempt, error: 'unknown_channel' });
-    return pushDLQ(job);
+    return dropOrDeadLetter(job, 'unknown_channel');
   }
 
   // Resolve a known template name to its provider-side id; when the provider
@@ -69,24 +97,18 @@ export async function processJob(job: Job) {
   // compliance break and a phishing primitive. Declared-but-blank is a
   // configuration gap, never an invitation for the caller to fill it.
   if (named === '' || namedBody === '') {
-    await metrics.incr('ns_job_dlq_total', { channel: job.channel, reason: 'template_not_configured' });
     console.log(
       `Template '${job.template_id}' is named but not fully configured for the active provider ` +
         `(id=${named === '' ? 'missing' : 'ok'}, body=${namedBody === '' ? 'missing' : 'ok'}), sending to DLQ:`,
       job.job_id
     );
-    await markAttempt(job, 'failed', job.attempt);
-    await stamp(job, { status: 'failed', attemptNo: job.attempt, error: 'template_not_configured' });
-    return pushDLQ(job);
+    return dropOrDeadLetter(job, 'template_not_configured');
   }
 
   const templateId = named ?? (provider.allowRawTemplateId ? job.template_id : undefined);
   if (!templateId) {
-    await metrics.incr('ns_job_dlq_total', { channel: job.channel, reason: 'unknown_template' });
     console.log('Unknown provider template, sending to DLQ:', job.job_id);
-    await markAttempt(job, 'failed', job.attempt);
-    await stamp(job, { status: 'failed', attemptNo: job.attempt, error: 'unknown_template' });
-    return pushDLQ(job);
+    return dropOrDeadLetter(job, 'unknown_template');
   }
 
   console.log(`Processing ${job.job_id} (attempt ${job.attempt})`);
@@ -123,24 +145,19 @@ export async function processJob(job: Job) {
     // rejected sender id — will fail identically four more times. Retrying it
     // only delays the diagnosis and buries the cause under "max retries".
     if (res.retryable === false) {
-      await metrics.incr('ns_job_dlq_total', { channel: job.channel, reason: 'permanent_failure' });
       console.log(`Permanent failure → DLQ: ${job.job_id}${res.error ? ` (${res.error})` : ''}`);
-      await markAttempt(job, 'failed', job.attempt);
-      await stamp(job, { status: 'failed', attemptNo: job.attempt, error: res.error ?? 'permanent_failure' });
-      return pushDLQ(job);
+      return dropOrDeadLetter(job, 'permanent_failure', res.error);
     }
 
     if (job.attempt >= MAX_RETRIES) {
-      await metrics.incr('ns_job_dlq_total', { channel: job.channel, reason: 'max_retries' });
       console.log(
         `Max retries reached → DLQ: ${job.job_id}${res.error ? ` (${res.error})` : ''}`
       );
-      await markAttempt(job, 'failed', job.attempt);
-      await stamp(job, { status: 'failed', attemptNo: job.attempt, error: res.error ?? 'max_retries' });
-      return pushDLQ(job);
+      return dropOrDeadLetter(job, 'max_retries', res.error);
     }
 
     const delay = 5 * Math.pow(2, job.attempt - 1);
+    if (wouldExpire(job, delay * 1000)) return expire(job, job.attempt);
     console.log(`Retry scheduled in ${delay}s:`, job.job_id);
 
     // Stamp, then the retry ZADD and the `retry` marker in one MULTI: the
@@ -166,6 +183,7 @@ export function validateWorkerConfig(env: NodeJS.ProcessEnv = process.env): void
   for (const channel of Object.keys(providers)) bucketsFor(channel, env);
   rateLimitDeferMs(env);
   providerTimeoutMs(env);
+  urgentDefaultDeadlineS(env);
 }
 
 /**

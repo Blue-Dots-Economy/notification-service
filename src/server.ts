@@ -4,6 +4,7 @@ import { spawnWorker } from './lib/worker.js';
 import { runMigrations } from './lib/db/migrate.js';
 import { startPartitionMaintenance } from './lib/db/maintenance.js';
 import { recoverAtBoot, recoverLostJobs, recoveryMaxAgeHours } from './lib/audit/recover.js';
+import { urgentDefaultDeadlineS } from './lib/deadline.js';
 import { describeDbError } from './lib/db/errors.js';
 import { seedBuiltinTemplates } from './lib/templates/seed.js';
 
@@ -18,6 +19,7 @@ async function main() {
   startPartitionMaintenance();
   // Config errors are fatal; a recovery failure is not.
   recoveryMaxAgeHours();
+  urgentDefaultDeadlineS();
   // Before the worker starts draining, so recovered jobs join the queue in order.
   // Not fatal: the periodic sweep below retries within 5 minutes.
   await recoverAtBoot();

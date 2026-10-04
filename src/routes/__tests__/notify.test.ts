@@ -208,6 +208,16 @@ describe('/notify audit', () => {
     expect(ot.audit.redactValues).toBe(false);
   });
 
+  it('gives a realtime job a deadline about 600s out, and an other job none', async () => {
+    const before = Date.now();
+    await signedNotify({ ...body(), priority: 'realtime' });
+    await signedNotify(body({ subject: 'other two' }));
+    const rt = (pushRealtime.mock.calls[0] as unknown as [{ deadline?: number }])[0];
+    const ot = (pushOther.mock.calls[0] as unknown as [{ deadline?: number }])[0];
+    expect(Math.abs(rt.deadline! - (before + 600_000))).toBeLessThan(5000);
+    expect(ot.deadline).toBeUndefined();
+  });
+
   it('realtime still enqueues when the audit insert fails', async () => {
     recordAccepted.mockRejectedValueOnce(new Error('db down'));
     const res = await signedNotify({ ...body(), priority: 'realtime' });
