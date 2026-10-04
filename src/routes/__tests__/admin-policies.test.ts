@@ -1,11 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const auth = vi.hoisted(() => ({
-  authenticate: vi.fn((_opts: unknown) => async (req: any) => {
+// Route scopes are pinned in src/__tests__/route-scopes.test.ts.
+vi.mock('../../plugins/auth', () => ({
+  authenticate: () => async (req: any) => {
     req.principal = { kind: 'hmac', id: 'test-key', scopes: new Set(['notify:send', 'templates:admin']) };
-  }),
+  },
 }));
-vi.mock('../../plugins/auth', () => auth);
 const repo = vi.hoisted(() => ({
   createPolicyDraft: vi.fn(), updatePolicyDraft: vi.fn(), publishPolicy: vi.fn(),
   retirePolicy: vi.fn(), getPolicy: vi.fn(), listPolicies: vi.fn(),
@@ -38,13 +38,6 @@ beforeEach(() => {
 });
 
 describe('admin policy routes', () => {
-  it('guards every route with the templates:admin scope', async () => {
-    auth.authenticate.mockClear();
-    await build();
-    expect(auth.authenticate).toHaveBeenCalled();
-    for (const [opts] of auth.authenticate.mock.calls) expect(opts).toEqual({ scope: 'templates:admin' });
-  });
-
   it('creates a draft', async () => {
     repo.createPolicyDraft.mockResolvedValue(row);
     const res = await (await build()).inject({
