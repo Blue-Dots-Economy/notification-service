@@ -161,6 +161,18 @@ describe('getQueueMetrics', () => {
     expect(m.other).toBe(2);
     expect(m.dlq).toBe(1);
     expect(m.retry_count).toBe(1);
+    expect(m.bulk).toBe(0);
+  });
+
+  it('counts the bulk queue separately', async () => {
+    await queue.pushToPriority(job({ job_id: 'b1', priority: 'bulk' }));
+    await queue.pushToPriority(job({ job_id: 'b2', priority: 'bulk' }));
+    await queue.pushOther(job({ job_id: 'o1' }));
+
+    const m = await queue.getQueueMetrics();
+
+    expect(m.bulk).toBe(2);
+    expect(m.other).toBe(1);
   });
 
   it('reports the oldest retry as an epoch-milliseconds timestamp', async () => {
