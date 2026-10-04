@@ -35,7 +35,10 @@ export async function pushOther(job: Job) {
 }
 
 export async function pushToPriority(job: Job): Promise<void> {
-  await redis.lpush(QUEUE_KEYS[job.priority] ?? QUEUE_KEYS.other, JSON.stringify(job));
+  const key = Object.prototype.hasOwnProperty.call(QUEUE_KEYS, job.priority)
+    ? QUEUE_KEYS[job.priority]
+    : QUEUE_KEYS.other;
+  await redis.lpush(key, JSON.stringify(job));
 }
 
 /**
@@ -59,15 +62,16 @@ export async function deferJob(job: Job, delayMs: number): Promise<void> {
 
 // Claim every due retry and push it onto its own priority's queue in one atomic
 // step, so concurrent schedulers never move a member twice and a retry never
-// changes pool. A member that is not valid JSON goes to the DLQ untouched rather
-// than vanishing. Fixed script; keys and cutoff are passed as KEYS/ARGV.
+// changes pool. A member that is not a JSON object with a string job_id goes to
+// the DLQ untouched rather than vanishing. Each call claims at most 1000 members
+// so one EVAL never blocks Redis for long; the caller simply calls again. Fixed script; keys and cutoff are passed as KEYS/ARGV.
 const MOVE_DUE_RETRIES = `
-local due = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1])
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'LIMIT', 0, 1000)
 local moved = 0
 for _, raw in ipairs(due) do
   redis.call('ZREM', KEYS[1], raw)
   local ok, job = pcall(cjson.decode, raw)
-  if ok and type(job) == 'table' then
+  if ok and type(job) == 'table' and type(job['job_id']) == 'string' then
     local p = job['priority']
     local target = KEYS[3]
     if p == 'realtime' then target = KEYS[2] elseif p == 'bulk' then target = KEYS[4] end
@@ -80,6 +84,7 @@ end
 return moved
 `;
 
+/** Moves up to 1000 due retries per call; returns how many were routed to a priority queue. */
 export async function moveDueRetries(now = Date.now()): Promise<number> {
   return (await redis.eval(
     MOVE_DUE_RETRIES,

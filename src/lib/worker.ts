@@ -1,10 +1,5 @@
-import {
-  popRealtime,
-  popOther,
-  popScheduledRetries,
-  pushDLQ,
-  scheduleRetryWithMarker,
-} from './queue';
+import { pushDLQ, scheduleRetryWithMarker } from './queue';
+import { poolConfig, startPools } from './pools';
 import { providers } from './providers';
 import * as metrics from './metrics';
 import { Job } from 'src/types';
@@ -19,7 +14,7 @@ const MAX_RETRIES = 5;
  * Runs one job through its provider, then decides its fate: delivered, scheduled
  * for another attempt with exponential backoff, or moved to the dead-letter queue.
  *
- * Exported for tests. `mainLoop` is the only production caller.
+ * Exported for tests. The worker pools are the only production caller.
  *
  * @param job - The job to attempt. Its `attempt` counter is incremented in place.
  */
@@ -143,38 +138,6 @@ export async function processJob(job: Job) {
   console.log('Delivered:', job.job_id);
 }
 
-async function mainLoop() {
-  while (true) {
-    // 1) Try realtime queue first, but do not block forever.
-    const realtime = await popRealtime();
-    if (realtime) {
-      const job = JSON.parse(realtime[1]);
-      await processJob(job);
-      continue;
-    }
-
-    // 2) Try retry queue
-    const retries = await popScheduledRetries();
-    if (retries.length > 0) {
-      for (const job of retries) {
-        await processJob(job);
-      }
-      continue;
-    }
-
-    // 3) Try other queue (low priority), also with a short timeout.
-    const other = await popOther();
-    if (other) {
-      const job = JSON.parse(other[1]);
-      await processJob(job);
-      continue;
-    }
-
-    // 4) idle for 200ms
-    await new Promise((r) => setTimeout(r, 200));
-  }
-}
-
 /**
  * Keep the provider balance gauge fresh. Insufficient balance fails every send
  * permanently and looks exactly like a bad template from the outside, so it
@@ -203,10 +166,9 @@ if (process.argv.includes('worker')) {
   // An unhandled rejection here would kill the only process that sends
   // anything, while the API stays healthy and keeps accepting jobs into a queue
   // nothing drains. Crash loudly instead so the orchestrator restarts it.
-  mainLoop().catch((err) => {
-    console.error('Worker main loop died:', err);
-    process.exit(1);
-  });
+  // Fail fast on bad pool config: a worker that cannot size its pools must not
+  // start half-configured.
+  startPools(poolConfig());
 }
 
 export function spawnWorker() {
