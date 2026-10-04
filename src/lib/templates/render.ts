@@ -10,6 +10,9 @@ export type Rendered =
 
 const TOKEN = /\{\{(\w+)\}\}/g;
 
+/** C0 controls, DEL, NEL and the Unicode line/paragraph separators: no header injection via a subject. */
+const SUBJECT_BREAKS = /[\x00-\x1f\x7f\u0085\u2028\u2029]+/g;
+
 export function escapeHtml(s: string): string {
   return s
     .replace(/&/g, '&amp;')
@@ -58,7 +61,7 @@ export function renderTemplate(
     return {
       mode: 'ns',
       channel: 'email',
-      subject: substitute(t.subject, values, t.variables, false).replace(/[\r\n]+/g, ' '),
+      subject: substitute(t.subject, values, t.variables, false).replace(SUBJECT_BREAKS, ' '),
       html: t.bodyHtml ? substitute(t.bodyHtml, values, t.variables, true) : null,
       text: t.bodyText ? substitute(t.bodyText, values, t.variables, false) : null,
     };
