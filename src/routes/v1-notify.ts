@@ -12,7 +12,7 @@ import * as metrics from '../lib/metrics';
 import { currentNetwork, NetworkNotConfigured } from '../lib/network';
 import { notifyBodyLimitBytes } from '../lib/providers/email/attachments';
 import { pushManyToPriority } from '../lib/queue';
-import { SendError } from '../lib/send/errors';
+import { SendError, StoreUnavailable } from '../lib/send/errors';
 import { claimIdempotency, completeIdempotency, fallbackKey, releaseIdempotency } from '../lib/send/idempotency';
 import { planSend, type SendPlan } from '../lib/send/plan';
 import { PRIORITY_MAP, V1NotifySchema, type V1Request } from '../lib/send/request';
@@ -100,6 +100,7 @@ export async function v1NotifyRoutes(app: FastifyInstance) {
         } catch (e) {
           await release();
           if (e instanceof RangeError) return reply.code(400).send({ error: 'invalid_deadline', message: e.message });
+          if (e instanceof StoreUnavailable) return reply.code(503).send({ error: 'template store unavailable' });
           if (e instanceof SendError) {
             await metrics.incr('ns_send_rejected_total', { kind: e.kind, code: e.code });
             return reply.code(422).send({

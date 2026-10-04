@@ -6,6 +6,8 @@ const repo = vi.hoisted(() => ({
   retirePolicy: vi.fn(), getPolicy: vi.fn(), listPolicies: vi.fn(),
 }));
 vi.mock('../../lib/policies/repo', () => repo);
+const cache = vi.hoisted(() => ({ clearResolveCache: vi.fn() }));
+vi.mock('../../lib/send/resolver-cache', () => cache);
 
 const Fastify = (await import('fastify')).default;
 const { adminPolicyRoutes } = await import('../admin-policies');
@@ -28,6 +30,7 @@ async function build() {
 beforeEach(() => {
   process.env.NS_ADMIN_KEY_IDS = 'ns-admin';
   Object.values(repo).forEach((f) => f.mockReset());
+  cache.clearResolveCache.mockClear();
 });
 
 describe('admin policy routes', () => {
@@ -74,5 +77,18 @@ describe('admin policy routes', () => {
     const res = await (await build()).inject({ method: 'POST', url: `/v1/admin/policies/${ID}/publish`, headers: admin });
     expect(res.statusCode).toBe(422);
     expect(res.json()).toMatchObject({ error: 'incomplete_template', details: { channel: 'sms' } });
+  });
+
+  it('publish and retire clear the send-path resolver cache; a failed publish does not', async () => {
+    const app = await build();
+    repo.publishPolicy.mockRejectedValueOnce(new TemplateError('invalid_state', 'x'));
+    await app.inject({ method: 'POST', url: `/v1/admin/policies/${ID}/publish`, headers: admin });
+    expect(cache.clearResolveCache).not.toHaveBeenCalled();
+    repo.publishPolicy.mockResolvedValue({ ...row, status: 'active' });
+    expect((await app.inject({ method: 'POST', url: `/v1/admin/policies/${ID}/publish`, headers: admin })).statusCode).toBe(200);
+    expect(cache.clearResolveCache).toHaveBeenCalledTimes(1);
+    repo.retirePolicy.mockResolvedValue({ ...row, status: 'retired' });
+    expect((await app.inject({ method: 'POST', url: `/v1/admin/policies/${ID}/retire`, headers: admin })).statusCode).toBe(200);
+    expect(cache.clearResolveCache).toHaveBeenCalledTimes(2);
   });
 });

@@ -9,6 +9,7 @@ import { TemplateError } from '../lib/templates/errors';
 import { requestAuth } from '../plugins/request-auth';
 import { requireAdmin } from '../plugins/require-admin';
 import { sendAdminError } from './admin-errors';
+import { clearResolveCache } from '../lib/send/resolver-cache';
 
 const nullableText = (max: number) => z.string().max(max).nullable().optional();
 
@@ -115,15 +116,21 @@ export async function adminTemplateRoutes(app: FastifyInstance) {
   app.post('/v1/admin/templates/:id/publish', { preHandler }, async (req, reply) => {
     const p = IdParams.safeParse(req.params);
     if (!p.success) return reply.code(400).send(z.formatError(p.error));
-    try { return serializeTemplate(await repo.publishTemplate(p.data.id, actorOf(req.headers))); }
-    catch (err) { return sendAdminError(reply, err); }
+    try {
+      const row = await repo.publishTemplate(p.data.id, actorOf(req.headers));
+      clearResolveCache(); // this pod sees the change now; others within the cache TTL
+      return serializeTemplate(row);
+    } catch (err) { return sendAdminError(reply, err); }
   });
 
   app.post('/v1/admin/templates/:id/retire', { preHandler }, async (req, reply) => {
     const p = IdParams.safeParse(req.params);
     if (!p.success) return reply.code(400).send(z.formatError(p.error));
-    try { return serializeTemplate(await repo.retireTemplate(p.data.id)); }
-    catch (err) { return sendAdminError(reply, err); }
+    try {
+      const row = await repo.retireTemplate(p.data.id);
+      clearResolveCache(); // this pod sees the change now; others within the cache TTL
+      return serializeTemplate(row);
+    } catch (err) { return sendAdminError(reply, err); }
   });
 
   app.post('/v1/admin/templates/:id/preview', { preHandler }, async (req, reply) => {

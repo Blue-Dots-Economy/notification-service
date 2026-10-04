@@ -5,6 +5,7 @@ import * as repo from '../lib/policies/repo';
 import { requestAuth } from '../plugins/request-auth';
 import { requireAdmin } from '../plugins/require-admin';
 import { sendAdminError } from './admin-errors';
+import { clearResolveCache } from '../lib/send/resolver-cache';
 
 // Slug requires at least one character, so an empty string can never collide with NULL
 // under the DB's coalesce-based unique indexes.
@@ -73,14 +74,20 @@ export async function adminPolicyRoutes(app: FastifyInstance) {
   app.post('/v1/admin/policies/:id/publish', { preHandler }, async (req, reply) => {
     const p = IdParams.safeParse(req.params);
     if (!p.success) return reply.code(400).send(z.formatError(p.error));
-    try { return serializePolicy(await repo.publishPolicy(p.data.id, actorOf(req.headers))); }
-    catch (err) { return sendAdminError(reply, err); }
+    try {
+      const row = await repo.publishPolicy(p.data.id, actorOf(req.headers));
+      clearResolveCache(); // this pod sees the change now; others within the cache TTL
+      return serializePolicy(row);
+    } catch (err) { return sendAdminError(reply, err); }
   });
 
   app.post('/v1/admin/policies/:id/retire', { preHandler }, async (req, reply) => {
     const p = IdParams.safeParse(req.params);
     if (!p.success) return reply.code(400).send(z.formatError(p.error));
-    try { return serializePolicy(await repo.retirePolicy(p.data.id)); }
-    catch (err) { return sendAdminError(reply, err); }
+    try {
+      const row = await repo.retirePolicy(p.data.id);
+      clearResolveCache(); // this pod sees the change now; others within the cache TTL
+      return serializePolicy(row);
+    } catch (err) { return sendAdminError(reply, err); }
   });
 }
