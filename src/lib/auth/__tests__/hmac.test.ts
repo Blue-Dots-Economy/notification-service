@@ -27,6 +27,14 @@ describe('hmac v2', () => {
     expect(macMatches('other', c, parsed.mac)).toBe(false);
   });
 
+  it('a v2 MAC over one body does not verify a different body', () => {
+    const signed = canonicalString('v2', 'POST', '/v1/notify', '100', 'n1', Buffer.from('{"a":1}'));
+    const other = canonicalString('v2', 'POST', '/v1/notify', '100', 'n1', Buffer.from('{"a":2}'));
+    const parsed = parseSignature(signHmac('v2', 'secret', signed))!;
+    expect(macMatches('secret', signed, parsed.mac)).toBe(true);
+    expect(macMatches('secret', other, parsed.mac)).toBe(false);
+  });
+
   it.each(['v3=' + 'a'.repeat(64), 'v2=' + 'A'.repeat(64), 'v2=' + 'a'.repeat(63), 'v2=zz', 'v2', ''])(
     'rejects malformed signature header %j',
     (h) => expect(parseSignature(h)).toBeNull(),

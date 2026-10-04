@@ -12,7 +12,12 @@ let KEYS = new Map<string, HmacKey>();
  * Validate the `internal-secrets.json` shape:
  *   { "<keyId>": { "secret": "...", "scopes"?: ["notify:send" | "templates:admin", ...] } }
  * `scopes` defaults to ["notify:send"]: a key may send unless it is explicitly
- * granted administration. Throws on anything else so a bad file fails the boot.
+ * granted administration.
+ *
+ * An entry whose `secret` is the empty string is skipped with a warning that
+ * names the key id: deployments render an unset secret as `""`, and such a key
+ * can never authenticate. Every other malformed entry throws so a bad file
+ * fails the boot.
  */
 export function parseSecrets(raw: unknown): Map<string, HmacKey> {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -24,18 +29,24 @@ export function parseSecrets(raw: unknown): Map<string, HmacKey> {
       throw new Error(`internal secrets entry "${id}" must be an object`);
     }
     const { secret, scopes } = entry as { secret?: unknown; scopes?: unknown };
-    if (typeof secret !== 'string' || secret.length === 0) {
-      throw new Error(`internal secrets entry "${id}" needs a non-empty "secret"`);
+    if (typeof secret !== 'string') {
+      throw new Error(`internal secrets entry "${id}" needs a "secret" string`);
     }
     let granted: Scope[] = ['notify:send'];
     if (scopes !== undefined) {
       if (!Array.isArray(scopes) || scopes.length === 0) {
         throw new Error(`internal secrets entry "${id}": "scopes" must be a non-empty array`);
       }
-      for (const s of scopes) {
-        if (!isScope(s)) throw new Error(`internal secrets entry "${id}": unknown scope "${String(s)}"`);
-      }
+      scopes.forEach((s, index) => {
+        if (!isScope(s)) {
+          throw new Error(`internal secrets entry "${id}": scopes[${index}] is not a known scope`);
+        }
+      });
       granted = scopes as Scope[];
+    }
+    if (secret === '') {
+      console.warn(`internal secrets entry "${id}" has an empty "secret"; skipping it`);
+      continue;
     }
     keys.set(id, { secret, scopes: new Set(granted) });
   }
