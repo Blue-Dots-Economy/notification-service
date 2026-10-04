@@ -29,6 +29,13 @@
       "when": 1791131819132,
       "tag": "0003_idempotency_key",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1791132832145,
+      "tag": "0004_idempotency_created_at_idx",
+      "breakpoints": true
     }
   ]
 }

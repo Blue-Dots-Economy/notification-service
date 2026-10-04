@@ -2,6 +2,7 @@ import type { Pool, PoolClient } from 'pg';
 import { getPool } from './client';
 import * as metrics from '../metrics';
 import { describeDbError } from './errors';
+import { pruneIdempotencyKeys } from '../send/idempotency';
 
 /**
  * pg_partman maintenance, driven by NS rather than pg_partman's background
@@ -27,6 +28,9 @@ export async function runPartitionMaintenance(pool: Pool = getPool()): Promise<b
     try {
       await client.query(`CALL partman.run_maintenance_proc()`);
       await checkDefaultPartitions(client);
+      await pruneIdempotencyKeys().catch((err) =>
+        console.error('idempotency key pruning failed:', describeDbError(err)),
+      );
       return true;
     } finally {
       await client.query(`SELECT pg_advisory_unlock(${PARTMAN_LOCK_SQL_KEY})`);
