@@ -302,7 +302,7 @@ See README for the full request/response contract.
 
 Code: `src/lib/templates/` (`contract`, `render`, `repo`, `validate`, `vendors`, `seed`),
 `src/lib/policies/` (`repo`, `plan`), routes `src/routes/admin-templates.ts` and
-`admin-policies.ts`. Plan C wires these into `/notify`; until then `/notify` behaves as before.
+`admin-policies.ts`. Send API v1 (`POST /v1/notify`) uses them; legacy `/notify` does not.
 
 **Tables.** `template` is keyed `(network, channel, template_key, locale)` and `notification_policy`
 `(network, domain, event_type)` where NULL means "any". Both carry a `version` and a status of
@@ -382,11 +382,76 @@ current vendor's template is created and published, which retires the old vendor
 serialise on a session advisory lock. Seeding is non-fatal (logged, never blocks listen) and is
 skipped when `NS_NETWORK` is unset; a template that fails publish validation is left as a draft.
 
+## Send API v1
+
+Code: `src/routes/v1-notify.ts`, `src/lib/send/` (`request`, `plan`, `errors`, `idempotency`), and the
+`job.v1` branch of `src/lib/worker.ts` (`processV1Job`, `failDelivery`, `fallThrough`). Legacy `/notify`
+is unchanged and stays until the cutover release.
+
+**Request** (`V1NotifySchema`, strict: unknown keys → `400`). Exactly one of `event_type` (a policy
+picks the channels) or `template_key`; `template_key` requires `channel`, `event_type` forbids it.
+`to` carries `email` and/or E.164 `phone` (at least one). `priority` is `urgent | normal | bulk`
+(default `normal`), mapped to `realtime | other | bulk` by `PRIORITY_MAP`. `cc`, `reply_to` and
+`attachments` are email-only: with `template_key` they require `channel: 'email'`, with `event_type`
+they apply to the email deliveries. `network` is never request input: it is `currentNetwork()`, and
+unset answers `503 network_not_configured` on `/v1/notify` only. Free-text bodies and sender
+identity are not accepted; the sender is server config (`EMAIL_FROM_ADDRESS`, `EMAIL_FROM_NAME`).
+Without `EMAIL_FROM_ADDRESS` an email delivery fails permanently with `email sender not configured`.
+
+**Planning** (`planSend`) renders and validates everything before the request is accepted. Request
+variables are checked against the union of the planned templates' contracts (a name declared by none
+is `unknown_variable`); each template renders with only its own declared variables. A failure is
+`422 {error, kind, message, details?}` and counts `ns_send_rejected_total{kind,code}`:
+- `caller`: `missing_variable`, `unknown_variable`, `invalid_variable`, `no_reachable_channel`.
+- `configuration`: `not_found`, `vendor_mismatch`, `incomplete_template`, `body_too_long`,
+  `unknown_channel`, `no_policy`.
+With `template_key` a configuration problem fails the request. With a policy, a candidate whose
+template cannot resolve or render is skipped while another can carry the message; if none can, the
+first configuration error is returned. Messages name variables and keys, never values.
+
+**Modes and event status.** `single` (template_key), `first_available` and `all` (policy). A request's
+jobs are enqueued in one MULTI (`pushManyToPriority`): `all` is one job per delivery,
+the others one job carrying every candidate. Event status: `single` mirrors its attempt; `all` is a
+roll-up across deliveries (`partially_delivered` when outcomes are mixed); `first_available` is
+`sent`/`delivered` if any attempt got there, otherwise the latest attempt's status, so it never
+regresses. `rollUpEvent` (`audit/store.ts`) does this inside the attempt's transaction under the
+event row lock.
+
+**Fallthrough** is synchronous only. A `first_available` delivery that fails permanently or exhausts
+its retries is closed `failed` and the next candidate starts as a **new attempt row** (fresh attempt
+id, attempt counter reset; `ns_send_fallthrough_total{from,to}`). If the deadline has passed the event
+expires instead. The `expired` fate is recorded by marker (`markAttempt`). Async bounces after a
+vendor accepted a message are out of scope (Stage 2.5/3). The last delivery takes the legacy fate
+(`dropOrDeadLetter`). `sendRendered` sends the content rendered at accept and never re-renders; a
+vendor change since accept (`vendor_changed`) fails the delivery.
+
+**Redaction.** A send is redacted when its priority is `urgent` **or** any planned template declares
+a `sensitive` variable. A redacted send persists only the variable **names** (`audit.variableNames`),
+keeps no job copy, is not recoverable, and is never dead-lettered (`ns_job_dropped_total`). Urgent
+sends enqueue first and write the audit row afterwards, so a slow Postgres never delays an OTP;
+normal and bulk record first and answer `503 audit store unavailable` if they cannot.
+
+**Deadline**, in order: request `deadline` (ISO-8601 with offset, in the future, at most 24 h ahead,
+else `400 invalid_deadline`) → the smallest `default_deadline_s` among the planned templates → for
+`urgent`, `URGENT_DEFAULT_DEADLINE_S`. DLQ replay clears the deadline (an explicit operator action).
+
+**Idempotency** (`idempotency.ts`). `idempotency_key` is 1-128 chars and is claimed before planning.
+`urgent` claims live in Redis (`idem:<network>:<key>`, 15-minute window) so an OTP makes no Postgres
+round trip; `normal` and `bulk` use the Postgres `idempotency_key` table, pruned after 90 days. A
+repeat returns `200` with the original response; a repeat while the first is in flight is `409
+idempotency_in_progress`. A Postgres claim with no response older than 15 minutes is reclaimable
+(Redis expires by TTL). Any refusal after a claim releases it. Without a key, a 5-second content
+guard answers a repeat with `409 duplicate-fallback`.
+
+**Response:** `202 {notification_event_id, correlation_id, status: "accepted", mode, deliveries:
+[{channel}]}`. See README for examples.
+
 ## Key Files
 
 **Routes** (`src/routes/`):
 - `docs.ts` — Scalar API reference and OpenAPI JSON
-- `notify.ts` — Enqueue notification endpoint
+- `notify.ts` — Enqueue notification endpoint (legacy)
+- `v1-notify.ts` — Send API v1 (see Send API v1)
 - `providers.ts` — Provider discovery endpoints
 - `metrics.ts` — Queue metrics endpoint (HMAC-authed JSON) **and** `/metrics`,
   the unauthenticated Prometheus scrape endpoint
@@ -506,7 +571,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 441 unit tests across 39 files (plus 84 integration tests). The unit suite runs in about a second because Redis
+vitest 4, 514 unit tests across 43 files (plus the integration suite). The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
@@ -627,6 +692,8 @@ live at scrape time rather than counted, so they cannot drift.
 | `ns_rate_limited_total` | counter | `channel`, `priority` |
 | `ns_job_expired_total` | counter | `channel` |
 | `ns_job_dropped_total` | counter | `channel`, `reason` |
+| `ns_send_rejected_total` | counter | `kind` (`caller`/`configuration`), `code` |
+| `ns_send_fallthrough_total` | counter | `from`, `to` (channels) |
 | `ns_queue_depth` | gauge | `queue` (`realtime`/`other`/`bulk`/`retry_count`/`dlq`) |
 | `ns_retry_eta_seconds` | gauge | — |
 

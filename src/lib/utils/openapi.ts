@@ -83,6 +83,20 @@ const policyChannels = {
 };
 
 const adminSchemas = {
+  SendAccepted: {
+    type: 'object',
+    required: ['notification_event_id', 'correlation_id', 'status', 'mode', 'deliveries'],
+    properties: {
+      notification_event_id: { type: 'string', format: 'uuid' },
+      correlation_id: { type: 'string' },
+      status: { type: 'string', enum: ['accepted'] },
+      mode: { type: 'string', enum: ['single', 'first_available', 'all'] },
+      deliveries: {
+        type: 'array',
+        items: { type: 'object', required: ['channel'], properties: { channel: { type: 'string' } } },
+      },
+    },
+  },
   VariableSpec: {
     type: 'object',
     required: ['name'],
@@ -346,6 +360,80 @@ export function openApiDocument() {
     },
     paths: {
       ...adminPaths,
+      '/v1/notify': {
+        post: {
+          summary: 'Send a notification (Send API v1)',
+          tags: ['send'],
+          description:
+            'Send by `event_type` (a policy picks the channels) or by `template_key` + `channel`. Content is rendered and validated before the request is accepted. `network` is server config and is never read from the request.',
+          security: [{ requestSignature: [] }],
+          requestBody: jsonBody({
+            type: 'object',
+            additionalProperties: false,
+            required: ['to'],
+            description: 'Exactly one of `event_type` or `template_key`. `template_key` requires `channel`; `event_type` forbids it.',
+            properties: {
+              event_type: { type: 'string', pattern: '^[a-z0-9_.-]+$', maxLength: 64, example: 'login_otp' },
+              template_key: { type: 'string', pattern: '^[a-z0-9_.-]+$', maxLength: 128 },
+              channel: { type: 'string', minLength: 1, maxLength: 32, example: 'sms' },
+              domain: { type: 'string', pattern: '^[a-z0-9_.-]+$', maxLength: 64 },
+              to: {
+                type: 'object',
+                additionalProperties: false,
+                minProperties: 1,
+                properties: {
+                  email: { type: 'string', format: 'email', maxLength: 254 },
+                  phone: { type: 'string', pattern: '^\\+[1-9]\\d{6,14}$', description: 'E.164' },
+                },
+              },
+              locale: { type: 'string', pattern: '^[a-z]{2,3}(-[A-Z]{2})?$' },
+              variables: { type: 'object', additionalProperties: true, default: {} },
+              priority: { type: 'string', enum: ['urgent', 'normal', 'bulk'], default: 'normal' },
+              idempotency_key: { type: 'string', minLength: 1, maxLength: 128 },
+              deadline: {
+                type: 'string',
+                format: 'date-time',
+                description: 'ISO-8601 with offset; must be in the future and at most 24 hours ahead.',
+              },
+              cc: { type: 'array', maxItems: 10, items: { type: 'string', format: 'email' }, description: 'Email deliveries only.' },
+              reply_to: { type: 'string', format: 'email', description: 'Email deliveries only.' },
+              attachments: { type: 'array', items: { type: 'object', additionalProperties: true }, description: 'Email deliveries only.' },
+            },
+          }),
+          responses: {
+            '200': {
+              description: 'A repeat of an `idempotency_key`: the original 202 response.',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/SendAccepted' } } },
+            },
+            '202': {
+              description: 'Accepted. Delivery is asynchronous.',
+              content: { 'application/json': { schema: { $ref: '#/components/schemas/SendAccepted' } } },
+            },
+            '400': { description: 'Invalid request (Zod format), or `invalid_deadline`' },
+            '401': { description: 'Missing or invalid request signature' },
+            '409': errorBody('idempotency_in_progress, or duplicate-fallback (a repeat without an idempotency_key within 5 seconds)'),
+            '422': {
+              description:
+                'The send was refused. `kind` is `caller` (missing_variable, unknown_variable, invalid_variable, no_reachable_channel) or `configuration` (not_found, vendor_mismatch, incomplete_template, body_too_long, unknown_channel, no_policy).',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['error', 'kind', 'message'],
+                    properties: {
+                      error: { type: 'string' },
+                      kind: { type: 'string', enum: ['caller', 'configuration'] },
+                      message: { type: 'string', description: 'Names variables, never their values.' },
+                      details: { type: 'object', additionalProperties: true },
+                    },
+                  },
+                },
+              },
+            },
+            '503': errorBody('network_not_configured: NS_NETWORK is not set; audit store unavailable (normal and bulk sends)'),
+          },
+        },
+      },
       '/notify': {
         post: {
           summary: 'Queue a notification',

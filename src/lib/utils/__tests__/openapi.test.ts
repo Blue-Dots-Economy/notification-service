@@ -16,4 +16,17 @@ describe('openApiDocument', () => {
       }
     }
   });
+
+  it('documents POST /v1/notify', () => {
+    const doc = openApiDocument() as { paths: Record<string, any> };
+    const op = doc.paths['/v1/notify']?.post;
+    expect(op).toBeDefined();
+    expect(op.security).toEqual([{ requestSignature: [] }]);
+    const schema = op.requestBody.content['application/json'].schema;
+    expect(schema.additionalProperties).toBe(false);
+    for (const k of ['event_type', 'template_key', 'channel', 'to', 'priority']) expect(schema.properties[k], k).toBeDefined();
+    expect(schema.properties.priority.enum).toEqual(['urgent', 'normal', 'bulk']);
+    for (const code of ['200', '202', '400', '409', '422', '503']) expect(op.responses[code], code).toBeDefined();
+    expect(op.responses['422'].content['application/json'].schema.properties.kind.enum).toEqual(['caller', 'configuration']);
+  });
 });
