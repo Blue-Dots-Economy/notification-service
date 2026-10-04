@@ -9,6 +9,9 @@ vi.mock('../../plugins/request-auth', () => ({ requestAuth: async () => {} }));
 const dedupe = vi.fn(async (_key: string, _ttl?: number) => true);
 vi.mock('../../lib/dedupe', () => ({ dedupe: (key: string, ttl?: number) => dedupe(key, ttl) }));
 
+const { recordAccepted } = vi.hoisted(() => ({ recordAccepted: vi.fn(async (_rec: unknown) => {}) }));
+vi.mock('../../lib/audit/store', () => ({ recordAccepted }));
+
 const pushRealtime = vi.fn(async () => {});
 const pushOther = vi.fn(async () => {});
 vi.mock('../../lib/queue', () => ({ pushRealtime, pushOther }));
@@ -161,5 +164,38 @@ describe('POST /notify — duplicate suppression (#88)', () => {
     expect(res.statusCode).toBe(409);
     expect(res.json()).toMatchObject({ enqueued: false, reason: 'duplicate-fallback' });
     expect(pushOther).not.toHaveBeenCalled();
+  });
+});
+
+// Request auth is mocked above, so a "signed" notify is a plain inject.
+const signedNotify = (payload: unknown) => post(payload);
+
+describe('/notify audit', () => {
+  beforeEach(() => recordAccepted.mockReset().mockResolvedValue(undefined));
+
+  it('records a normal send before queueing it, with audit ids on the job', async () => {
+    const res = await signedNotify(body());
+    expect(res.statusCode).toBe(200);
+    expect(recordAccepted).toHaveBeenCalledTimes(1);
+    const queued = (pushOther.mock.calls[0] as unknown as [{ audit: unknown }])[0];
+    expect(queued.audit).toMatchObject({ eventId: expect.any(String), attemptId: expect.any(String) });
+    expect(recordAccepted.mock.invocationCallOrder[0]).toBeLessThan(
+      pushOther.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it('returns 503 when the record fails, and queues nothing', async () => {
+    recordAccepted.mockRejectedValueOnce(new Error('db down'));
+    const res = await signedNotify(body());
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toEqual({ error: 'audit store unavailable', enqueued: false });
+    expect(pushOther).not.toHaveBeenCalled();
+  });
+
+  it('realtime still enqueues when the audit insert fails', async () => {
+    recordAccepted.mockRejectedValueOnce(new Error('db down'));
+    const res = await signedNotify({ ...body(), priority: 'realtime' });
+    expect(res.statusCode).toBe(200);
+    expect(pushRealtime).toHaveBeenCalledTimes(1);
   });
 });

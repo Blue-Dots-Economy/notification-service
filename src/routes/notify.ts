@@ -5,6 +5,8 @@ import { dedupe } from '../lib/dedupe';
 import { buildDedupeKey } from '../lib/dedupe_key';
 import { providers } from '../lib/providers';
 import * as queue from '../lib/queue';
+import { recordAccepted } from '../lib/audit/store';
+import { toAcceptedRecord } from '../lib/audit/redact';
 import { requestAuth } from '../plugins/request-auth';
 import { notifyBodyLimitBytes } from '../lib/providers/email/attachments';
 
@@ -76,11 +78,40 @@ export async function notifyRoutes(app: FastifyInstance) {
           : reply.code(409).send({ job_id, enqueued: false, reason: 'duplicate-fallback' });
       }
 
-      const job = { job_id, ...body, priority };
+      const correlation = req.headers['x-correlation-id'];
+      const job = {
+        job_id,
+        ...body,
+        priority,
+        audit: {
+          eventId: randomUUID(),
+          attemptId: randomUUID(),
+          createdAt: new Date().toISOString(),
+          correlationId: typeof correlation === 'string' && correlation ? correlation : job_id,
+        },
+      };
+      const source = String(req.headers['x-ns-key'] ?? 'unknown');
+      const record = toAcceptedRecord(job, source);
 
-      if (priority === 'realtime') await queue.pushRealtime(job);
-      else await queue.pushOther(job);
+      if (priority === 'realtime') {
+        // Queue first: a slow or unavailable Postgres must never delay an OTP.
+        await queue.pushRealtime(job);
+        void recordAccepted(record).catch((err) =>
+          req.log.error({ err: err.message, job_id }, 'realtime audit insert failed'),
+        );
+        return reply.send({ job_id, enqueued: true });
+      }
 
+      // Record before queue: a normal send that cannot be recorded is refused,
+      // so a Redis loss can always be recovered from the record (spec
+      // §Architecture, durability model).
+      try {
+        await recordAccepted(record);
+      } catch (err) {
+        req.log.error({ err: (err as Error).message, job_id }, 'audit insert failed; refusing send');
+        return reply.code(503).send({ error: 'audit store unavailable', enqueued: false });
+      }
+      await queue.pushOther(job);
       reply.send({ job_id, enqueued: true });
     },
   });
