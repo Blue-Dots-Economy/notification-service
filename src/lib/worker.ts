@@ -1,3 +1,4 @@
+import { fork } from 'node:child_process';
 import { deferJob, pushDLQ, scheduleRetryWithMarker } from './queue';
 import { acquireSendToken, bucketsFor, rateLimitDeferMs } from './rate_limit';
 import { providerTimeoutMs } from './providers/http';
@@ -221,16 +222,25 @@ if (process.argv.includes('worker')) {
   loadSecrets();
   console.log('Worker started:', process.pid);
   startBalancePolling();
-  // An unhandled rejection here would kill the only process that sends
-  // anything, while the API stays healthy and keeps accepting jobs into a queue
-  // nothing drains. Crash loudly instead so the orchestrator restarts it.
-  // Fail fast on bad pool config: a worker that cannot size its pools must not
-  // start half-configured.
+  // Fail fast on bad config: a worker that cannot size its pools or parse its
+  // rate limits must not start half-configured. The API validated the same
+  // values before listen, so this only fires if they differ between processes;
+  // the exit then takes the API down too (see spawnWorker).
   validateWorkerConfig();
   startPools(poolConfig());
 }
 
-export function spawnWorker() {
-  const { fork } = require('child_process');
-  fork(__filename, ['worker']);
+/**
+ * Fork the worker. If it exits for any reason the API exits with it: the worker
+ * is the only process that sends, so an API left running without it would stay
+ * healthy and keep queueing work nothing drains. Exiting hands the restart to
+ * the orchestrator.
+ */
+export function spawnWorker(exit: (code: number) => never = process.exit) {
+  const child = fork(__filename, ['worker']);
+  child.on('exit', (code: number | null, signal: NodeJS.Signals | null) => {
+    console.error(`Worker exited (code=${code ?? 'none'}, signal=${signal ?? 'none'}); exiting so the pod restarts`);
+    exit(code ?? 1);
+  });
+  return child;
 }

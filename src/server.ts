@@ -3,8 +3,8 @@ import { loadSecrets } from './lib/auth/secrets.js';
 import { spawnWorker } from './lib/worker.js';
 import { runMigrations } from './lib/db/migrate.js';
 import { startPartitionMaintenance } from './lib/db/maintenance.js';
-import { recoverAtBoot, recoverLostJobs, recoveryMaxAgeHours } from './lib/audit/recover.js';
-import { urgentDefaultDeadlineS } from './lib/deadline.js';
+import { recoverAtBoot, recoverLostJobs } from './lib/audit/recover.js';
+import { validateBootConfig } from './lib/boot-config.js';
 import { describeDbError } from './lib/db/errors.js';
 import { seedBuiltinTemplates } from './lib/templates/seed.js';
 
@@ -17,9 +17,10 @@ async function main() {
   // orchestrator keeps the previous pod serving.
   await runMigrations();
   startPartitionMaintenance();
-  // Config errors are fatal; a recovery failure is not.
-  recoveryMaxAgeHours();
-  urgentDefaultDeadlineS();
+  // Config errors are fatal; a recovery failure is not. This includes the
+  // worker's pool, rate-limit, deadline and timeout settings: a bad value must
+  // fail the pod here, not only kill the forked worker after listen.
+  validateBootConfig();
   // Before the worker starts draining, so recovered jobs join the queue in order.
   // Not fatal: the periodic sweep below retries within 5 minutes.
   await recoverAtBoot();
