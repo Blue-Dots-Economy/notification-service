@@ -88,6 +88,8 @@ export async function notifyRoutes(app: FastifyInstance) {
           attemptId: randomUUID(),
           createdAt: new Date().toISOString(),
           correlationId: typeof correlation === 'string' && correlation ? correlation : job_id,
+          // Sticky: decided by the priority the caller sent, never re-derived.
+          redactValues: priority === 'realtime',
         },
       };
       const source = String(req.headers['x-ns-key'] ?? 'unknown');

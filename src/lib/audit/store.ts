@@ -9,6 +9,13 @@ export interface AuditIds {
   /** ISO timestamp; part of both primary keys, so it travels with the job. */
   createdAt: string;
   correlationId: string;
+  /**
+   * Persist variable NAMES only, never values, and keep no job copy. Fixed at
+   * /notify from the ORIGINAL priority (true for realtime) and carried on the
+   * job, so a DLQ replay under another priority still never persists an OTP.
+   * Optional only for jobs queued before the flag existed.
+   */
+  redactValues?: boolean;
 }
 
 export interface AcceptedRecord {

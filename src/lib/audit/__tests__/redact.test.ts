@@ -28,3 +28,29 @@ describe('toAcceptedRecord', () => {
     expect(rec.source).toBe('dpg-api-client');
   });
 });
+
+describe('toAcceptedRecord — sticky redaction', () => {
+  it('keeps a realtime-origin job redacted after a DLQ replay moves it to other', () => {
+    const job: Job = {
+      job_id: 'j', channel: 'sms', priority: 'other', to: '+919999999999',
+      template_id: 'login_otp', variables: { message: '482913' },
+      audit: { ...ids, redactValues: true },
+    };
+    const rec = toAcceptedRecord(job, 'worker');
+    expect(JSON.stringify(rec)).not.toContain('482913');
+    expect(rec.payload).toEqual({ to: '+919999999999', variable_names: ['message'] });
+    expect(rec.job).toBeUndefined();
+    expect(rec.recoverable).toBe(false);
+  });
+
+  it('keeps values for a normal-origin job even when replayed as realtime', () => {
+    const job: Job = {
+      job_id: 'j', channel: 'email', priority: 'realtime', to: 'a@b.c',
+      template_id: 'basic_email', variables: { subject: 's' },
+      audit: { ...ids, redactValues: false },
+    };
+    const rec = toAcceptedRecord(job, 'worker');
+    expect(rec.recoverable).toBe(true);
+    expect(rec.job).toMatchObject({ variables: { subject: 's' } });
+  });
+});

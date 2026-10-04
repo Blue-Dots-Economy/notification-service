@@ -8,10 +8,15 @@ import type { AcceptedRecord } from './store';
  * persisted (spec §Retention and PII): they keep the recipient and the variable
  * NAMES only, and no job copy — so they are also not recoverable after a Redis
  * loss, which is acceptable because the user simply requests a new code.
+ *
+ * The decision keys on `audit.redactValues`, set once at /notify from the
+ * original priority, not on the job's current priority: a DLQ replay may move
+ * an OTP job to 'other', and it must stay redacted. Jobs queued before the flag
+ * existed fall back to the priority.
  */
 export function toAcceptedRecord(job: Job, source: string): AcceptedRecord {
   if (!job.audit) throw new Error(`job ${job.job_id} has no audit ids`);
-  const realtime = job.priority === 'realtime';
+  const realtime = job.audit.redactValues ?? job.priority === 'realtime';
   return {
     ids: job.audit,
     network: process.env.NS_NETWORK ?? 'unknown',

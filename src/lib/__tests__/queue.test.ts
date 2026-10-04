@@ -10,6 +10,7 @@ vi.mock('../redis', async () => {
 
 const redis = (await import('../redis')).default as unknown as import('./redis-fake').RedisFake;
 const queue = await import('../queue');
+const { toAcceptedRecord } = await import('../audit/redact');
 
 const job = (over: Partial<Job> = {}): Job => ({
   job_id: 'job-1',
@@ -270,5 +271,25 @@ describe('retryFailedJobs replay accounting', () => {
     await queue.retryFailedJobs({ jobId: 'n' });
     const [raw] = await redis.lrange('queue:other', 0, -1);
     expect(JSON.parse(raw).audit).toBeUndefined();
+  });
+
+  it('a realtime-origin OTP replayed as other persists no variable values and no job copy', async () => {
+    const audit = {
+      eventId: 'ev-2', attemptId: 'attempt-2', createdAt: '2026-10-04T00:00:00.000Z',
+      correlationId: 'corr-2', redactValues: true,
+    };
+    await queue.pushDLQ(job({
+      job_id: 'otp', channel: 'sms', priority: 'realtime', template_id: 'login_otp',
+      variables: { message: '739104' }, audit,
+    }));
+    // Default replay priority is 'other'.
+    await queue.retryFailedJobs({ jobId: 'otp' });
+    const [raw] = await redis.lrange('queue:other', 0, -1);
+    const replayed = JSON.parse(raw) as Job;
+    expect(replayed.priority).toBe('other');
+    const rec = toAcceptedRecord(replayed, 'worker');
+    expect(JSON.stringify(rec)).not.toContain('739104');
+    expect(rec.job).toBeUndefined();
+    expect(rec.recoverable).toBe(false);
   });
 });

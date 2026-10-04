@@ -197,6 +197,15 @@ describe('/notify audit', () => {
     expect(pushOther).not.toHaveBeenCalled();
   });
 
+  it('marks realtime jobs redactValues=true and normal jobs false, on the queued job', async () => {
+    await signedNotify({ ...body(), priority: 'realtime' });
+    await signedNotify(body({ subject: 'other one' }));
+    const rt = (pushRealtime.mock.calls[0] as unknown as [{ audit: { redactValues: boolean } }])[0];
+    const ot = (pushOther.mock.calls[0] as unknown as [{ audit: { redactValues: boolean } }])[0];
+    expect(rt.audit.redactValues).toBe(true);
+    expect(ot.audit.redactValues).toBe(false);
+  });
+
   it('realtime still enqueues when the audit insert fails', async () => {
     recordAccepted.mockRejectedValueOnce(new Error('db down'));
     const res = await signedNotify({ ...body(), priority: 'realtime' });
