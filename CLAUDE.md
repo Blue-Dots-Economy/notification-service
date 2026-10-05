@@ -419,7 +419,6 @@ current vendor's template is created and published, which retires the old vendor
 serialise on a session advisory lock. Seeding is non-fatal (logged, never blocks listen) and is
 skipped when `NS_NETWORK` is unset; a template that fails publish validation is left as a draft.
 
-
 ### Content resolver
 
 Code: `src/lib/content/` (`types`, `configmap`, `resolver`, `inject`). A template variable can take its
@@ -436,7 +435,7 @@ the same email-only rule as other variables.
 **File format.** One JSON document, at most 1 MiB:
 `{ "version": "2026-10-01", "entries": { "<key>": { "<locale>": "<value>" } } }`. `version` matches
 `^[A-Za-z0-9._-]{1,64}$`; locales look like `en` or `en-IN`; at most 500 keys; each value is a
-non-empty string of at most 2000 characters. Unknown top-level fields are rejected. A `url` variable's
+non-blank string of at most 2000 characters. Unknown top-level fields are rejected. A `url` variable's
 value passes the same checks as a caller URL (http(s), no userinfo, `urlHosts` when declared).
 
 **Configuration.** `NS_CONTENT_PROVIDER` (`configmap`), `NS_CONTENT_FILE` (the path), and
@@ -474,10 +473,15 @@ too, so an audit can answer which terms version a message carried.
 
 **Reload and boot (E4).** The first load happens at boot and the file is re-read every
 `NS_CONTENT_RELOAD_MS`; a slow load never overlaps the next. Every successful reload takes effect
-and clears the memo, including one that keeps the same `version` (that logs a warning: bump the
-version on edits). A bad or unreadable file keeps the last good snapshot and logs the problem
-without values. Boot never fails because of the content file: until a valid file loads, `content_ref`
-sends answer `422 content_unavailable`.
+and clears the memo. A same-version reload that has different content still takes effect and logs a
+warning (bump the version on edits). A bad or unreadable file keeps the last good snapshot and logs
+the problem without values. An invalid `NS_CONTENT_PROVIDER` or `NS_CONTENT_RELOAD_MS` fails boot
+like other config (`validateBootConfig`); a missing or broken content file never does: until a valid
+file loads, `content_ref` sends answer `422 content_unavailable`.
+
+**Rollout.** Publish templates with `content_ref` variables only after every pod runs a build with
+the content resolver: an older pod treats the variable as a caller variable and answers
+`missing_variable`.
 
 **Isolation.** A template with no content variables never consults the resolver, so OTP and every
 other send are unaffected by content being off, missing or broken.
@@ -645,7 +649,8 @@ Required for persistence and Redis:
 - `NS_CONTENT_FILE` — optional; the content file for `content_ref` variables. Unset, content is off.
   Deployments set `/app/content/content.json`. `NS_CONTENT_PROVIDER` (default and only value
   `configmap`) and `NS_CONTENT_RELOAD_MS` (integer 1 to 3600000, default 30000) are validated
-  whether or not a file is set. See Content resolver.
+  whether or not a file is set: an invalid value fails boot like other config. A missing or broken
+  content file never fails boot. See Content resolver.
 - `NS_RESOLVE_CACHE_TTL_MS` — optional, default 60000, positive integer (invalid fails boot). See
   Resolver cache.
 - `PARTITION_MAINTENANCE_INTERVAL_MS` — optional, default 6h.
@@ -707,7 +712,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 705 unit tests across 51 files, plus 119 integration tests across 15 files. The unit suite runs in about a second because Redis
+vitest 4, 711 unit tests across 51 files, plus 119 integration tests across 15 files. The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
