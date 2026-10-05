@@ -42,7 +42,7 @@ beforeEach(() => {
   queue.pushManyToPriority.mockResolvedValue(undefined);
   idem.claimIdempotency.mockResolvedValue({ status: 'fresh' });
   dd.dedupe.mockResolvedValue(true);
-  plan.planSend.mockResolvedValue({ mode: 'first_available', deliveries: [delivery('sms'), delivery('email')], redact: false, variables: { name: 'A' } });
+  plan.planSend.mockResolvedValue({ contentRefs: [], mode: 'first_available', deliveries: [delivery('sms'), delivery('email')], redact: false, variables: { name: 'A' } });
 });
 
 describe('POST /v1/notify', () => {
@@ -58,7 +58,7 @@ describe('POST /v1/notify', () => {
   });
 
   it('fans out one job per delivery for all, under one event', async () => {
-    plan.planSend.mockResolvedValue({ mode: 'all', deliveries: [delivery('sms'), delivery('email')], redact: false, variables: {} });
+    plan.planSend.mockResolvedValue({ contentRefs: [], mode: 'all', deliveries: [delivery('sms'), delivery('email')], redact: false, variables: {} });
     await post(body);
     expect(queue.pushManyToPriority).toHaveBeenCalledTimes(1);
     const [a, b] = queue.pushManyToPriority.mock.calls[0]![0];
@@ -168,7 +168,7 @@ describe('POST /v1/notify', () => {
   });
 
   it('all mode: a failed enqueue stamps every job failed and releases once', async () => {
-    plan.planSend.mockResolvedValue({ mode: 'all', deliveries: [delivery('sms'), delivery('email')], redact: false, variables: {} });
+    plan.planSend.mockResolvedValue({ contentRefs: [], mode: 'all', deliveries: [delivery('sms'), delivery('email')], redact: false, variables: {} });
     queue.pushManyToPriority.mockRejectedValue(new Error('redis down'));
     await post({ ...body, idempotency_key: 'k' });
     expect(queue.pushManyToPriority).toHaveBeenCalledTimes(1);
@@ -197,7 +197,7 @@ describe('POST /v1/notify', () => {
   });
 
   it('redacted records carry names only: no job copy, no values, no rendered content', async () => {
-    plan.planSend.mockResolvedValue({ mode: 'single', deliveries: [delivery('sms')], redact: true, variables: { message: '123456' } });
+    plan.planSend.mockResolvedValue({ contentRefs: [], mode: 'single', deliveries: [delivery('sms')], redact: true, variables: { message: '123456' } });
     await post({ template_key: 'login_otp', channel: 'sms', to: { phone: '+919999999999' }, variables: { message: '123456' } });
     const recs = store.recordAcceptedMany.mock.calls[0]![0] as any[];
     expect(recs[0].source).toBe('hmac:test-key');
@@ -212,7 +212,7 @@ describe('POST /v1/notify', () => {
   });
 
   it('redacted sends carry no variable values on the job', async () => {
-    plan.planSend.mockResolvedValue({ mode: 'single', deliveries: [delivery('sms')], redact: true, variables: { message: '123456' } });
+    plan.planSend.mockResolvedValue({ contentRefs: [], mode: 'single', deliveries: [delivery('sms')], redact: true, variables: { message: '123456' } });
     await post({ template_key: 'login_otp', channel: 'sms', to: { phone: '+919999999999' }, variables: { message: '123456' } });
     const job = queue.pushManyToPriority.mock.calls[0]![0][0];
     expect(job.variables).toEqual({});
@@ -254,27 +254,46 @@ describe('POST /v1/notify', () => {
   });
 
   it('email extras ride only on jobs that can deliver by email', async () => {
-    plan.planSend.mockResolvedValue({ mode: 'all', deliveries: [delivery('sms'), delivery('email')], redact: false, variables: {} });
+    plan.planSend.mockResolvedValue({ contentRefs: [], mode: 'all', deliveries: [delivery('sms'), delivery('email')], redact: false, variables: {} });
     await post({ ...body, cc: ['c@b.co'], reply_to: 'r@b.co' });
     const [smsJob, emailJob] = queue.pushManyToPriority.mock.calls[0]![0];
     expect(smsJob.v1.email).toBeUndefined();
     expect(emailJob.v1.email).toEqual({ cc: ['c@b.co'], replyTo: 'r@b.co', attachments: undefined });
     queue.pushManyToPriority.mockClear();
-    plan.planSend.mockResolvedValue({ mode: 'first_available', deliveries: [delivery('sms'), delivery('email')], redact: false, variables: {} });
+    plan.planSend.mockResolvedValue({ contentRefs: [], mode: 'first_available', deliveries: [delivery('sms'), delivery('email')], redact: false, variables: {} });
     await post({ ...body, cc: ['c@b.co'] });
     expect(queue.pushManyToPriority.mock.calls[0]![0][0].v1.email).toMatchObject({ cc: ['c@b.co'] });
     queue.pushManyToPriority.mockClear();
-    plan.planSend.mockResolvedValue({ mode: 'first_available', deliveries: [delivery('sms')], redact: false, variables: {} });
+    plan.planSend.mockResolvedValue({ contentRefs: [], mode: 'first_available', deliveries: [delivery('sms')], redact: false, variables: {} });
     await post({ ...body, cc: ['c@b.co'] });
     expect(queue.pushManyToPriority.mock.calls[0]![0][0].v1.email).toBeUndefined();
   });
 
   it('the event payload records every contact point the request supplied, also when redacted', async () => {
-    plan.planSend.mockResolvedValue({ mode: 'all', deliveries: [delivery('sms'), delivery('email')], redact: true, variables: { message: '123456' } });
+    plan.planSend.mockResolvedValue({ contentRefs: [], mode: 'all', deliveries: [delivery('sms'), delivery('email')], redact: true, variables: { message: '123456' } });
     await post({ ...body, priority: 'urgent' });
     await new Promise((r) => setImmediate(r));
     const recs = store.recordAcceptedMany.mock.calls[0]![0] as any[];
     for (const r of recs) expect(r.payload.to).toEqual({ phone: '+919999999999', email: 'a@b.co' });
     expect(JSON.stringify(recs)).not.toContain('123456');
+  });
+});
+
+describe('POST /v1/notify — content refs', () => {
+  const refs = [{ key: 'tnc.in_force.url', version: 'v3', locale: 'en' }];
+  it('jobs carry audit.contentRefs when the plan has them', async () => {
+    plan.planSend.mockResolvedValue({ contentRefs: refs, mode: 'all', deliveries: [delivery('sms'), delivery('email')], redact: false, variables: { name: 'A' } });
+    await post(body);
+    const jobs = queue.pushManyToPriority.mock.calls[0]![0] as any[];
+    expect(jobs).toHaveLength(2);
+    for (const j of jobs) expect(j.audit.contentRefs).toEqual(refs);
+    const recs = store.recordAcceptedMany.mock.calls[0]![0] as any[];
+    for (const r of recs) expect(r.payload.content_refs).toEqual(refs);
+  });
+
+  it('jobs carry no contentRefs when the plan has none', async () => {
+    await post(body);
+    const job = queue.pushManyToPriority.mock.calls[0]![0][0];
+    expect(job.audit).not.toHaveProperty('contentRefs');
   });
 });

@@ -59,6 +59,7 @@ function buildJobs(req: V1Request, plan: SendPlan, correlationHeader: unknown): 
       deliveryMode: plan.mode,
       recipients,
       ...(plan.redact ? { variableNames: Object.keys(plan.variables) } : {}),
+      ...(plan.contentRefs.length ? { contentRefs: plan.contentRefs } : {}),
     },
   });
   return plan.mode === 'all' ? plan.deliveries.map((d) => make([d])) : [make(plan.deliveries)];

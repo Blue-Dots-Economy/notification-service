@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Route scopes are pinned in src/__tests__/route-scopes.test.ts.
 vi.mock('../../plugins/auth', () => ({
@@ -21,6 +21,8 @@ const Fastify = (await import('fastify')).default;
 const { adminTemplateRoutes } = await import('../admin-templates');
 const { TemplateError } = await import('../../lib/templates/errors');
 const { NetworkNotConfigured } = await import('../../lib/network');
+const { parseContentDocument } = await import('../../lib/content/configmap');
+const { setContentForTests } = await import('../../lib/content/resolver');
 
 const ID = '00000000-0000-4000-8000-000000000001';
 const row = {
@@ -147,5 +149,33 @@ describe('admin template routes', () => {
     repo.retireTemplate.mockResolvedValue({ ...row, status: 'retired' });
     expect((await app.inject({ method: 'POST', url: `/v1/admin/templates/${ID}/retire`, headers: admin })).statusCode).toBe(200);
     expect(cache.clearResolveCache).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('admin template preview — content', () => {
+  afterEach(() => setContentForTests(null));
+  const contentRow = {
+    ...row, bodyHtml: '<p>{{name}} <a href="{{tnc_url}}">terms</a></p>',
+    variables: [...row.variables, { name: 'tnc_url', required: true, type: 'url', sensitive: false, raw: false, source: 'content_ref', contentKey: 'tnc.in_force.url' }],
+  };
+
+  it('preview renders resolved content', async () => {
+    setContentForTests(parseContentDocument({ version: 'v3', entries: { 'tnc.in_force.url': { en: 'https://example.org/tnc' } } }));
+    repo.getTemplate.mockResolvedValue(contentRow);
+    const res = await (await build()).inject({ method: 'POST', url: `/v1/admin/templates/${ID}/preview`, headers: admin, payload: { variables: { name: 'A' } } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().rendered).toMatchObject({ mode: 'ns', html: '<p>A <a href="https://example.org/tnc">terms</a></p>' });
+  });
+
+  it('preview with no content loaded is 422 content_unavailable; naming a content variable is 422 unknown_variable', async () => {
+    repo.getTemplate.mockResolvedValue(contentRow);
+    const app = await build();
+    const a = await app.inject({ method: 'POST', url: `/v1/admin/templates/${ID}/preview`, headers: admin, payload: { variables: { name: 'A' } } });
+    expect(a.statusCode).toBe(422);
+    expect(a.json().error).toBe('content_unavailable');
+    setContentForTests(parseContentDocument({ version: 'v3', entries: { 'tnc.in_force.url': { en: 'https://example.org/tnc' } } }));
+    const b = await app.inject({ method: 'POST', url: `/v1/admin/templates/${ID}/preview`, headers: admin, payload: { variables: { name: 'A', tnc_url: 'https://example.org/x' } } });
+    expect(b.statusCode).toBe(422);
+    expect(b.json().error).toBe('unknown_variable');
   });
 });

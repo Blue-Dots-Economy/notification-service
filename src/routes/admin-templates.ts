@@ -2,6 +2,7 @@ import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { TemplateRow } from '../lib/db/schema';
 import { VariableContractSchema } from '../lib/templates/contract';
+import { withContent } from '../lib/content/inject';
 import { renderTemplate } from '../lib/templates/render';
 import * as repo from '../lib/templates/repo';
 import { channelVendor } from '../lib/templates/vendors';
@@ -140,7 +141,7 @@ export async function adminTemplateRoutes(app: FastifyInstance) {
       const t = await repo.getTemplate(p.data.id);
       const vendor = channelVendor(t.channel);
       if (!vendor) throw new TemplateError('unknown_channel', `no provider for channel ${t.channel}`);
-      return { rendered: renderTemplate(t, vendor.renders, b.data.variables) };
+      return { rendered: renderTemplate(t, vendor.renders, withContent(t, b.data.variables).input) };
     } catch (err) { return sendAdminError(reply, err); }
   });
 }

@@ -1,7 +1,10 @@
+import { withContent } from '../content/inject';
+import type { ContentRef } from '../content/types';
 import type { DeliveryMode } from '../db/partitioned';
 import type { TemplateRow } from '../db/schema';
 import { urgentDefaultDeadlineS } from '../deadline';
 import { CHANNEL_CONTACT, planDelivery } from '../policies/plan';
+import { callerVariables } from '../templates/contract';
 import { TemplateError } from '../templates/errors';
 import { renderWithValues, type Rendered } from '../templates/render';
 import { classify, SendError } from './errors';
@@ -24,6 +27,8 @@ export interface SendPlan {
   redact: boolean;
   deadline?: number;
   variables: Record<string, string>;
+  /** Shared content the rendered deliveries carry: references, never values. */
+  contentRefs: ContentRef[];
 }
 
 const toSendError = (e: TemplateError) => new SendError(e.code, e.message, e.details);
@@ -77,18 +82,23 @@ export async function planSend(req: V1Request, now = Date.now()): Promise<SendPl
   }
   if (resolved.length === 0) throw firstConfigError ?? new SendError('no_reachable_channel', 'nothing to send');
 
-  const union = new Set(resolved.flatMap((r) => r.template.variables.map((s) => s.name)));
+  // Content variables are filled by NS, never the caller: naming one is unknown_variable.
+  const union = new Set(resolved.flatMap((r) => callerVariables(r.template.variables).map((s) => s.name)));
   const unknown = Object.keys(req.variables).filter((k) => !union.has(k));
   if (unknown.length) throw new SendError('unknown_variable', `unknown variables: ${unknown.join(', ')}`, { variables: unknown });
 
   const deliveries: PlannedDelivery[] = [];
   const variables: Record<string, string> = {};
+  const contentRefs: ContentRef[] = [];
   for (const r of resolved) {
-    const own = new Set(r.template.variables.map((s) => s.name));
+    const own = new Set(callerVariables(r.template.variables).map((s) => s.name));
     let rendered: Rendered;
+    let refs: ContentRef[];
     try {
-      const out = renderWithValues(r.template, r.renders, pick(req.variables, own));
+      const content = withContent(r.template, pick(req.variables, own));
+      const out = renderWithValues(r.template, r.renders, content.input);
       rendered = out.rendered;
+      refs = content.refs;
       Object.assign(variables, out.values);
     } catch (e) {
       if (!(e instanceof TemplateError)) throw e;
@@ -108,6 +118,7 @@ export async function planSend(req: V1Request, now = Date.now()): Promise<SendPl
         dltHeaderId: r.template.dltHeaderId, dltTagId: r.template.dltTagId,
       },
     });
+    contentRefs.push(...refs);
   }
   if (deliveries.length === 0) throw firstConfigError ?? new SendError('no_reachable_channel', 'nothing to send');
 
@@ -119,5 +130,5 @@ export async function planSend(req: V1Request, now = Date.now()): Promise<SendPl
     (defaults.length ? now + Math.min(...defaults) * 1000 : undefined) ??
     (req.priority === 'urgent' ? now + urgentDefaultDeadlineS() * 1000 : undefined);
 
-  return { mode, deliveries, redact, deadline, variables };
+  return { mode, deliveries, redact, deadline, variables, contentRefs };
 }
