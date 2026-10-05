@@ -41,7 +41,8 @@ export function toAcceptedRecord(job: Job, source: string): AcceptedRecord {
   const realtime = job.audit.redactValues ?? job.priority === 'realtime';
   const to = job.audit.recipients ?? job.to;
   // References (key, version, locale), never content values: recorded on redacted sends too.
-  const contentRefs = job.audit.contentRefs?.length ? { content_refs: job.audit.contentRefs } : {};
+  const contentRefs =
+    job.audit.contentRefs && Object.keys(job.audit.contentRefs).length ? { content_refs: job.audit.contentRefs } : {};
   return {
     ids: job.audit,
     network: process.env.NS_NETWORK ?? 'unknown',

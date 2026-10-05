@@ -198,13 +198,13 @@ describe('planSend — content_ref variables', () => {
     templates.resolveTemplate.mockResolvedValue({ template: tncSms, renders: 'provider' });
     const plan = await planSend(req({ template_key: 'tnc_sms', channel: 'sms', to: { phone: '+919999999999' }, variables: { name: 'A' } }));
     expect(plan.deliveries[0]!.rendered).toMatchObject({ mode: 'provider', variables: { name: 'A', tnc_url: 'https://example.org/tnc' } });
-    expect(plan.contentRefs).toEqual([{ key: 'tnc.in_force.url', version: 'v3', locale: 'en' }]);
+    expect(plan.deliveries[0]!.contentRefs).toEqual([{ key: 'tnc.in_force.url', version: 'v3', locale: 'en' }]);
   });
 
-  it('a plan with no content variables has empty contentRefs', async () => {
+  it('a delivery with no content variables has empty contentRefs', async () => {
     policy('first_available');
     const plan = await planSend(req({ event_type: 'apply', to: { phone: '+919999999999' }, variables: { name: 'A' } }));
-    expect(plan.contentRefs).toEqual([]);
+    expect(plan.deliveries[0]!.contentRefs).toEqual([]);
   });
 
   it('first_available skips a candidate whose content is unresolved and uses the next', async () => {
@@ -213,6 +213,16 @@ describe('planSend — content_ref variables', () => {
       channel === 'sms' ? { template: tncSms, renders: 'provider' } : { template: plainEmail, renders: 'ns' });
     const plan = await planSend(req({ event_type: 'tnc', to: { phone: '+919999999999', email: 'a@b.co' }, variables: { name: 'A' } }));
     expect(plan.deliveries.map((d) => d.channel)).toEqual(['email']);
-    expect(plan.contentRefs).toEqual([]);
+    expect(plan.deliveries[0]!.contentRefs).toEqual([]);
+  });
+
+  it('first_available: when every candidate fails on content, the first configuration error is thrown', async () => {
+    const tncEmail = tpl({ channel: 'email', templateKey: 'tnc_email', provider: 'smtp', providerTemplateId: null, subject: 'Hi {{name}}', bodyText: '{{tnc_url}}', variables: [v('name'), tncV] });
+    policies.resolvePolicy.mockResolvedValue({ mode: 'first_available', channels: [{ channel: 'sms', template_key: 'tnc_sms' }, { channel: 'email', template_key: 'tnc_email' }] });
+    templates.resolveTemplate.mockImplementation(async (channel: string) =>
+      channel === 'sms' ? { template: tncSms, renders: 'provider' } : { template: tncEmail, renders: 'ns' });
+    const e = await planSend(req({ event_type: 'tnc', to: { phone: '+919999999999', email: 'a@b.co' }, variables: { name: 'A' } })).catch((x) => x);
+    expect(e).toBeInstanceOf(SendError);
+    expect(e).toMatchObject({ code: 'content_unavailable', kind: 'configuration' });
   });
 });

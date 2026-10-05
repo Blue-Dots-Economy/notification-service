@@ -1,5 +1,6 @@
 import type { TemplateRow, VariableSpec } from '../db/schema';
 import { MAX_LENGTH, messageType } from '../providers/sms/render';
+import { withContent } from '../content/inject';
 import { currentContent } from '../content/resolver';
 import { checkTokensMatchContract, isContentVariable, VariableContractSchema } from './contract';
 import { TemplateError } from './errors';
@@ -67,6 +68,10 @@ export function validateForPublish(
     if (missing.length) {
       throw new TemplateError('unknown_content_key', `content keys not defined: ${missing.join(', ')}`, { keys: missing });
     }
+    // Resolve and type-check every content value over this template's locale
+    // chain now, so publish fails (content_unresolved / invalid_content) rather
+    // than every send.
+    withContent({ locale: t.locale, variables: contract }, {});
   }
 
   if (t.channel === 'email') {
