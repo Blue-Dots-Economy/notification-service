@@ -24,10 +24,10 @@ import { authenticate } from '../plugins/auth';
 const FALLBACK_TTL_S = 5;
 
 /**
- * The content each channel of this job carries, keyed by channel and
+ * The content each channel of the send carries, keyed by channel and
  * de-duplicated by (key, version, locale). Absent when there is none.
  */
-function contentRefsFor(deliveries: SendPlan['deliveries']): { contentRefs?: Record<string, ContentRef[]> } {
+export function contentRefsFor(deliveries: SendPlan['deliveries']): { contentRefs?: Record<string, ContentRef[]> } {
   const byChannel: Record<string, ContentRef[]> = {};
   for (const d of deliveries) {
     if (!d.contentRefs.length) continue;
@@ -51,6 +51,10 @@ function buildJobs(req: V1Request, plan: SendPlan, correlationHeader: unknown): 
       : undefined;
   const recipients: Record<string, string> = {};
   for (const [k, v] of Object.entries(req.to)) if (typeof v === 'string') recipients[k] = v;
+  // Plan-wide, like recipients: in `all` mode the event row is written from
+  // the first job, so every job carries every channel's refs and the
+  // delivering attempt's channel picks its entry.
+  const contentRefs = contentRefsFor(plan.deliveries);
   const make = (deliveries: SendPlan['deliveries']): Job => ({
     job_id: randomUUID(),
     channel: deliveries[0]!.channel,
@@ -76,7 +80,7 @@ function buildJobs(req: V1Request, plan: SendPlan, correlationHeader: unknown): 
       deliveryMode: plan.mode,
       recipients,
       ...(plan.redact ? { variableNames: Object.keys(plan.variables) } : {}),
-      ...contentRefsFor(deliveries),
+      ...contentRefs,
     },
   });
   return plan.mode === 'all' ? plan.deliveries.map((d) => make([d])) : [make(plan.deliveries)];
