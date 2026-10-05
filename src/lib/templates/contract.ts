@@ -2,6 +2,9 @@ import { z } from 'zod';
 import type { VariableSpec } from '../db/schema';
 import { TemplateError } from './errors';
 
+/** `<segment>(.<segment>){1,7}`, lowercase; e.g. `tnc.in_force.url`. */
+export const CONTENT_KEY = /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){1,7}$/;
+
 const VariableSpecSchema = z
   .object({
     name: z.string().regex(/^\w+$/, 'letters, digits and underscore only').max(64),
@@ -10,6 +13,8 @@ const VariableSpecSchema = z
     sensitive: z.boolean().default(false),
     raw: z.boolean().default(false),
     urlHosts: z.array(z.string().min(1).max(253)).min(1).optional(),
+    source: z.enum(['request', 'content_ref']).default('request'),
+    contentKey: z.string().max(128).optional(),
   })
   .strict()
   .refine((s) => s.type === 'url' || s.urlHosts === undefined, {
@@ -19,7 +24,20 @@ const VariableSpecSchema = z
   .refine((s) => !(s.name in Object.prototype), {
     message: 'variable name is reserved',
     path: ['name'],
-  });
+  })
+  .refine((s) => (s.source === 'content_ref') === (s.contentKey !== undefined), {
+    message: 'contentKey is required for, and only for, content_ref variables',
+    path: ['contentKey'],
+  })
+  .refine((s) => s.contentKey === undefined || CONTENT_KEY.test(s.contentKey), {
+    message: 'contentKey must be dotted lowercase segments, e.g. tnc.in_force.url',
+    path: ['contentKey'],
+  })
+  .refine((s) => !(s.source === 'content_ref' && s.sensitive), {
+    message: 'content_ref variables hold shared content and cannot be sensitive',
+    path: ['sensitive'],
+  })
+  .transform((s) => (s.source === 'content_ref' ? { ...s, required: true } : s));
 
 export const VariableContractSchema = z
   .array(VariableSpecSchema)
@@ -144,4 +162,13 @@ export function validateVariables(
 
 export function sensitiveVariables(contract: VariableSpec[]): string[] {
   return contract.filter((s) => s.sensitive).map((s) => s.name);
+}
+
+export function isContentVariable(s: VariableSpec): boolean {
+  return s.source === 'content_ref';
+}
+
+/** The variables a request may supply: everything except content_ref variables. */
+export function callerVariables(contract: VariableSpec[]): VariableSpec[] {
+  return contract.filter((s) => !isContentVariable(s));
 }

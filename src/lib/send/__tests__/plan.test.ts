@@ -6,7 +6,7 @@ vi.mock('../../templates/repo', () => templates);
 
 import { planSend } from '../plan';
 import { clearResolveCache } from '../resolver-cache';
-import { SendError } from '../errors';
+import { SendError, classify } from '../errors';
 import { TemplateError } from '../../templates/errors';
 import { V1NotifySchema } from '../request';
 
@@ -163,5 +163,9 @@ describe('planSend', () => {
     templates.resolveTemplate.mockResolvedValue({ template: emailT, renders: 'ns' });
     const plan = await planSend(req({ template_key: 'apply_email', channel: 'email', to: { email: 'a@b.co' }, variables: { name: 'A', link: 'https://X.org' } }));
     expect(plan.variables).toEqual({ name: 'A', link: 'https://x.org/' });
+  });
+
+  it.each(['unknown_content_key', 'content_unavailable', 'content_unresolved', 'invalid_content'])('content error %s classifies as configuration', (code) => {
+    expect(classify(code)).toBe('configuration');
   });
 });

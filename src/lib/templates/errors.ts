@@ -10,7 +10,11 @@ export type TemplateErrorCode =
   | 'missing_variable'
   | 'unknown_variable'
   | 'invalid_variable'
-  | 'invalid_contract';
+  | 'invalid_contract'
+  | 'unknown_content_key'
+  | 'content_unavailable'
+  | 'content_unresolved'
+  | 'invalid_content';
 
 /** A template/policy rule violation. Messages name variables, never their values. */
 export class TemplateError extends Error {
