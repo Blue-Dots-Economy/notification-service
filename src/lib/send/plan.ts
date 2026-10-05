@@ -18,6 +18,8 @@ export interface PlannedDelivery {
   provider: string;
   providerTemplateId: string | null;
   rendered: Rendered;
+  /** Shared content this delivery carries: references, never values. */
+  contentRefs: ContentRef[];
   dlt: { senderId: string | null; dltEntityId: string | null; dltHeaderId: string | null; dltTagId: string | null };
 }
 
@@ -27,8 +29,6 @@ export interface SendPlan {
   redact: boolean;
   deadline?: number;
   variables: Record<string, string>;
-  /** Shared content the rendered deliveries carry: references, never values. */
-  contentRefs: ContentRef[];
 }
 
 const toSendError = (e: TemplateError) => new SendError(e.code, e.message, e.details);
@@ -89,7 +89,6 @@ export async function planSend(req: V1Request, now = Date.now()): Promise<SendPl
 
   const deliveries: PlannedDelivery[] = [];
   const variables: Record<string, string> = {};
-  const contentRefs: ContentRef[] = [];
   for (const r of resolved) {
     const own = new Set(callerVariables(r.template.variables).map((s) => s.name));
     let rendered: Rendered;
@@ -113,12 +112,12 @@ export async function planSend(req: V1Request, now = Date.now()): Promise<SendPl
       provider: r.template.provider,
       providerTemplateId: r.template.providerTemplateId,
       rendered,
+      contentRefs: refs,
       dlt: {
         senderId: r.template.senderId, dltEntityId: r.template.dltEntityId,
         dltHeaderId: r.template.dltHeaderId, dltTagId: r.template.dltTagId,
       },
     });
-    contentRefs.push(...refs);
   }
   if (deliveries.length === 0) throw firstConfigError ?? new SendError('no_reachable_channel', 'nothing to send');
 
@@ -130,5 +129,5 @@ export async function planSend(req: V1Request, now = Date.now()): Promise<SendPl
     (defaults.length ? now + Math.min(...defaults) * 1000 : undefined) ??
     (req.priority === 'urgent' ? now + urgentDefaultDeadlineS() * 1000 : undefined);
 
-  return { mode, deliveries, redact, deadline, variables, contentRefs };
+  return { mode, deliveries, redact, deadline, variables };
 }

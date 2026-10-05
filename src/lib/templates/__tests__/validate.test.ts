@@ -105,6 +105,20 @@ describe('validateForPublish — content_ref variables', () => {
     expect(codeOf(() => validateForPublish(t, pinnacle))).toBeUndefined();
   });
 
+  it('publish fails content_unresolved when the key has no value for the template locale chain', () => {
+    setContentForTests(parseContentDocument({ version: 'v1', entries: { 'tnc.in_force.url': { ta: 'https://example.org/ta' } } }));
+    expect(codeOf(() => validateForPublish({ ...t, locale: 'kn-IN' }, pinnacle))).toBe('content_unresolved');
+  });
+
+  it('publish fails invalid_content when the content URL host is not in urlHosts', () => {
+    const hosted = row({ provider: 'pinnacle', bodyText: 'Terms: {{tnc_url}}', variables: [{ ...tnc, urlHosts: ['example.org'] }] });
+    setContentForTests(parseContentDocument({ version: 'v1', entries: { 'tnc.in_force.url': { en: 'https://other.example/tnc' } } }));
+    const err = (() => { try { validateForPublish(hosted, pinnacle); } catch (e) { return e as TemplateError; } })();
+    expect(err?.code).toBe('invalid_content');
+    expect(err?.details).toEqual({ key: 'tnc.in_force.url', variable: 'tnc_url' });
+    expect(err?.message).not.toContain('other.example');
+  });
+
   it('content is not consulted for templates without content variables', () => {
     expect(codeOf(() => validateForPublish(row({ bodyText: 'Hi {{name}}', variables: [v({ name: 'name' })] }), pinnacle))).toBeUndefined();
   });

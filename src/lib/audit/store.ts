@@ -28,8 +28,11 @@ export interface AuditIds {
    * the first job. Recipients only, never variable values.
    */
   recipients?: Record<string, string>;
-  /** Shared content this send rendered (key, version, locale) — references, never values. */
-  contentRefs?: ContentRef[];
+  /**
+   * Shared content each channel's message carried, keyed by channel: (key,
+   * version, locale) references, never values. Absent when there is none.
+   */
+  contentRefs?: Record<string, ContentRef[]>;
 }
 
 export interface AcceptedRecord {
