@@ -26,7 +26,7 @@ const ID = '00000000-0000-4000-8000-000000000001';
 const row = {
   id: ID, network: 'n', channel: 'email', templateKey: 'welcome', locale: 'en', version: 1,
   status: 'draft', subject: 'Hi {{name}}', bodyHtml: '<p>{{name}}</p>', bodyText: null,
-  variables: [{ name: 'name', required: true, type: 'string', sensitive: false, raw: false }],
+  variables: [{ name: 'name', required: true, type: 'string', sensitive: false, raw: false, source: 'request' }],
   provider: 'smtp', providerTemplateId: null, senderId: null, dltEntityId: null, dltHeaderId: null,
   dltTagId: null, approvalRef: null, defaultDeadlineS: null, createdBy: 'ns-admin', publishedBy: null,
   createdAt: new Date('2026-10-04T00:00:00Z'), updatedAt: new Date('2026-10-04T00:00:00Z'),
@@ -55,7 +55,7 @@ describe('admin template routes', () => {
     });
     expect(res.statusCode).toBe(201);
     expect(repo.createTemplateDraft).toHaveBeenCalledWith(
-      expect.objectContaining({ channel: 'email', templateKey: 'welcome', bodyHtml: '<p>{{name}}</p>', variables: [{ name: 'name', required: true, type: 'string', sensitive: false, raw: false }] }),
+      expect.objectContaining({ channel: 'email', templateKey: 'welcome', bodyHtml: '<p>{{name}}</p>', variables: [{ name: 'name', required: true, type: 'string', sensitive: false, raw: false, source: 'request' }] }),
       'hmac:test-key',
     );
     expect(res.json()).toMatchObject({ id: ID, template_key: 'welcome', body_html: '<p>{{name}}</p>', status: 'draft' });

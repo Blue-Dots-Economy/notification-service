@@ -23,6 +23,10 @@ export interface VariableSpec {
   raw: boolean;
   /** url only: the value's host must equal one of these or be a subdomain of one. */
   urlHosts?: string[];
+  /** `content_ref`: the value comes from the content resolver, never the caller. Absent = `request`. */
+  source?: 'request' | 'content_ref';
+  /** content_ref only: the content key, e.g. `tnc.in_force.url`. */
+  contentKey?: string;
 }
 
 export interface PolicyChannel {
