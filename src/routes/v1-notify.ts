@@ -5,7 +5,7 @@ import type { Job } from 'src/types';
 import { recordAcceptedMany } from '../lib/audit/store';
 import { toAcceptedRecord } from '../lib/audit/redact';
 import { stamp } from '../lib/audit/stamp';
-import type { ContentRef } from '../lib/content/types';
+import { contentRefsFor } from '../lib/content/refs';
 import { correlationIdFrom } from '../lib/correlation';
 import { describeDbError } from '../lib/db/errors';
 import { dedupe, releaseDedupe } from '../lib/dedupe';
@@ -22,22 +22,6 @@ import { authenticate } from '../plugins/auth';
 
 
 const FALLBACK_TTL_S = 5;
-
-/**
- * The content each channel of the send carries, keyed by channel and
- * de-duplicated by (key, version, locale). Absent when there is none.
- */
-export function contentRefsFor(deliveries: SendPlan['deliveries']): { contentRefs?: Record<string, ContentRef[]> } {
-  const byChannel: Record<string, ContentRef[]> = {};
-  for (const d of deliveries) {
-    if (!d.contentRefs.length) continue;
-    const list = (byChannel[d.channel] ??= []);
-    for (const r of d.contentRefs) {
-      if (!list.some((x) => x.key === r.key && x.version === r.version && x.locale === r.locale)) list.push(r);
-    }
-  }
-  return Object.keys(byChannel).length ? { contentRefs: byChannel } : {};
-}
 
 function buildJobs(req: V1Request, plan: SendPlan, correlationHeader: unknown): Job[] {
   const eventId = randomUUID();
