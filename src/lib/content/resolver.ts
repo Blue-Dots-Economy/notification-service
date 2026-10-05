@@ -8,15 +8,20 @@ export interface ContentConfig {
   reloadMs: number;
 }
 
-/** Content is off (every content_ref is unavailable) unless NS_CONTENT_FILE is set. */
+/**
+ * Content is off (every content_ref is unavailable) unless NS_CONTENT_FILE is set.
+ * The other settings are validated either way, so a typo is caught at boot.
+ */
 export function contentConfig(env: NodeJS.ProcessEnv = process.env): ContentConfig | null {
   const file = env.NS_CONTENT_FILE?.trim();
-  if (!file) return null;
   const provider = (env.NS_CONTENT_PROVIDER?.trim() || 'configmap').toLowerCase();
   if (provider !== 'configmap') throw new Error(`NS_CONTENT_PROVIDER must be configmap, got "${provider}"`);
   const raw = env.NS_CONTENT_RELOAD_MS?.trim();
   const reloadMs = raw === undefined || raw === '' ? 30_000 : Number(raw);
-  if (!Number.isInteger(reloadMs) || reloadMs <= 0) throw new Error('NS_CONTENT_RELOAD_MS must be a positive integer');
+  if (!Number.isInteger(reloadMs) || reloadMs < 1 || reloadMs > 3_600_000) {
+    throw new Error('NS_CONTENT_RELOAD_MS must be an integer from 1 to 3600000');
+  }
+  if (!file) return null;
   return { provider: 'configmap', file, reloadMs };
 }
 
@@ -25,7 +30,12 @@ let memo = new Map<string, { value: string; ref: ContentRef }>();
 let timer: NodeJS.Timeout | undefined;
 
 function install(next: ContentSnapshot | null): void {
-  if (next?.version !== active?.version || next === null) memo = new Map();
+  // Every successful load drops the memo: an edit that keeps the version string
+  // must not leave stale values cached until restart.
+  if (next && active && next.version === active.version && next.fingerprint !== active.fingerprint) {
+    console.warn(`content version ${next.version} was reloaded with different content; bump the version on edits`);
+  }
+  memo = new Map();
   active = next;
 }
 
@@ -39,12 +49,18 @@ export function setContentForTests(snapshot: ContentSnapshot | null): void {
   active = snapshot;
 }
 
+let loading = false;
+
 async function loadOnce(provider: ContentProvider): Promise<void> {
+  if (loading) return; // a slow load must not overlap the next tick
+  loading = true;
   try {
     install(await provider.load());
   } catch (err) {
     // Keep the last good snapshot. The message names the problem, never content.
     console.error(`content (${provider.name}) not loaded; keeping version ${active?.version ?? 'none'}: ${(err as Error).message}`);
+  } finally {
+    loading = false;
   }
 }
 
@@ -62,15 +78,21 @@ export async function startContent(env: NodeJS.ProcessEnv = process.env): Promis
     return;
   }
   if (!cfg) return;
-  const provider = configmapProvider(cfg.file);
+  await startWithProvider(configmapProvider(cfg.file), cfg.reloadMs);
+}
+
+/** Internal seam: the load-then-reload loop for any provider. */
+export async function startWithProvider(provider: ContentProvider, reloadMs: number): Promise<void> {
+  stopContent();
   await loadOnce(provider);
-  timer = setInterval(() => void loadOnce(provider), cfg.reloadMs);
+  timer = setInterval(() => void loadOnce(provider), reloadMs);
   timer.unref();
 }
 
 export function stopContent(): void {
   if (timer) clearInterval(timer);
   timer = undefined;
+  loading = false;
 }
 
 /**

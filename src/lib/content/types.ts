@@ -4,6 +4,8 @@ export interface ContentSnapshot {
   /** The allowlist: the only keys a template may reference. */
   keys: ReadonlySet<string>;
   get(key: string, locale: string): string | undefined;
+  /** Hash of the source text, when the provider has one; used to spot edits that keep the version. */
+  fingerprint?: string;
 }
 
 /** Where content comes from. `configmap` today; `db`/`http` later, as configuration. */

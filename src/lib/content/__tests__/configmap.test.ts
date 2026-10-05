@@ -41,7 +41,22 @@ describe('parseContentDocument', () => {
   });
 });
 
+describe('parseContentDocument prototype keys', () => {
+  it('rejects __proto__ as an entry key', () => {
+    expect(() => parseContentDocument(JSON.parse('{"version":"v","entries":{"__proto__":{"en":"x"}}}'))).toThrow();
+  });
+  it('rejects __proto__ as a locale', () => {
+    expect(() => parseContentDocument(JSON.parse('{"version":"v","entries":{"tnc.url":{"__proto__":"x"}}}'))).toThrow();
+  });
+});
+
 describe('configmapProvider', () => {
+  it('rejects a file over 1 MiB with a size-only message', async () => {
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ns-content-')), 'big.json');
+    fs.writeFileSync(file, ' '.repeat(1_048_577));
+    await expect(configmapProvider(file).load()).rejects.toThrow(/too large/);
+  });
+
   it('loads the file', async () => {
     const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ns-content-')), 'content.json');
     fs.writeFileSync(file, JSON.stringify(doc));
