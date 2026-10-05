@@ -1,8 +1,20 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { configmapProvider, parseContentDocument } from '../configmap';
+
+const dirs: string[] = [];
+const tempDir = () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ns-content-'));
+  dirs.push(dir);
+  return dir;
+};
+
+afterEach(() => {
+  for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  vi.restoreAllMocks();
+});
 
 const doc = {
   version: '2026-09-01',
@@ -52,19 +64,19 @@ describe('parseContentDocument prototype keys', () => {
 
 describe('configmapProvider', () => {
   it('rejects a file over 1 MiB with a size-only message', async () => {
-    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ns-content-')), 'big.json');
+    const file = path.join(tempDir(), 'big.json');
     fs.writeFileSync(file, ' '.repeat(1_048_577));
     await expect(configmapProvider(file).load()).rejects.toThrow(/too large/);
   });
 
   it('loads the file', async () => {
-    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ns-content-')), 'content.json');
+    const file = path.join(tempDir(), 'content.json');
     fs.writeFileSync(file, JSON.stringify(doc));
     expect((await configmapProvider(file).load()).version).toBe('2026-09-01');
   });
 
   it('fails on unreadable or non-JSON files', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ns-content-'));
+    const dir = tempDir();
     await expect(configmapProvider(path.join(dir, 'missing.json')).load()).rejects.toThrow();
     fs.writeFileSync(path.join(dir, 'bad.json'), '{ not json');
     await expect(configmapProvider(path.join(dir, 'bad.json')).load()).rejects.toThrow();

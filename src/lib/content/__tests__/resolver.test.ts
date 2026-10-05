@@ -3,12 +3,42 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { parseContentDocument } from '../configmap';
+import type { ContentSnapshot } from '../types';
 import { contentConfig, currentContent, resolveContent, setContentForTests, startContent, startWithProvider, stopContent } from '../resolver';
 
 const snap = (version: string, url = 'https://example.org/tnc') =>
   parseContentDocument({ version, entries: { 'tnc.in_force.url': { en: url, 'hi-IN': 'https://example.org/hi' } } });
 
-afterEach(() => { stopContent(); setContentForTests(null); vi.useRealTimers(); });
+const dirs: string[] = [];
+const tempFile = (name: string) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ns-content-'));
+  dirs.push(dir);
+  return path.join(dir, name);
+};
+
+afterEach(() => {
+  stopContent();
+  setContentForTests(null);
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+  for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+/** A promise the test settles by hand. */
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((r) => { resolve = r; });
+  return { promise, resolve };
+}
+
+/** A provider whose loads return `results` in order; a deferred result stays pending until settled. */
+function scripted(results: Array<ContentSnapshot | Promise<ContentSnapshot>>) {
+  let i = 0;
+  const load = vi.fn(() => Promise.resolve(results[Math.min(i++, results.length - 1)]!));
+  return { name: 'stub', load };
+}
+
+const tick = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 describe('resolveContent', () => {
   it('walks the locale chain and reports the ref', () => {
@@ -48,7 +78,7 @@ describe('resolveContent', () => {
 describe('startContent (configmap reload)', () => {
   // Real timers on purpose: the reload does real file I/O, which fake timers do not wait for.
   it('loads at start, picks up a new version, and keeps the last good snapshot on a bad reload', async () => {
-    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ns-content-')), 'content.json');
+    const file = tempFile('content.json');
     fs.writeFileSync(file, JSON.stringify({ version: 'v1', entries: { 'tnc.in_force.url': { en: 'https://a.example/1' } } }));
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
     await startContent({ NS_CONTENT_FILE: file, NS_CONTENT_RELOAD_MS: '20' });
@@ -64,7 +94,7 @@ describe('startContent (configmap reload)', () => {
   });
 
   it('serves the new value after an edit that keeps the version, and warns', async () => {
-    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ns-content-')), 'content.json');
+    const file = tempFile('content.json');
     const write = (url: string) => fs.writeFileSync(file, JSON.stringify({ version: 'v1', entries: { 'tnc.in_force.url': { en: url } } }));
     write('https://a.example/A');
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -76,11 +106,66 @@ describe('startContent (configmap reload)', () => {
     expect(warn.mock.calls.flat().join(' ')).not.toContain('a.example');
   });
 
-  it('skips a tick while a load is still pending', async () => {
-    const load = vi.fn(() => new Promise<never>(() => {}));
-    void startWithProvider({ name: 'stub', load }, 5);
-    await new Promise((r) => setTimeout(r, 60));
-    expect(load).toHaveBeenCalledTimes(1);
+  it('skips ticks while a reload is still pending, then resumes', async () => {
+    const slow = deferred<ContentSnapshot>();
+    const provider = scripted([snap('v1'), slow.promise, snap('v3')]);
+    await startWithProvider(provider, 5);
+    expect(currentContent()?.version).toBe('v1');
+    await vi.waitFor(() => expect(provider.load).toHaveBeenCalledTimes(2), { timeout: 2000 });
+    await tick(50); // many ticks pass while the second load is pending
+    expect(provider.load).toHaveBeenCalledTimes(2);
+    slow.resolve(snap('v2'));
+    await vi.waitFor(() => expect(provider.load.mock.calls.length).toBeGreaterThanOrEqual(3), { timeout: 2000 });
+    await vi.waitFor(() => expect(currentContent()?.version).toBe('v3'), { timeout: 2000 });
+  });
+
+  it('a load pending across stop never installs its snapshot', async () => {
+    const stale = deferred<ContentSnapshot>();
+    const provider = scripted([snap('v1'), stale.promise]);
+    await startWithProvider(provider, 5);
+    await vi.waitFor(() => expect(provider.load).toHaveBeenCalledTimes(2), { timeout: 2000 });
+    stopContent();
+    stale.resolve(snap('stale'));
+    await tick(20);
+    expect(currentContent()?.version).toBe('v1');
+  });
+
+  it('a stale load from before a restart neither installs nor clears the new run\'s pending flag', async () => {
+    const stale = deferred<ContentSnapshot>();
+    const old = scripted([snap('a1'), stale.promise]);
+    await startWithProvider(old, 5);
+    await vi.waitFor(() => expect(old.load).toHaveBeenCalledTimes(2), { timeout: 2000 });
+
+    const pending = deferred<ContentSnapshot>();
+    const next = scripted([snap('b1'), pending.promise, snap('b3')]);
+    await startWithProvider(next, 5);
+    await vi.waitFor(() => expect(next.load).toHaveBeenCalledTimes(2), { timeout: 2000 });
+
+    stale.resolve(snap('a2'));
+    await tick(50);
+    expect(old.load).toHaveBeenCalledTimes(2);
+    expect(next.load).toHaveBeenCalledTimes(2); // still guarded by the new run's pending load
+    expect(currentContent()?.version).toBe('b1');
+
+    pending.resolve(snap('b2'));
+    await vi.waitFor(() => expect(currentContent()?.version).toBe('b3'), { timeout: 2000 });
+  });
+
+  it('warns on a same-version reload only when both fingerprints exist and differ', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fp = (fingerprint?: string) => ({ ...snap('v1'), ...(fingerprint ? { fingerprint } : {}) });
+    const run = async (a: ContentSnapshot, b: ContentSnapshot) => {
+      warn.mockClear();
+      const provider = scripted([a, b]);
+      await startWithProvider(provider, 5);
+      await vi.waitFor(() => expect(currentContent()).toBe(b), { timeout: 2000 });
+      stopContent();
+      return warn.mock.calls.length;
+    };
+    expect(await run(fp(), fp('x'))).toBe(0);
+    expect(await run(fp('x'), fp())).toBe(0);
+    expect(await run(fp('x'), fp('x'))).toBe(0);
+    expect(await run(fp('x'), fp('y'))).toBe(1);
   });
 
   it('never throws when the file is missing at start; content stays unavailable', async () => {
