@@ -40,6 +40,8 @@ export function toAcceptedRecord(job: Job, source: string): AcceptedRecord {
   if (!job.audit) throw new Error(`job ${job.job_id} has no audit ids`);
   const realtime = job.audit.redactValues ?? job.priority === 'realtime';
   const to = job.audit.recipients ?? job.to;
+  // References (key, version, locale), never content values: recorded on redacted sends too.
+  const contentRefs = job.audit.contentRefs?.length ? { content_refs: job.audit.contentRefs } : {};
   return {
     ids: job.audit,
     network: process.env.NS_NETWORK ?? 'unknown',
@@ -48,11 +50,12 @@ export function toAcceptedRecord(job: Job, source: string): AcceptedRecord {
     channel: job.channel,
     templateId: job.template_id,
     payload: realtime
-      ? { to, variable_names: job.audit.variableNames ?? Object.keys(job.variables ?? {}) }
+      ? { to, variable_names: job.audit.variableNames ?? Object.keys(job.variables ?? {}), ...contentRefs }
       : {
           to,
           variables: withoutAttachmentBodies(job.channel, job.variables),
           ...(job.body ? { body: job.body } : {}),
+          ...contentRefs,
         },
     job: realtime ? undefined : (job as unknown as Record<string, unknown>),
     recoverable: !realtime,

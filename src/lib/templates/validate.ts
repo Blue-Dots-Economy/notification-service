@@ -1,6 +1,7 @@
 import type { TemplateRow, VariableSpec } from '../db/schema';
 import { MAX_LENGTH, messageType } from '../providers/sms/render';
-import { checkTokensMatchContract, VariableContractSchema } from './contract';
+import { currentContent } from '../content/resolver';
+import { checkTokensMatchContract, isContentVariable, VariableContractSchema } from './contract';
 import { TemplateError } from './errors';
 
 const VALID_TOKEN = /\{\{\w+\}\}/g;
@@ -56,6 +57,17 @@ export function validateForPublish(
   const parsed = VariableContractSchema.safeParse(t.variables);
   if (!parsed.success) throw new TemplateError('invalid_contract', 'variable contract is invalid');
   const contract = parsed.data;
+
+  // Every content key must exist in the loaded content (the allowlist) before publish.
+  const contentSpecs = contract.filter(isContentVariable);
+  if (contentSpecs.length) {
+    const snap = currentContent();
+    if (!snap) throw new TemplateError('content_unavailable', 'no content is loaded; cannot publish content_ref variables');
+    const missing = contentSpecs.map((s) => s.contentKey!).filter((k) => !snap.keys.has(k));
+    if (missing.length) {
+      throw new TemplateError('unknown_content_key', `content keys not defined: ${missing.join(', ')}`, { keys: missing });
+    }
+  }
 
   if (t.channel === 'email') {
     if (!t.subject || (!t.bodyHtml && !t.bodyText)) {

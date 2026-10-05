@@ -87,3 +87,24 @@ describe('toAcceptedRecord — email attachments', () => {
     expect((job.variables.attachments[0] as { data: string }).data).toBe(data);
   });
 });
+
+describe('toAcceptedRecord — content refs', () => {
+  const refs = [{ key: 'tnc.in_force.url', version: 'v3', locale: 'en' }];
+  it('payload includes content_refs for redacted and non-redacted jobs', () => {
+    const redacted: Job = {
+      job_id: 'j', channel: 'sms', priority: 'realtime', to: '+919999999999',
+      template_id: 't', variables: {}, audit: { ...ids, redactValues: true, variableNames: ['tnc_url'], contentRefs: refs },
+    };
+    expect(toAcceptedRecord(redacted, 's').payload).toEqual({ to: '+919999999999', variable_names: ['tnc_url'], content_refs: refs });
+    const normal: Job = {
+      job_id: 'j', channel: 'sms', priority: 'other', to: '+919999999999',
+      template_id: 't', variables: { tnc_url: 'https://example.org/tnc' }, audit: { ...ids, redactValues: false, contentRefs: refs },
+    };
+    expect(toAcceptedRecord(normal, 's').payload).toMatchObject({ content_refs: refs });
+  });
+
+  it('no content_refs key when the job carried none', () => {
+    const job: Job = { job_id: 'j', channel: 'sms', priority: 'other', to: '+91', template_id: 't', variables: {}, audit: { ...ids, contentRefs: [] } };
+    expect(toAcceptedRecord(job, 's').payload).not.toHaveProperty('content_refs');
+  });
+});

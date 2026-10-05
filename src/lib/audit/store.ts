@@ -1,5 +1,6 @@
 import { sql, type SQL } from 'drizzle-orm';
 import type { Priority } from 'src/types';
+import type { ContentRef } from '../content/types';
 import { getDb } from '../db/client';
 import type { AttemptStatus, DeliveryMode } from '../db/partitioned';
 import { ATTEMPT_RANK, eventStatusFor } from './status';
@@ -27,6 +28,8 @@ export interface AuditIds {
    * the first job. Recipients only, never variable values.
    */
   recipients?: Record<string, string>;
+  /** Shared content this send rendered (key, version, locale) — references, never values. */
+  contentRefs?: ContentRef[];
 }
 
 export interface AcceptedRecord {
