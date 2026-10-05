@@ -501,7 +501,9 @@ Messages name the key and variable, never the value.
 
 **Event record (E3).** The event payload carries `content_refs`, a per-channel map
 `{ "<channel>": [{ key, version, locale }] }`, de-duplicated per channel and built from each planned
-delivery's own references. These are references, never values, and are recorded for redacted sends
+delivery's own references (`src/lib/content/refs.ts`). Every job of a send carries the whole map, so
+the event row holds every channel's entry in any mode, and the delivering attempt's channel selects
+the entry that applied. These are references, never values, and are recorded for redacted sends
 too, so an audit can answer which terms version a message carried.
 
 **Reload and boot (E4).** The first load happens at boot and the file is re-read every

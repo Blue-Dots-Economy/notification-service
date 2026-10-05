@@ -11,7 +11,7 @@ import { TemplateError } from '../../templates/errors';
 import { V1NotifySchema } from '../request';
 import { parseContentDocument } from '../../content/configmap';
 import { setContentForTests } from '../../content/resolver';
-import { contentRefsFor } from '../../../routes/v1-notify';
+import { contentRefsFor } from '../../content/refs';
 
 const v = (name: string, extra = {}) => ({ name, required: true, type: 'string', sensitive: false, raw: false, ...extra });
 const tpl = (over: Record<string, unknown>) => ({
