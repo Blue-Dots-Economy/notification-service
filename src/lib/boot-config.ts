@@ -1,4 +1,5 @@
 import { bearerConfig } from './auth/bearer';
+import { contentConfig } from './content/resolver';
 import { recoveryMaxAgeHours } from './audit/recover';
 import { urgentDefaultDeadlineS } from './deadline';
 import { poolConfig } from './pools';
@@ -18,4 +19,5 @@ export function validateBootConfig(env: NodeJS.ProcessEnv = process.env): void {
   resolveCacheTtlMs(env);
   validateWorkerConfig(env);
   bearerConfig(env);
+  contentConfig(env);
 }
