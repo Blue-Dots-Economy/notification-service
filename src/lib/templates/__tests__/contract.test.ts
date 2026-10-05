@@ -217,7 +217,7 @@ describe('content_ref variables', () => {
   ])('rejects %j', (spec, path) => {
     const r = VariableContractSchema.safeParse([spec]);
     expect(r.success).toBe(false);
-    expect(JSON.stringify(r.error?.issues)).toContain(path);
+    expect(r.error?.issues[0]?.path).toEqual([0, path]);
   });
 
   it('callerVariables excludes content variables', () => {
@@ -225,6 +225,6 @@ describe('content_ref variables', () => {
     expect(callerVariables(c).map((s) => s.name)).toEqual(['name']);
   });
 
-  it.each(['tnc.in_force.url', 'tnc.on_offer.text', 'a.b', 'a1.b_2.c'])('key grammar accepts %s', (k) => expect(CONTENT_KEY.test(k)).toBe(true));
+  it.each(['tnc.in_force.url', 'tnc.on_offer.text', 'a.b', 'a1.b_2.c', 'a.b.c.d.e.f.g.h'])('key grammar accepts %s', (k) => expect(CONTENT_KEY.test(k)).toBe(true));
   it.each(['tnc', '.tnc.url', 'tnc.url.', 'Tnc.url', 'tnc.1url', 'a.b.c.d.e.f.g.h.i'])('key grammar rejects %s', (k) => expect(CONTENT_KEY.test(k)).toBe(false));
 });
