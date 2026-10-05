@@ -11,6 +11,7 @@ import { TemplateError } from '../../templates/errors';
 import { V1NotifySchema } from '../request';
 import { parseContentDocument } from '../../content/configmap';
 import { setContentForTests } from '../../content/resolver';
+import { contentRefsFor } from '../../../routes/v1-notify';
 
 const v = (name: string, extra = {}) => ({ name, required: true, type: 'string', sensitive: false, raw: false, ...extra });
 const tpl = (over: Record<string, unknown>) => ({
@@ -199,6 +200,16 @@ describe('planSend — content_ref variables', () => {
     const plan = await planSend(req({ template_key: 'tnc_sms', channel: 'sms', to: { phone: '+919999999999' }, variables: { name: 'A' } }));
     expect(plan.deliveries[0]!.rendered).toMatchObject({ mode: 'provider', variables: { name: 'A', tnc_url: 'https://example.org/tnc' } });
     expect(plan.deliveries[0]!.contentRefs).toEqual([{ key: 'tnc.in_force.url', version: 'v3', locale: 'en' }]);
+  });
+
+  it('two content variables on one key: the per-channel map records the ref once', async () => {
+    loadTnc();
+    const tncV2 = v('tnc_link', { type: 'url', source: 'content_ref', contentKey: 'tnc.in_force.url' });
+    const twice = tpl({ channel: 'sms', templateKey: 'tnc_sms', variables: [v('name'), tncV, tncV2] });
+    templates.resolveTemplate.mockResolvedValue({ template: twice, renders: 'provider' });
+    const plan = await planSend(req({ template_key: 'tnc_sms', channel: 'sms', to: { phone: '+919999999999' }, variables: { name: 'A' } }));
+    expect(plan.deliveries[0]!.rendered).toMatchObject({ variables: { tnc_url: 'https://example.org/tnc', tnc_link: 'https://example.org/tnc' } });
+    expect(contentRefsFor(plan.deliveries)).toEqual({ contentRefs: { sms: [{ key: 'tnc.in_force.url', version: 'v3', locale: 'en' }] } });
   });
 
   it('a delivery with no content variables has empty contentRefs', async () => {

@@ -253,14 +253,23 @@ describe('POST /v1/notify — content refs', () => {
   const en = { key: 'tnc.in_force.url', version: 'v3', locale: 'en' };
   const hi = { key: 'tnc.in_force.url', version: 'v3', locale: 'hi' };
 
-  it('all: each job carries only its own channel\'s refs', async () => {
+  it('all: every job, and so the event row, carries every channel\'s refs', async () => {
     plan.planSend.mockResolvedValue({ mode: 'all', deliveries: [delivery('sms', [hi]), delivery('email', [en])], redact: false, variables: { name: 'A' } });
     await post(body);
     const [smsJob, emailJob] = queue.pushManyToPriority.mock.calls[0]![0] as any[];
-    expect(smsJob.audit.contentRefs).toEqual({ sms: [hi] });
-    expect(emailJob.audit.contentRefs).toEqual({ email: [en] });
+    expect(smsJob.audit.contentRefs).toEqual({ sms: [hi], email: [en] });
+    expect(emailJob.audit.contentRefs).toEqual({ sms: [hi], email: [en] });
+    // The event row is written from records[0].
     const recs = store.recordAcceptedMany.mock.calls[0]![0] as any[];
-    expect(recs.map((r) => r.payload.content_refs)).toEqual([{ sms: [hi] }, { email: [en] }]);
+    expect(recs[0].payload.content_refs).toEqual({ sms: [hi], email: [en] });
+  });
+
+  it('all, redacted: the event payload carries the full map', async () => {
+    plan.planSend.mockResolvedValue({ mode: 'all', deliveries: [delivery('sms', [hi]), delivery('email', [en])], redact: true, variables: { message: '123456' } });
+    await post(body);
+    const recs = store.recordAcceptedMany.mock.calls[0]![0] as any[];
+    expect(recs[0].payload.content_refs).toEqual({ sms: [hi], email: [en] });
+    expect(JSON.stringify(recs)).not.toContain('123456');
   });
 
   it('first_available: the map is keyed by candidate channel', async () => {
