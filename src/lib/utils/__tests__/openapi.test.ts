@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 vi.mock('../../providers', () => ({ providers: {} }));
+import { CONTENT_KEY } from '../../templates/contract';
 import { openApiDocument } from '../openapi';
 
 const SEND_SECURITY = [{ requestSignature: [] }, { bearerAuth: ['notify:send'] }];
@@ -77,5 +78,20 @@ describe('openApiDocument', () => {
     }
     expect(checked).toBeGreaterThan(10);
     expect(doc.components.securitySchemes.bearerAuth.description).toContain('the configured audience (default `notification-service`)');
+  });
+
+  it('documents content_ref variables and their error codes', () => {
+    const doc = openApiDocument() as { components: { schemas: Record<string, any> }; paths: Record<string, any> };
+    const props = doc.components.schemas.VariableSpec.properties;
+    expect(props.source.enum).toEqual(['request', 'content_ref']);
+    expect(props.contentKey.pattern).toBe(CONTENT_KEY.source);
+    const codes = ['content_unavailable', 'unknown_content_key', 'content_unresolved', 'invalid_content'];
+    const admin = doc.paths['/v1/admin/templates'].post.responses['422'].description as string;
+    const notify = doc.paths['/v1/notify'].post.responses['422'].description as string;
+    for (const c of codes) {
+      expect(admin, c).toContain(c);
+      expect(notify, c).toContain(c);
+    }
+    expect(notify).toMatch(/configuration.*content_unavailable/);
   });
 });

@@ -419,6 +419,73 @@ current vendor's template is created and published, which retires the old vendor
 serialise on a session advisory lock. Seeding is non-fatal (logged, never blocks listen) and is
 skipped when `NS_NETWORK` is unset; a template that fails publish validation is left as a draft.
 
+
+### Content resolver
+
+Code: `src/lib/content/` (`types`, `configmap`, `resolver`, `inject`). A template variable can take its
+value from shared content, such as a terms-and-conditions link, instead of from the caller.
+
+**Variable fields.** `source: "request"` (default) or `"content_ref"`, plus `contentKey` for
+`content_ref`. The key is dotted lowercase segments matching `CONTENT_KEY`
+(`^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){1,7}$`), e.g. `tnc.in_force.url` or `tnc.on_offer.text`; NS does
+not interpret the segments, and `in_force` versus `on_offer` is part of the key (an acceptance receipt
+carries the in-force text, a re-consent broadcast the offered one). A `content_ref` variable is always
+required, is never `sensitive` (shared public content has nothing to redact), and may be `raw` under
+the same email-only rule as other variables.
+
+**File format.** One JSON document, at most 1 MiB:
+`{ "version": "2026-10-01", "entries": { "<key>": { "<locale>": "<value>" } } }`. `version` matches
+`^[A-Za-z0-9._-]{1,64}$`; locales look like `en` or `en-IN`; at most 500 keys; each value is a
+non-empty string of at most 2000 characters. Unknown top-level fields are rejected. A `url` variable's
+value passes the same checks as a caller URL (http(s), no userinfo, `urlHosts` when declared).
+
+**Configuration.** `NS_CONTENT_PROVIDER` (`configmap`), `NS_CONTENT_FILE` (the path), and
+`NS_CONTENT_RELOAD_MS` (1 to 3600000, default 30000). Deployments set
+`NS_CONTENT_FILE=/app/content/content.json`. The provider reads only that file, never environment
+variables, secrets or other config. The provider interface leaves room for `db` and `http` providers
+as a configuration change.
+
+**Allowlist (E1).** The keys of the loaded file are the allowlist. A template may reference a key only
+if the current file defines it; there is no second list of permitted prefixes. Keys come from template
+contracts, which only `templates:admin` can write, never from requests.
+
+**Resolution at accept (E2).** Content resolves where the send is planned, so a failure is a
+synchronous `422` and a queued message carries the version current when it was accepted. The worker
+never consults content. Values are memoised per `(key, locale, version)`. Preview and publish resolve
+content too: publish checks that the key exists, that the template's locale chain resolves
+(`content_unresolved`), and that the value passes the variable's type and `urlHosts` checks
+(`invalid_content`). A template cannot be published before its content exists for its locale.
+
+**Locale chain.** The resolved template's locale, then its language, then `NS_DEFAULT_LOCALE`.
+
+**Errors.** All four are configuration errors (`422`, `kind: configuration` on `/v1/notify`), and a
+send is refused rather than rendered with an empty value:
+`content_unavailable` (no content loaded), `unknown_content_key`, `content_unresolved` (no value for
+the locale chain), `invalid_content` (the value fails the variable's type or `urlHosts` check).
+Messages name the key and variable, never the value.
+
+**Callers cannot supply content.** A request variable under a content variable's name is
+`422 unknown_variable` (a caller error); content variables are not part of the caller contract.
+
+**Event record (E3).** The event payload carries `content_refs`, a per-channel map
+`{ "<channel>": [{ key, version, locale }] }`, de-duplicated per channel and built from each planned
+delivery's own references. These are references, never values, and are recorded for redacted sends
+too, so an audit can answer which terms version a message carried.
+
+**Reload and boot (E4).** The first load happens at boot and the file is re-read every
+`NS_CONTENT_RELOAD_MS`; a slow load never overlaps the next. Every successful reload takes effect
+and clears the memo, including one that keeps the same `version` (that logs a warning: bump the
+version on edits). A bad or unreadable file keeps the last good snapshot and logs the problem
+without values. Boot never fails because of the content file: until a valid file loads, `content_ref`
+sends answer `422 content_unavailable`.
+
+**Isolation.** A template with no content variables never consults the resolver, so OTP and every
+other send are unaffected by content being off, missing or broken.
+
+**Mounting.** Mount the ConfigMap as a directory, not with `subPath`: Kubernetes updates directory
+mounts in place and never updates `subPath` mounts, so only a directory mount receives edits
+without a restart.
+
 ## Send API v1
 
 Code: `src/routes/v1-notify.ts`, `src/lib/send/` (`request`, `plan`, `errors`, `idempotency`,
@@ -575,6 +642,10 @@ Required for persistence and Redis:
 - `NS_DEFAULT_LOCALE` — optional, default `en`; the last step of the template locale chain.
 - `NS_KEYCLOAK_ISSUER`, `NS_KEYCLOAK_JWKS_URI`, `NS_AUTH_AUDIENCE`, `NS_AUTH_ALLOWED_AZP` — bearer-token
   auth; see Authentication. `NS_DOCS_ENABLED` — serves `/` and `/openapi.json` when `true`.
+- `NS_CONTENT_FILE` — optional; the content file for `content_ref` variables. Unset, content is off.
+  Deployments set `/app/content/content.json`. `NS_CONTENT_PROVIDER` (default and only value
+  `configmap`) and `NS_CONTENT_RELOAD_MS` (integer 1 to 3600000, default 30000) are validated
+  whether or not a file is set. See Content resolver.
 - `NS_RESOLVE_CACHE_TTL_MS` — optional, default 60000, positive integer (invalid fails boot). See
   Resolver cache.
 - `PARTITION_MAINTENANCE_INTERVAL_MS` — optional, default 6h.
@@ -636,7 +707,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 619 unit tests across 48 files, plus 119 integration tests across 15 files. The unit suite runs in about a second because Redis
+vitest 4, 705 unit tests across 51 files, plus 119 integration tests across 15 files. The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real

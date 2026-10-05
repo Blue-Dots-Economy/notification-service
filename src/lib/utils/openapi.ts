@@ -1,4 +1,5 @@
 import { providers } from '../providers';
+import { CONTENT_KEY } from '../templates/contract';
 import { serializeProvider } from './provider-docs';
 
 // Either credential type authenticates a request (alternatives, not both at once).
@@ -43,7 +44,7 @@ const adminErrors = {
   '404': errorBody('not_found: no such template or policy'),
   '409': errorBody('invalid_state: the row is not in a state that allows this change'),
   '422': errorBody(
-    'A template or policy rule was violated (vendor_mismatch, incomplete_template, undeclared_token, unused_variable, body_too_long, invalid_contract, unknown_channel, missing_variable, unknown_variable, invalid_variable)'
+    'A template or policy rule was violated (vendor_mismatch, incomplete_template, undeclared_token, unused_variable, body_too_long, invalid_contract, unknown_channel, missing_variable, unknown_variable, invalid_variable, content_unavailable, unknown_content_key, content_unresolved, invalid_content)'
   ),
   '503': errorBody(
     `network_not_configured: NS_NETWORK is not set; database_unavailable: the template/policy store could not be reached; ${AUTH_UNAVAILABLE}`,
@@ -127,6 +128,19 @@ const adminSchemas = {
         minItems: 1,
         items: { type: 'string' },
         description: 'Allowed hosts for url variables; subdomains match. Valid only when type is url.',
+      },
+      source: {
+        type: 'string',
+        enum: ['request', 'content_ref'],
+        default: 'request',
+        description:
+          'request: the caller supplies the value. content_ref: the value comes from the shared content file by `contentKey`; callers cannot supply it. content_ref variables are always required and cannot be sensitive.',
+      },
+      contentKey: {
+        type: 'string',
+        maxLength: 128,
+        pattern: CONTENT_KEY.source,
+        description: 'The content key, e.g. tnc.in_force.url. Required when source is content_ref, and valid only then.',
       },
     },
   },
@@ -447,7 +461,7 @@ export function openApiDocument() {
             '409': errorBody('idempotency_in_progress, or duplicate-fallback (a repeat without an idempotency_key within 5 seconds)'),
             '422': {
               description:
-                'The send was refused. `kind` is `caller` (missing_variable, unknown_variable, invalid_variable, no_reachable_channel) or `configuration` (not_found, vendor_mismatch, incomplete_template, body_too_long, unknown_channel, no_policy).',
+                'The send was refused. `kind` is `caller` (missing_variable, unknown_variable, invalid_variable, no_reachable_channel) or `configuration` (not_found, vendor_mismatch, incomplete_template, body_too_long, unknown_channel, no_policy, content_unavailable, unknown_content_key, content_unresolved, invalid_content).',
               content: {
                 'application/json': {
                   schema: {
