@@ -94,6 +94,9 @@ is for local runs only).
 | `DATABASE_QUERY_TIMEOUT_MS` | `5000` | Client and server-side query timeout |
 | `DATABASE_SSL` | `disable` | `disable` or `require`; `require` verifies the certificate, so supply the CA via `NODE_EXTRA_CA_CERTS` |
 | `NS_NETWORK` | `unknown` | Network recorded on each event |
+| `NS_CONTENT_FILE` | unset | Content file for `content_ref` template variables; unset, they are unavailable. Deployments use `/app/content/content.json` |
+| `NS_CONTENT_PROVIDER` | `configmap` | Content source; `configmap` is the only value |
+| `NS_CONTENT_RELOAD_MS` | `30000` | How often the content file is re-read, 1 to 3600000 |
 | `INTERNAL_SECRETS_JSON` | required | Path to the HMAC signing keys file (see [Authentication](#authentication)) |
 | `NS_KEYCLOAK_ISSUER` | unset | Turns bearer-token auth on. Must equal the token `iss` exactly, an http(s) URL with no trailing slash |
 | `NS_KEYCLOAK_JWKS_URI` | `<issuer>/protocol/openid-connect/certs` | Key set location |
@@ -286,6 +289,35 @@ Email variables are HTML-escaped unless declared `raw: true`. Variable `type` is
 (subdomains match). A variable used inside an `href` or `src` attribute must be `type: "url"`,
 and publish rejects malformed tokens such as `{{ name }}`.
 
+### Shared content (`content_ref`)
+
+A variable can take its value from a shared content file, such as the current terms link, instead of
+from the caller. Declare `source: "content_ref"` and a `contentKey`:
+
+```json
+{ "name": "tnc_url", "type": "url", "source": "content_ref", "contentKey": "tnc.in_force.url", "urlHosts": ["example.com"] }
+```
+
+The file named by `NS_CONTENT_FILE`:
+
+```json
+{
+  "version": "2026-10-01",
+  "entries": {
+    "tnc.in_force.url": { "en": "https://example.com/terms/v3", "hi": "https://example.com/hi/terms/v3" }
+  }
+}
+```
+
+A body of `Read the terms: {{tnc_url}}` for an `hi-IN` template renders
+`Read the terms: https://example.com/hi/terms/v3` (the locale chain is `hi-IN`, `hi`, then
+`NS_DEFAULT_LOCALE`). Content resolves when the send is accepted, and the event records each channel's
+`content_refs` (`key`, `version`, `locale`). A `content_ref` variable is always required, cannot be
+`sensitive`, and cannot be supplied by the caller (`422 unknown_variable`). A missing key or locale, an
+invalid value, or no loaded content refuses the send with a configuration `422`
+(`content_unavailable`, `unknown_content_key`, `content_unresolved`, `invalid_content`). The file is
+re-read every `NS_CONTENT_RELOAD_MS`; a bad file keeps the last good version.
+
 
 ## Queue Model
 
@@ -467,7 +499,8 @@ keys return `400`.
 
 `422` codes. `caller`: `missing_variable`, `unknown_variable`, `invalid_variable`,
 `no_reachable_channel`. `configuration`: `not_found`, `vendor_mismatch`, `incomplete_template`,
-`body_too_long`, `unknown_channel`, `no_policy`. Messages name variables, never their values.
+`body_too_long`, `unknown_channel`, `no_policy`, `content_unavailable`, `unknown_content_key`,
+`content_unresolved`, `invalid_content`. Messages name variables, never their values.
 
 Urgent sends and sends using a template with a `sensitive` variable are redacted: only variable names
 are stored, and they are never dead-lettered. See `CLAUDE.md` (Send API v1) for planning, fallthrough,
