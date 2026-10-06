@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-This is a **Fastify notification service** that queues and asynchronously processes multi-channel notifications (email, SMS, WhatsApp). The API validates requests up front, records each send in Postgres, queues it in Redis, and a background worker processes it with retry logic and deduplication. Postgres is the record; Redis is the queue.
+This is a **Fastify notification service** that queues and asynchronously processes multi-channel notifications (email, SMS, WhatsApp). Callers send through one route, the Send API v1 (`POST /v1/notify`), by `event_type` (a published policy picks the channels) or by `template_key` + `channel`. The API resolves the stored templates, renders and validates the content before it accepts the request, records each send in Postgres and queues it in Redis; a background worker delivers it with retries. Postgres is the record; Redis is the queue.
 
 ## Quick Commands
 
@@ -46,9 +46,10 @@ This is a **Fastify notification service** that queues and asynchronously proces
      with its code (1 if it was killed by a signal), so the orchestrator restarts the pod: there
      is never a healthy-looking API queueing work that nothing drains.
 
-2. **Request Pipeline** (e.g., `POST /notify`)
-   - Authentication: bearer token or HMAC signature, plus route scope (`src/plugins/auth.ts`)
-   - Payload validation via Zod schemas
+2. **Request Pipeline** (`POST /v1/notify`)
+   - Authentication: bearer token or HMAC v2 signature, plus route scope (`src/plugins/auth.ts`)
+   - Payload validation via Zod (`V1NotifySchema`), then idempotency claim, then planning: templates
+     and policies are resolved, rendered and validated (see Send API v1)
    - Record in Postgres and enqueue to Redis (order depends on priority; see Persistence)
 
 3. **Background Worker** (`src/lib/worker.ts`)
@@ -104,24 +105,24 @@ Postgres is the record of every send; Redis is only the dispatch queue. Code: `s
 (client, `migrate.ts`, `maintenance.ts`, `schema.ts`, `partitioned.ts`) and `src/lib/audit/`
 (`store.ts`, `stamp.ts`, `status.ts`, `redact.ts`, `recover.ts`).
 
-**`/notify` ordering.**
-- **Normal priority is record-before-queue.** If the record cannot be written the send is refused:
-  `503 {"error": "audit store unavailable", "enqueued": false}`, and the dedupe claim is
+**Send ordering (`/v1/notify`).**
+- **Normal and bulk are record-before-queue.** If the record cannot be written the send is refused:
+  `503 {"error": "audit store unavailable"}`, and the claim (idempotency key or duplicate guard) is
   **released** so the caller's retry is accepted rather than answered as a duplicate.
-- **Realtime is queue-first.** The audit write is fire-and-forget so a slow database never delays
-  an OTP. It persists the recipient and variable **names only, never values**, and keeps no job
-  copy, so realtime sends are **not recoverable** after a Redis loss (the user requests a new code).
-- **Redaction is sticky.** `/notify` sets `audit.redactValues` (true for realtime **or an OTP
-  template**) on the job, and `toAcceptedRecord` keys on it, not on the current priority: a DLQ
-  replay of an OTP as `other` still persists names only and no job copy. Jobs without the flag fall
-  back to the priority. An OTP template (`isOtpTemplate`: `otp` as a whole token of the id, e.g.
-  `login_otp`, `otp.login`) is redacted at **any** priority, so an OTP sent without `priority` is
-  never persisted (and, like realtime, not recoverable). A raw provider id (DLT flow id) carries no
-  name: an OTP sent under one is redacted only if the caller sends `priority: 'realtime'`.
-- If the Redis push fails after the record was written, the attempt is stamped `failed`
-  (`enqueue failed`, best-effort) and the dedupe claim is released (as on the 503 path) before the
-  error propagates, so recovery never sends it later and the caller's retry is accepted.
-- `x-correlation-id` is trimmed and capped at **128** chars; blank falls back to the job id.
+- **Urgent is queue-first.** The audit write is fire-and-forget so a slow database never delays
+  an OTP.
+- **Redaction is sticky.** A send is redacted when it is urgent or a planned template declares a
+  `sensitive` variable. It persists the recipients and variable **names only, never values**, and
+  keeps no job copy, so it is **not recoverable** after a Redis loss (the user requests a new code).
+  `/v1/notify` sets `audit.redactValues` on the job and `toAcceptedRecord` keys on it, not on the
+  current priority, so the decision holds for every later write. Jobs without the flag fall back to
+  the priority. An OTP template id (`isOtpTemplate`: `otp` as a whole token, e.g. `login_otp`) is
+  redacted by `toAcceptedRecord` at any priority, as a backstop.
+- If the Redis push fails after the record was written, the attempts are stamped `failed`
+  (`enqueue failed`, best-effort) and the claim is released (as on the 503 path) before the error
+  propagates, so recovery never sends it later and the caller's retry is accepted.
+- Correlation id: the body's `correlation_id`, else `x-correlation-id`, trimmed and capped at
+  **128** chars; blank falls back to the event id.
 - The persisted payload never holds email attachment bodies (filename, contentType and size
   only). The **job copy keeps them**: recovery re-pushes that copy. Persisted `error` strings are
   capped at 500 chars.
@@ -219,7 +220,7 @@ rollups and erasure tooling remain #65.
 
 ### Authentication
 
-One preHandler, `authenticate({ scope, legacyHmacV1? })` (`src/plugins/auth.ts`), guards every route except `GET /metrics` (unauthenticated, content-free). A request carries **one** of two credential types:
+One preHandler, `authenticate({ scope })` (`src/plugins/auth.ts`), guards every route except `GET /metrics` (unauthenticated, content-free). A request carries **one** of two credential types:
 
 - **HMAC v2** headers: `X-NS-Key`, `X-NS-Timestamp`, `X-NS-Nonce`, `X-NS-Signature: v2=<64 lowercase hex>`.
 - **Keycloak bearer token**: `Authorization: Bearer <jwt>`.
@@ -230,18 +231,15 @@ An `Authorization` header together with any of the four HMAC headers is `401 Amb
 ```
 METHOD\npath\ntimestamp\nnonce\nsha256(body)
 ```
-`path` is `req.url` including the query string. The digest is lowercase hex SHA-256 of the exact body bytes, or of the empty string when there is no body. The signature format is strict: `v1=` or `v2=` followed by 64 lowercase hex characters. Allowed clock skew is 30 s; a non-numeric timestamp is `401 Request expired`. The **signature is verified first, then the nonce is claimed** (`nonce:<keyId>:<nonce>`, `SET NX EX 60`), so `Replay detected` always means a correctly signed request seen twice.
+`path` is `req.url` including the query string. The digest is lowercase hex SHA-256 of the exact body bytes, or of the empty string when there is no body. The signature format is strict: `v2=` followed by 64 lowercase hex characters. Allowed clock skew is 30 s; a non-numeric timestamp is `401 Request expired`. The **signature is verified first, then the nonce is claimed** (`nonce:<keyId>:<nonce>`, `SET NX EX 60`), so `Replay detected` always means a correctly signed request seen twice.
 
 **Bodies.** JSON is the only accepted body type; any other content type is `415` before authentication runs, and every accepted body is covered by the v2 signature. A bodyless POST (publish, retire, `POST /failed/retry`) sends no `Content-Type`, or sends `{}` as JSON; an empty body declared as `application/json` is `400`. `registerRawJsonBody` (`src/plugins/raw-body.ts`) removes all default content-type parsers and installs one `application/json` parser that keeps the raw bytes on `req.rawBody` and then parses with Fastify's own JSON parser. The built-in parser is replaced because it hands over only the parsed object, and re-serialising an object does not reproduce the bytes the caller signed.
-
-**HMAC v1** (`METHOD\npath\ntimestamp\nonce`, no body digest) is accepted on legacy `POST /notify` only (`legacyHmacV1: true`), until the cutover release deletes that route. Every other route answers `401 Signature version not accepted` for `v1=`.
 
 **Scopes.** Two scopes: `notify:send` and `templates:admin`. A route's scope is in its `authenticate` options; the table is pinned by `src/__tests__/route-scopes.test.ts`.
 
 | Route | Scope |
 | --- | --- |
 | `POST /v1/notify` | `notify:send` |
-| `POST /notify` (legacy; HMAC v1 or v2) | `notify:send` |
 | `/v1/admin/templates*`, `/v1/admin/policies*`, `GET /v1/admin/export` | `templates:admin` |
 | `POST /failed/retry` | `templates:admin` |
 | `GET /providers`, `GET /providers/:name`, `GET /metrics/queue` | any authenticated principal |
@@ -266,7 +264,7 @@ A missing scope is `403 {"error":"Insufficient scope","required":"<scope>"}`. `P
 
 **`NS_DOCS_ENABLED`.** The API reference (`/`) and `/openapi.json` are registered only when `NS_DOCS_ENABLED=true`. The local-dev `example.env` sets it; deployed environments leave it unset.
 
-**Caller identity in audit rows.** The audit `source` on `/notify` and `/v1/notify`, and the admin `created_by`/`published_by`, are `principalLabel(req.principal)`: `hmac:<keyId>` or `bearer:<id>`. Rows written before this change hold the bare key id.
+**Caller identity in audit rows.** The audit `source` on `/v1/notify`, and the admin `created_by`/`published_by`, are `principalLabel(req.principal)`: `hmac:<keyId>` or `bearer:<id>`. Rows written before this change hold the bare key id.
 
 **Rejection logging.** Every refused request logs `{ status, error, credential }` with message `auth rejected` (`credential` is `bearer`, `hmac`, or `both` for ambiguous credentials) — at `warn`, or at `error` for a `503`. The token, signature, nonce, key secret and `Authorization` header are never logged.
 
@@ -274,75 +272,51 @@ Implementation: `src/lib/auth/` (`secrets.ts`, `hmac.ts`, `bearer.ts`, `principa
 
 ### Provider System
 
-Providers are extensible implementations for different notification channels (email, SMS, WhatsApp). Each provider exports a `ProviderDefinition` from `src/lib/providers/<name>/index.ts`:
+Providers are the channel implementations (email, SMS, WhatsApp). Each provider exports one `ProviderDefinition` (`src/types/provider.ts`) from `src/lib/providers/<name>/index.ts`:
 
 ```ts
 export const emailProvider: ProviderDefinition = {
-  name: 'email',                     // Channel name used in /notify requests
-  templates: { welcome: '...' },     // Public template keys → provider IDs
-  allowRawTemplateId: false,         // optional; see below
-  schema: z.object({ ... }),         // Zod schema for variables
-  async send({ to, template_id, variables }) { ... }
+  name: 'email',     // the channel: `channel` on /v1/notify, and the rate-limit key
+  vendor: 'smtp',    // 'smtp' | 'msg91' | 'pinnacle' | 'twilio'; templates name it in `provider`
+  renders: 'ns',     // 'ns': NS renders the stored body; 'provider': the vendor renders its template
+  async sendRendered({ to, rendered, providerTemplateId, dlt, email, job_id }) { ... },
 };
 ```
 
-`vendor` (a string naming the vendor, e.g. `'smtp'`, `'msg91'`, `'pinnacle'`, `'twilio'`) and `renders` (`'ns' | 'provider'`) are
-**required** on every definition; see Templates and policies for what they drive.
+All four fields are required. `src/lib/providers/index.ts` auto-discovers a folder's export by
+shape (`name`, `vendor` and `sendRendered`) and throws when a folder exports none or more than one.
+To add a provider, create a folder and export the definition (see README for a full example).
 
-Providers are auto-discovered and registered by `src/lib/providers/index.ts`. To add a provider, create a folder and export the definition, including `vendor` and `renders` (see README for full example).
+**`sendRendered`** sends content NS rendered and validated at accept time (`RenderedSendArgs`) and
+never re-renders. `rendered` is the template's output for the channel; `providerTemplateId` is the
+template's vendor template id (MSG91 flow id, Pinnacle DLT template id, Twilio content sid), and
+`dlt` carries the template's DLT ids, each non-null value overriding the env config. A rendered mode
+or channel the vendor cannot send is a permanent failure. `GET /providers` publishes
+`{name, vendor, renders}` per channel (`serializeProvider`, `src/lib/utils/provider-docs.ts`).
 
-**`allowRawTemplateId` (raw template-id pass-through).** By default a `template_id`
-must name a key in the provider's `templates` map or `/notify` rejects it with a
-400. When `allowRawTemplateId: true`, an unknown `template_id` is passed through to
-the provider verbatim — treated as a raw provider-side id the caller owns. SMS uses
-this (#532/#535): signalstack sends DLT-approved MSG91 flow ids directly, so only
-the legacy `login_otp` flow is named in its `templates` map. Email keeps the default
-(strict allowlist).
-
-**SMS variables schema.** SMS switched its `schema` to `z.record(z.string(),
-z.string())` — an open map of named string variables (the DLT template's
-placeholders), rather than a fixed `z.object`. This carries the multi-variable
-flow (`name`, `link`, …) through to MSG91 as per-recipient vars.
+**`renders`** decides what a template stores and what is sent:
+- `ns` (email/smtp, Pinnacle SMS): the stored body is rendered here and the final text is sent.
+- `provider` (MSG91 Flow, Twilio Content): the template's `provider_template_id` is sent with the
+  validated variables, and the vendor renders its registered template.
 
 **Two SMS vendors, selected by `SMS_PROVIDER` (`msg91` default, or `pinnacle`).**
-`src/lib/providers/sms/index.ts` picks one at boot and throws on an unknown name
-rather than falling back — silently sending through the wrong vendor would use
-the wrong sender id and DLT entity. Both definitions declare `name: 'sms'`, so
-the channel key, the rate-limit key and every caller are identical either way.
-
-The two vendors are **not** the same shape, and this is the thing to understand
-before touching either file:
+`src/lib/providers/sms/index.ts` picks one at boot and throws on an unknown name, because each
+vendor has its own sender id and DLT entity. Both definitions declare `name: 'sms'`, so the channel
+key, the rate-limit key and every caller are identical either way.
 
 | | MSG91 Flow | Pinnacle JSON |
 |---|---|---|
-| What you send | flow id + named variables | fully **rendered `text`** |
-| Who renders the body | **MSG91**, from the DLT template | **nobody** — you supply final text |
-| DLT metadata | hidden inside the flow | explicit `dltentityid` / `dlttempid` / `sender` |
-| `template_id` means | an MSG91-internal flow id | the **DLT template id itself** |
+| `renders` | `provider` | `ns` |
+| What is sent | flow id (`providerTemplateId`) + named variables | the rendered `text` |
+| Who renders the body | **MSG91**, from the DLT template | **NS**, from the stored body |
+| DLT metadata | held in the flow | explicit `dltentityid` / `dlttempid` / `sender`, from the template or `PINNACLE_*` env |
 | Errors | HTTP status | HTTP 200 + `code: EC1xxx` in the body |
 
-**`bodies` (provider-owned message text).** Because Pinnacle renders nothing,
-`ProviderDefinition.bodies` maps the same public keys as `templates` to their
-body text, and the worker resolves `provider.bodies[key] ?? job.body`. So a
-template the provider **names** (`login_otp`) carries its own body and needs no
-caller change — which is why the OTP callers (Keycloak, Signals guardian OTP)
-were untouched by the Pinnacle work. A **raw pass-through** id has no entry, so
-its body must come from the caller's optional `body` field on `/notify`.
-
-**`??`, never `||` — this one is load-bearing.** A *declared but blank* body
-(`bodies: { login_otp: '' }`, the state while a DLT approval is pending) is
-dead-lettered alongside a blank template id, and must never fall through to the
-caller's `body`. With `||` it did, which let any caller put arbitrary text on the
-wire under a DLT-approved template id: a compliance break and a phishing
-primitive in one. Declaring a template is this service claiming its text;
-blank means unconfigured, not "caller may supply it".
-
-The body must be **byte-identical to the DLT-approved text**. The operator
-matches on it; drift is scrubbed downstream rather than rejected upfront, so it
-fails silently. `src/lib/providers/sms/render.ts` substitutes `{{token}}` and
-**throws** on any unresolved or empty variable — the lenient behaviour that is
-right for signalstack's dev-preview log would put a literal `{{name}}` on a
-handset here.
+- **MSG91.** Each variable is a per-recipient Flow variable. A lone `message` variable (the OTP
+  contract) is sent as `var`, MSG91's `##var##` placeholder. `mobiles` is spread last, so a variable
+  of that name never overrides the recipient phone.
+- **Pinnacle.** The stored SMS body must be **byte-identical to the DLT-approved text**: the operator
+  matches on it. SMS bodies are stored byte-exact (see Templates and policies, Rendering).
 
 **`retryable` on the send result.** The worker's default is to retry every
 failure up to `MAX_RETRIES`, which is right for a timeout and wrong for "that
@@ -355,28 +329,23 @@ are permanent; `EC1009`/`EC1010` and unrecognised codes still retry.
 
 ### Request Deduplication
 
-`/notify` deduplicates by a Redis `SET NX` key with a per-mode TTL (windows are
-**not** configurable). Two modes (`src/lib/dedupe_key.ts`, `src/routes/notify.ts`):
+`/v1/notify` has two mechanisms, both claimed before planning (`src/routes/v1-notify.ts`):
 
-- **Explicit `dedupe_id`** — the caller promising "send this once". Used verbatim
-  as the key, **1 hour** window. A suppressed repeat is a success with a reason:
-  `200 {"enqueued": false, "reason": "duplicate"}`.
-- **No `dedupe_id`** — fallback key `channel:to:template_id:<sha256 of the rendered
-  payload>` (the `channel:to:template_id` prefix stays in the clear so the key is
-  greppable; the digest carries message identity), **5 second** window. A suppressed
-  repeat is nobody's intent — a dropped message — so it answers
-  `409 {"enqueued": false, "reason": "duplicate-fallback"}` (#88).
+- **`idempotency_key`** (`src/lib/send/idempotency.ts`): the caller's "send this once". A repeat
+  returns `200` with the original response; a repeat while the first is in flight is
+  `409 idempotency_in_progress`. See Send API v1, Idempotency, for storage and windows.
+- **Fallback guard** (no key): `fallbackKey` hashes the request's `event_type`, `template_key`,
+  `channel`, `domain`, `to`, `locale` and `variables` into `dedupe:v1:<sha256>`, claimed with
+  `SET NX` for **5 seconds** (`src/lib/dedupe.ts`). A byte-identical repeat inside the window is
+  `409 {"error":"duplicate-fallback"}` and sends nothing.
 
-Hashing the whole payload is what makes the fallback message-identifying: it used
-to key on `channel:to:template_id` alone, which for a generic template like
-`basic_email` collapsed to one email per recipient per window regardless of content.
-See README for the full request/response contract.
+Any refusal after a claim releases it, so a corrected retry is accepted.
 
 ## Templates and policies
 
 Code: `src/lib/templates/` (`contract`, `render`, `repo`, `validate`, `vendors`, `seed`),
 `src/lib/policies/` (`repo`, `plan`), routes `src/routes/admin-templates.ts` and
-`admin-policies.ts`. Send API v1 (`POST /v1/notify`) uses them; legacy `/notify` does not.
+`admin-policies.ts`. Send API v1 (`POST /v1/notify`) sends through them.
 
 **Tables.** `template` is keyed `(network, channel, template_key, locale)` and `notification_policy`
 `(network, domain, event_type)` where NULL means "any". Both carry a `version` and a status of
@@ -446,10 +415,11 @@ variables and sends nothing.
 
 **`login_otp` seeding** (`seed.ts`, called from `server.ts` after recovery). At boot the SMS
 `login_otp` template is created and published from the **explicitly configured** id for the current
-vendor, with the provider's body and contract `message` (required, sensitive): msg91 reads
-`SMS_LOGIN_OTP_TEMPLATE_ID` directly (the provider map's hardcoded fallback flow id is never
-seeded), pinnacle reads `PINNACLE_LOGIN_OTP_TEMPLATE_ID` via its provider map; unset or blank →
-`skipped_no_id`. Existence is checked **per vendor**: any `login_otp` row (any status/locale) whose
+vendor, with contract `message` (required, sensitive). `configuredLoginOtp(vendor, env)` reads
+explicit env only: msg91 → `SMS_LOGIN_OTP_TEMPLATE_ID`; pinnacle → `PINNACLE_LOGIN_OTP_TEMPLATE_ID`.
+The id is trimmed, and unset or blank → `skipped_no_id`. The body is `SMS_LOGIN_OTP_BODY` as written
+(byte-exact), or null; a pinnacle template without a body fails publish validation and is left as a
+draft (`seeded_draft`). Existence is checked **per vendor**: any `login_otp` row (any status/locale) whose
 `provider` is the current vendor → `exists`, never overwritten, so an admin's edits always win over
 environment defaults. The one exception is the seed's **own untouched draft** (`created_by =
 'system:seed'`, still `draft`, `updated_at = created_at`): e.g. Pinnacle with
@@ -574,8 +544,10 @@ without a restart.
 
 Code: `src/routes/v1-notify.ts`, `src/lib/send/` (`request`, `plan`, `errors`, `idempotency`,
 `resolver-cache`), and the
-`job.v1` branch of `src/lib/worker.ts` (`processV1Job`, `failDelivery`, `fallThrough`). Legacy `/notify`
-is unchanged and stays until the cutover release.
+`src/lib/worker.ts` (`processV1Job`, `failDelivery`, `fallThrough`). `/v1/notify` is the only send
+route. The worker processes only jobs that carry a `v1` plan; a job without one (an older job shape
+reaching the worker through recovery or a DLQ replay) is closed `failed` and dead-lettered with
+reason `legacy_job_shape` (dropped when redacted), counted in `ns_job_dlq_total{reason="legacy_job_shape"}`.
 
 **Request** (`V1NotifySchema`, strict: unknown keys → `400`). Exactly one of `event_type` (a policy
 picks the channels) or `template_key`; `template_key` requires `channel`, `event_type` forbids it.
@@ -630,8 +602,8 @@ attempt `queued` → one MULTI {LPUSH it, SET the old attempt's `failed` marker}
 (`queue.pushToPriorityWithMarker`) → stamp the old attempt `failed`, so the old marker exists iff the
 next delivery is queued. If the deadline has passed the event
 expires instead. The `expired` fate is recorded by marker (`markAttempt`). Async bounces after a
-vendor accepted a message are out of scope (Stage 2.5/3). The last delivery takes the legacy fate
-(`dropOrDeadLetter`). `sendRendered` sends the content rendered at accept and never re-renders; a
+vendor accepted a message are out of scope (Stage 2.5/3). The last delivery is dead-lettered,
+or dropped when redacted (`dropOrDeadLetter`). `sendRendered` sends the content rendered at accept and never re-renders; a
 vendor change since accept (`vendor_changed`) fails the delivery.
 
 **Redaction.** A send is redacted when its priority is `urgent` **or** any planned template declares
@@ -673,7 +645,7 @@ and recipient `domain` as sent, null when absent (never the policy's matched dom
 fell back to a network-wide policy still records the caller's domain). They ride on `job.audit`, so
 every writer of the row records the same values: the accepted insert, a worker upsert that lands
 first (urgent), a fall-through, a DLQ replay and a recovered job. `template_key` is the request's
-`template_key` (legacy `/notify`: its `template_id`) and is **null for event sends**: their templates
+`template_key` and is **null for event sends**: their templates
 are per delivery and live on `delivery_attempt.template_id`.
 
 **Response:** `202 {notification_event_id, correlation_id, status: "accepted", mode, deliveries:
@@ -683,9 +655,8 @@ are per delivery and live on `delivery_attempt.template_id`.
 
 **Routes** (`src/routes/`):
 - `docs.ts` — Scalar API reference and OpenAPI JSON
-- `notify.ts` — Enqueue notification endpoint (legacy)
 - `v1-notify.ts` — Send API v1 (see Send API v1)
-- `providers.ts` — Provider discovery endpoints
+- `providers.ts` — Provider discovery: `{name, vendor, renders}` per channel
 - `metrics.ts` — Queue metrics endpoint (authenticated JSON) **and** `/metrics`,
   the unauthenticated Prometheus scrape endpoint
 - `retry.ts` — Manual DLQ retry endpoint (`refused` in the response; see DLQ replay cap)
@@ -694,7 +665,7 @@ are per delivery and live on `delivery_attempt.template_id`.
 **Library** (`src/lib/`):
 - `queue.ts` — Redis queue and retry helpers
 - `metrics.ts` — Redis-backed Prometheus counters/gauges (see below)
-- `worker.ts` — `processJob` (deadline, quota, send, retry/DLQ decision) and worker boot
+- `worker.ts` — `processJob` (v1 jobs only: deadline, quota, send, retry/fall-through/DLQ decision) and worker boot
 - `pools.ts` — Per-priority worker pools and the retry scheduler
 - `rate_limit.ts` — Split shared/reserved vendor quota
 - `deadline.ts` — Deadline and redaction helpers
@@ -702,11 +673,11 @@ are per delivery and live on `delivery_attempt.template_id`.
 - `auth/` — `secrets.ts` (signing keys and scopes from `INTERNAL_SECRETS_JSON`), `hmac.ts`, `bearer.ts`, `principal.ts`
 - `providers/` — Provider implementations (auto-loaded)
 - `utils/openapi.ts` — OpenAPI document builder
-- `utils/provider-docs.ts` — Provider schema/payload serialization
+- `utils/provider-docs.ts` — `serializeProvider`: `{name, vendor, renders}`
 
 **Other**:
 - `types/index.ts` — `Job` and `Priority`
-- `types/provider.ts` — `ProviderDefinition` interface
+- `types/provider.ts` — `ProviderDefinition` (`name`, `vendor`, `renders`, `sendRendered`) and `RenderedSendArgs`
 
 **Tests** (`src/**/__tests__/`):
 - `lib/__tests__/redis-fake.ts` — in-memory ioredis stand-in shared by the suites
@@ -774,14 +745,12 @@ Required for providers (varies by implementation):
   `PINNACLE_SENDER_ID`, `PINNACLE_DLT_ENTITY_ID` are required; the send fails
   **permanently** (no retries) if any is missing. `PINNACLE_DLT_HEADER_ID`,
   `PINNACLE_DLT_TAG_ID`, `PINNACLE_TMID` are optional and omitted when unset.
-  `PINNACLE_LOGIN_OTP_TEMPLATE_ID` + `SMS_LOGIN_OTP_BODY` configure the one
-  named template; a blank id dead-letters with "named but not configured".
-- `SMS_LOGIN_OTP_TEMPLATE_ID` — MSG91 flow id for the legacy `login_otp` template.
-  Read in `src/lib/providers/sms/msg91.ts`; optional, with a back-compat default of
-  the previously-hardcoded id for the legacy send path. The boot seed uses only the env value
-  and seeds nothing when it is unset. Per-event DLT flow ids are sent raw and need no env
-  (see `allowRawTemplateId`). Note: `MSG91_TEMPLATE_ID` in `example.env` is unused —
-  the code never reads it; use `SMS_LOGIN_OTP_TEMPLATE_ID` instead.
+  `PINNACLE_LOGIN_OTP_TEMPLATE_ID` + `SMS_LOGIN_OTP_BODY` seed the pinnacle
+  `login_otp` template at boot (see Templates and policies, `login_otp` seeding).
+- `SMS_LOGIN_OTP_TEMPLATE_ID` — MSG91 flow id that seeds the msg91 `login_otp` template at boot.
+  Unset or blank, nothing is seeded. Every other SMS template carries its vendor ids in the
+  catalogue or admin API. On every cluster, configure it (or the pinnacle pair) before the first
+  boot with `NS_SEED_FILE`, so the catalogue's OTP policies publish.
 - Twilio credentials for WhatsApp
 - etc.
 
@@ -811,7 +780,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 755 unit tests across 56 files, plus 138 integration tests across 17 files. The unit suite runs in about a second because Redis
+vitest 4, 734 unit tests across 56 files, plus 140 integration tests across 18 files. The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
@@ -831,8 +800,8 @@ assertions can read the state the code wrote.
 and the fake coerces its index args with `Number()`. If you add a `zrange`/`zrangebyscore`
 call, pass string indices to satisfy the v6 overloads.
 
-`worker.test.ts` covers `processJob`: provider/template routing, attempt counting, the full
-backoff ladder (5s → 10 → 20 → 40) and DLQ-on-exhaustion. It mocks `../queue` (these tests are
+`worker.test.ts` covers `processJob`: v1 delivery, the `legacy_job_shape` guard, attempt counting,
+the full backoff ladder (5s → 10 → 20 → 40), fall-through, deadlines, redaction and DLQ-on-exhaustion. It mocks `../queue` (these tests are
 about which queue call is made, not Redis behaviour) and must mock `../providers`, which
 auto-discovers by `require`-ing each `index.js` and so is not importable from source.
 
@@ -850,7 +819,7 @@ every retry sent eight times.
 A bulk send must not delay an OTP, and it must not exhaust the vendor quota an OTP needs. Three
 mechanisms (`src/lib/pools.ts`, `rate_limit.ts`, `deadline.ts`, `worker.ts`):
 
-**Split vendor quota.** Every send, from `/notify`, retries and DLQ replays alike, takes a token
+**Split vendor quota.** Every send, from `/v1/notify`, retries and DLQ replays alike, takes a token
 first. Each channel and vendor has two token buckets, `rl:<channel>:<vendor>:shared` and
 `rl:<channel>:<vendor>:reserved`. Urgent takes `shared` first, then `reserved`; normal and bulk
 take `shared` only, so they can never consume the reserve. A denied job is **deferred** back to
@@ -873,7 +842,7 @@ re-popping and re-denying in a tight loop. Every other outcome returns as before
 | `RATE_URGENT_SHARE` | `0.2` | Reserved fraction of rate and burst; `0 < share < 1` |
 | `RATE_LIMIT_DEFER_MS` | `250` | Deferral before jitter |
 | `PROVIDER_TIMEOUT_MS` | `10000` | Cap on every vendor call (HTTP, SMTP/SES, Pinnacle balance poll); a timeout is a retryable failure |
-| `URGENT_DEFAULT_DEADLINE_S` | `600` | Deadline the legacy `/notify` gives `realtime` jobs |
+| `URGENT_DEFAULT_DEADLINE_S` | `600` | Deadline of an urgent send when neither the request nor its templates set one |
 
 `validateWorkerConfig` parses all of these at worker boot, and the API parses them (plus the pool
 sizes) before listen via `validateBootConfig`. A bad value exits the process; a value parsed per
@@ -884,8 +853,9 @@ job would throw after the job was popped and drop it.
 call caps urgent throughput at ~0.2 jobs/s; size `WORKER_URGENT_CONCURRENCY` for the urgent rate
 you need times the timeout, or lower the timeout.
 
-**Deadlines.** `Job.deadline` is an absolute epoch-ms. Legacy `/notify` sets it for `realtime` jobs
-to now plus `URGENT_DEFAULT_DEADLINE_S`. `processJob` checks it first, and again before every
+**Deadlines.** `Job.deadline` is an absolute epoch-ms, set at accept (see Send API v1, Deadline:
+the request `deadline`, else the templates' `default_deadline_s`, else `URGENT_DEFAULT_DEADLINE_S`
+for urgent sends). `processJob` checks it first, and again before every
 deferral and before scheduling a retry. A job past its deadline is never sent: marker `expired`,
 status `expired` (the error keeps the last provider error, `deadline passed: <error>`),
 `ns_job_expired_total`, and never the DLQ. An OTP that arrives late is worse than none.
@@ -1045,7 +1015,7 @@ tab while it sits on a side branch.
 
 **Adding a provider:**
 1. Create `src/lib/providers/<name>/` folder
-2. Export `ProviderDefinition` from `index.ts`
+2. Export one `ProviderDefinition` (`name`, `vendor`, `renders`, `sendRendered`) from `index.ts`
 3. Auto-discovered on startup
 
 **Queue operations:**

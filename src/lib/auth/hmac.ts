@@ -22,7 +22,7 @@ export function signHmac(secret: string, canonical: string): string {
   return `v2=${crypto.createHmac('sha256', secret).update(canonical).digest('hex')}`;
 }
 
-/** The MAC of a `v2=<64 lowercase hex>` header; null for anything else, including `v1=`. */
+/** The MAC of a `v2=<64 lowercase hex>` header; null for any other format. */
 export function parseSignature(header: string): { mac: Buffer } | null {
   const m = SIGNATURE.exec(header);
   return m ? { mac: Buffer.from(m[1], 'hex') } : null;
