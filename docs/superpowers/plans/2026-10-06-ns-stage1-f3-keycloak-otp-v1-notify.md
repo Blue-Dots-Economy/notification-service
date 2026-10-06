@@ -11,7 +11,7 @@
 - **Email copy in NS.** The catalogue generator (signals-dpg `tools/ns-catalogue`) gains an email `login_otp` template, ported from the deployed Keycloak theme with each network's sign-off. The nine bluedots-schemas catalogues are regenerated.
 
 **Tech Stack:**
-- keycloak-otp-authenticator: Java 17, Maven multi-module, Keycloak SPI 26.5.5, JUnit 5.10 + Mockito 5.11 + Hamcrest 2.2, libphonenumber.
+- keycloak-otp-authenticator: Java 17, Maven multi-module, Keycloak SPI 26.7.3 (the runtime version), JUnit 5.10 + Mockito 5.11 + Hamcrest 2.2, libphonenumber.
 - signals-dpg `tools/ns-catalogue`: TypeScript, vitest.
 - bluedots-schemas: JSON.
 - Target API: notification-service `/v1/notify` (Plans C2, D), HMAC v2 (Plan D).
@@ -39,7 +39,7 @@
 - **Logging.** Never log the OTP or a full phone number or email address. Phones go through `SmsLogSafe.maskPhone`; emails are not logged. Response bodies only through `SmsLogSafe.boundedResponse`.
 - **Failure surface unchanged.** SMS failures stay `SmsException` → `smsSendError`. Email failures become `OtpEmailException`, caught where `EmailException` is caught today → `emailSendError`. The grant types keep throwing out of `sendOtp`.
 - **Defaults unchanged.** With no new configuration a cluster behaves exactly as today: `KC_SPI_SMS_PROVIDER` is whatever it is (all live clusters: `msg91`), and email goes through `smtp`.
-- **Known gap, not a task.** The plugin compiles against Keycloak 26.5.5; the deployed image runs 26.7.3. This plan does not change the Keycloak version.
+- **Keycloak version.** The plugin compiles against the version the deployed image runs (26.7.3), added during execution as Task 4b. The pom and the dev Dockerfile move together with the runtime.
 - **Standing rules.**
   - Public repos: state rules positively, no failure narratives.
   - Commit trailer: `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
@@ -1424,7 +1424,7 @@ git diff -U0 | grep '^[+-]' | grep -v '^+++\|^---' | grep -v 'login_otp\|OTP to 
 - **bluedots-automation, Keycloak chart:** `SMS_HTTP_URL` default `…/v1/notify`; a `KC_SPI_OTP_EMAIL_PROVIDER` value (default `smtp`); update the values/README comments that describe `/notify` and the v1 base string.
 - **NS deployment:** the catalogue mount (`NS_SEED_FILE`) delivers the email `login_otp` template; `EMAIL_FROM_ADDRESS` / `EMAIL_FROM_NAME` must be set before any cluster uses `KC_SPI_OTP_EMAIL_PROVIDER=http`.
 - **Plan G (deferred):** per-cluster flip of `KC_SPI_SMS_PROVIDER` and `KC_SPI_OTP_EMAIL_PROVIDER` to `http`, confirming the NS SMS `login_otp` template matches each cluster's current MSG91 flow and adding the Keycloak HMAC secret where missing (Test-dev).
-- **Keycloak version alignment** (26.5.5 compile vs 26.7.3 runtime) is tracked separately.
+- **Keycloak version alignment** was done in Task 4b (compile = runtime = 26.7.3).
 
 ## Self-review
 
