@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 vi.mock('../../providers', () => ({ providers: {} }));
+vi.mock('../../metrics', () => ({ incr: vi.fn(async () => {}), setGauge: vi.fn(async () => {}) }));
 import { CONTENT_KEY } from '../../templates/contract';
 import { openApiDocument } from '../openapi';
+import { serializeProvider } from '../provider-docs';
+import { smsProvider as msg91Provider } from '../../providers/sms/msg91';
 
 const SEND_SECURITY = [{ requestSignature: [] }, { bearerAuth: ['notify:send'] }];
 const ADMIN_SECURITY = [{ requestSignature: [] }, { bearerAuth: ['templates:admin'] }];
@@ -94,6 +97,8 @@ describe('openApiDocument', () => {
     expect(info.required).toEqual(['name', 'vendor', 'renders']);
     expect(Object.keys(info.properties)).toEqual(['name', 'vendor', 'renders']);
     expect(info.properties.renders.enum).toEqual(['ns', 'provider']);
+    // The schema documents exactly what the route returns for a real provider.
+    expect(Object.keys(serializeProvider(msg91Provider)).sort()).toEqual([...info.required].sort());
   });
 
   it('documents POST /v1/notify', () => {

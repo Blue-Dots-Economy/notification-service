@@ -315,8 +315,10 @@ are permanent; `EC1009`/`EC1010` and unrecognised codes still retry.
   `409 idempotency_in_progress`. See Send API v1, Idempotency, for storage and windows.
 - **Fallback guard** (no key): `fallbackKey` hashes the request's `event_type`, `template_key`,
   `channel`, `domain`, `to`, `locale` and `variables` into `dedupe:v1:<sha256>`, claimed with
-  `SET NX` for **5 seconds** (`src/lib/dedupe.ts`). A byte-identical repeat inside the window is
-  `409 {"error":"duplicate-fallback"}` and sends nothing.
+  `SET NX` for **5 seconds** (`src/lib/dedupe.ts`). The fields are canonicalised with sorted keys.
+  A repeat with the same event or template, channel, domain, recipients, locale and variables
+  inside the window is `409 {"error":"duplicate-fallback"}` and sends nothing. Other fields
+  (priority, deadline, cc, reply_to, attachments, correlation_id) are not compared.
 
 Any refusal after a claim releases it, so a corrected retry is accepted.
 
@@ -976,11 +978,18 @@ tab while it sits on a side branch.
 3. Auto-discovered on startup
 
 **Queue operations:**
-Import helpers from `src/lib/queue.ts`:
-- `enqueueNotification()` — Push to queue
-- `processJob()` — Dequeue and send
-- `retryJob()` — Move to retry sorted set
-- `moveToDeadLetter()` — Move to DLQ
+Helpers in `src/lib/queue.ts`:
+- `pushToPriority()` / `pushManyToPriority()` — push one job, or a request's jobs in one MULTI, to
+  the queue of each job's priority
+- `pushToPriorityWithMarker()` — push plus an attempt marker in one MULTI (v1 fall-through)
+- `popFrom()` — blocking pop for a pool loop
+- `scheduleRetry()` / `scheduleRetryWithMarker()` — add to `queue:retry` (the latter with the
+  `retry` marker in the same MULTI); `deferJob()` for rate-limit deferrals
+- `moveDueRetries()` — the retry scheduler's atomic move of due retries back to their queues
+- `pushDLQ()` — dead-letter a job; `retryFailedJobs()` — DLQ replay (`POST /failed/retry`)
+- `getQueueMetrics()` — depths and retry timing
+
+`processJob()` (send, retry, fall-through or dead-letter decision) lives in `src/lib/worker.ts`.
 
 ## Deployment Notes
 

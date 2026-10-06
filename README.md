@@ -359,25 +359,20 @@ curl -s -H "Authorization: Bearer $TOKEN" https://ns.example.com/v1/admin/export
 
 ## Queue Model
 
-The service uses four Redis structures:
+The service uses five Redis structures:
 
 ```text
-queue:realtime  # high-priority jobs
-queue:other     # normal/lower-priority jobs
-queue:retry     # delayed retry sorted set
+queue:realtime  # urgent jobs
+queue:other     # normal jobs
+queue:bulk      # bulk jobs
+queue:retry     # delayed retries and deferrals (sorted set)
 queue:dlq       # dead-letter queue
 ```
 
-Workers check `queue:realtime` first, but only block for a short window. That
-prevents `queue:other` and due retries from being starved when no realtime jobs
-are arriving.
-
-Processing order inside the worker loop:
-
-1. Try one realtime job.
-2. Process any due retry jobs.
-3. Try one normal `other` job.
-4. Sleep briefly when no work is available.
+Each priority queue has its own pool of worker loops (`WORKER_URGENT_CONCURRENCY`,
+`WORKER_NORMAL_CONCURRENCY`, `WORKER_BULK_CONCURRENCY`), each on its own Redis
+connection, so a bulk send never holds up an urgent one. A retry scheduler moves
+due retries back to the queue of their own priority.
 
 Failed sends are retried with exponential backoff. After the maximum retry
 count, the job is written to `queue:dlq`.
@@ -591,9 +586,10 @@ a repeat returns `200` with the original response, and a repeat while the first 
 in flight is `409 {"error":"idempotency_in_progress"}`. Urgent keys are held for
 15 minutes; normal and bulk keys for 90 days.
 
-Without a key, a byte-identical request repeated within 5 seconds is answered
-`409 {"error":"duplicate-fallback"}` and nothing is sent. Use an `idempotency_key` for
-deliberate retries.
+Without a key, a repeat with the same event or template, channel, domain, recipients,
+locale and variables within 5 seconds is answered `409 {"error":"duplicate-fallback"}`
+and nothing is sent. Other fields (priority, deadline, cc, reply_to, attachments,
+correlation_id) are not compared. Use an `idempotency_key` for deliberate retries.
 
 ## Provider Discovery
 
@@ -711,7 +707,8 @@ Example response:
     "retry_count": 0,
     "retry_oldest": null,
     "retry_eta_seconds": null,
-    "dlq": 0
+    "dlq": 0,
+    "bulk": 0
   }
 }
 ```
