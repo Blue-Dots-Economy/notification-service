@@ -192,7 +192,7 @@ Both run in their own low-priority lane. **A bulk job has two completions** — 
 
 Recipient phone and email are PII subject to DPDP erasure. Three tiers:
 
-- **Tier 1 — operational detail** (recipient, variables, vendor response). Postgres, monthly `RANGE` partitions on `created_at` managed by **`pg_partman`**, **dropped by partition at 90 days**.
+- **Tier 1 — operational detail** (recipient, variables, vendor response). Postgres, monthly `RANGE` partitions on `created_at` managed by **`pg_partman`**, **dropped by partition at 90 days** (Stage 1: a row lives at least 90 days and at most about 121 — the month it was written in, plus 90 days).
 - **Tier 2 — aggregate counters** (network × template × channel × day). No personal data; retained indefinitely.
 - **Tier 3 — long-term event log.** Kafka tiered storage, Stage 3 only. **Before Stage 3, 90 days is the audit horizon.**
 
@@ -351,7 +351,7 @@ Ordering is deliberately **not** backbone-first. Stages 1–2 deliver a working 
 Build order; auth (item 8) runs in parallel from the start.
 
 1. `[automation]` **Provision the NS database** (automation#114) — a `notification` database + role on the shared RDS via `postgresBootstrap`; `pg_partman` installed by the bootstrap; password through `random_passwords` → SOPS `global-secrets.yaml`. ALIMCO-TCS needs its Vault file moved to SOPS first.
-2. **Persistence foundation** (#56) — Postgres + Drizzle, migrate-on-boot under an advisory lock; `notification_event` + `delivery_attempt` with the status lifecycle and both trace ids; `pg_partman` partition creation from day one (pre-make maintenance driven by NS); record-before-queue with the startup re-queue sweep.
+2. **Persistence foundation** (#56) — Postgres + Drizzle, migrate-on-boot under an advisory lock; `notification_event` + `delivery_attempt` with the status lifecycle and both trace ids; `pg_partman` partition creation from day one (pre-make maintenance driven by NS) **and the 90-day partition drop** (moved here from #65 so recipient data is not kept indefinitely once all OTP flows through NS); record-before-queue with the startup re-queue sweep.
 3. **Template registry + admin API** (#57) — the one-vendor-per-channel model, vendor-declared render mode, lifecycle, locale fallback, variable contract including `sensitive`, publish-time vendor check, preview.
 4. **Routing policy + admin API** (#58).
 5. **Content resolver** (#59) — off the cutover's critical path; no template needs it at cutover.
@@ -373,7 +373,7 @@ Build order; auth (item 8) runs in parallel from the start.
 
 13. **Delivery receipts** (#63) — callbacks with vendor signature verification, plus a **Pinnacle polling lane**; own low-priority lane.
 14. **Audit query API** (#64).
-15. **Retention and rollups** (#65) — Tier-2 counters, `pg_partman` partition drop at 90 days, redaction enforcement.
+15. **Rollups and erasure** (#65) — Tier-2 counters, erasure across tiers, redaction enforcement. (The 90-day Tier-1 partition drop shipped in Stage 1.)
 
 ### Stage 3 — event bus + consumer SDK
 
