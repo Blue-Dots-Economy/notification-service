@@ -726,7 +726,7 @@ Each cluster's values live in bluedots-infra-deployments, which is private and p
 | up-gzb-blue-dots-prod | `blue_dot/up-gzb/` | same |
 | up-sdm-blue-dots-prod | `blue_dot/upsdm/` | same; `_smtp_from_display` is "Aggregator" (confirm with product) |
 | Test-dev | `blue_dot/up-gzb/` | add `msg91_template_id` (or Pinnacle settings) and `sms_http_secret`; both are unset today |
-| ALIMCO-TCS | `purple_dot/alimco/` | decrypt and confirm the vendor; for Pinnacle, set `pinnacle_login_otp_template_id` and `sms_login_otp_body` |
+| ALIMCO-TCS | `purple_dot/alimco/` | decrypt and confirm the vendor and `_brand: "alimco"` (a brand is required to fetch its catalogue); for Pinnacle, set `pinnacle_login_otp_template_id` and `sms_login_otp_body` |
 
 **Apply order:**
 1. Common-services / RDS bootstrap for NS Postgres (automation#260 checklist).
