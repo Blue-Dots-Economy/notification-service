@@ -621,6 +621,7 @@ export function openApiDocument() {
                       retry_oldest: null,
                       retry_eta_seconds: null,
                       dlq: 0,
+                      bulk: 0,
                     },
                   },
                 },
