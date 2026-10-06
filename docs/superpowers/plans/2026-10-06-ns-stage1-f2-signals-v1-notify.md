@@ -494,3 +494,38 @@ Notes on the table:
   - Drop the Signals `messages.properties` ConfigMap delivery.
   - e2e asserts via Mailpit against the event table.
   - NS deletes legacy `/notify`.
+
+---
+
+## As built (2026-10-06)
+
+Execution changed the plan in these places. The rulings live in the SDD ledger; this section is the summary to read alongside the tasks above.
+
+- **Event variables (Task 0, F2-8).** Event sends do not check for unknown variables. Each template picks only the variables it declares. `template_key` sends stay strict.
+- **Event table.**
+  - `teamName` is sent with every `action.*`, `action.cancelled_by_retire`, `item.*` and `item.onboarded_by_aggregator` event.
+  - `item.onboarded_by_aggregator` does not send `name`.
+  - Support fills `phone` and `email` with `—` and `attachmentsSummary` with `none`.
+  - Bulk guardian with no organisations sends `orgList` "the selected organisations".
+- **Idempotency (F2-5, Task 4).**
+  - Action and retire keys keep today's strings.
+  - Item keys are `item_lifecycle:<event_type>:<owner>[:<item>]`. `item.updated` and `item.paused` add a UTC hour bucket, because `/v1/notify` keeps normal-priority keys for 90 days.
+  - Welcome uses `user.welcome:<userId>`, and support uses its reference.
+  - Guardian OTP sends no key.
+- **Events module (R1).** It is `packages/notification/src/events.ts`, shared by the senders and the catalogue generator. `ITEM_EVENT` is keyed `created`, `created_draft`, `updated`, `paused` and `retired`.
+- **Client (Task 1).**
+  - A null `domain` is left out of the body.
+  - The token fetch and the POST each have their own timeout.
+- **Contacts (Task 5).**
+  - Guardian phone is normalised to E.164 at capture (`packages/schemas/src/phone.ts`); a number that cannot be normalised gets a 400.
+  - Guardian email must be a valid address.
+  - Welcome includes a phone only when it is E.164.
+  - Guardian send failures are logged through the request logger.
+- **bluedots-schemas.** The branch is based on `main`, the repo's active line, and its PR targets `main`.
+- **Golden test.** Besides F2-2, it asserts two accepted rendering differences: NS subject whitespace handling, and URL normalisation.
+- **Deploy requirements.**
+  - The `login_otp` SMS template must be configured before the first notification-service boot that loads `NS_SEED_FILE`. Guardian OTP policies name it, by email and by SMS.
+  - The Signals branch ships together with:
+    - the NS Stage 1 stack;
+    - the Plan D realm grant for `signals-api` (aggregator-dpg#834, bluedots-automation#262);
+    - F4's chart settings.
