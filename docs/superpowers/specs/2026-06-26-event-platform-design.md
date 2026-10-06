@@ -10,7 +10,7 @@
 - **2026-08-06 (later)** — added §Security, reconciling the design against the Phase-B security audit (#15). Request integrity must cover the request **body**, and the `content_ref` keyspace must be allowlisted.
 - **2026-10-04** — reconciled against two months of change across the repos. Keycloak (single shared realm) reached `feature` and is the only auth provider; Pinnacle was added as a second SMS vendor; Keycloak login OTP gained an `http` path into NS; the caller inventory grew well beyond the original draft. Decisions changed in this revision:
   - **One SMS/email/WhatsApp vendor per channel per deployment.** Templates carry the vendor's identifiers directly; render mode is a property of the vendor, not of the template. Multi-vendor routing is not built.
-  - **All OTP is delivered through NS** — Keycloak login OTP (SMS *and* email) and Signals guardian OTP. Where OTP is *raised and verified* is deferred to the architect; NS stays a carrier either way.
+  - **All OTP is delivered through NS** — Keycloak login OTP (SMS *and* email) and Signals guardian OTP. Login OTP is generated and verified in Keycloak; guardian OTP is generated and verified in Signals-DPG. NS only delivers it (decided 2026-10-06).
   - **No legacy `/notify`.** `/v1/notify` replaces it in one coordinated release with Signals; Signals' cutover moves from Stage 2.5 into Stage 1.
   - **Network comes from deployment config**, not a token claim — one network per deployment.
   - **HMAC is permanent** for callers that cannot use `client_credentials` (Keycloak itself), and is extended to sign the body.
@@ -402,7 +402,7 @@ Only if a real saga appears; Temporal as a separate consumer. Not decomposed.
 
 ## Open questions
 
-- **OTP ownership** — which service raises and verifies OTP (today Keycloak for login, Signals for guardian), and whether that is consolidated. Pending the architect. NS is a carrier either way, so Stage 1 does not wait on it.
+- **OTP ownership** — decided 2026-10-06: login OTP is generated and verified in Keycloak, guardian OTP in Signals-DPG. NS is the carrier for both and never generates or checks a code.
 - **Admin UI** — the templates and policy APIs have no UI in any stage. Whether network admins need one, and where it lives.
 - Topic taxonomy and partition strategy — Stage 3 spec.
 - Whether the 90-day Tier-1 horizon is acceptable to compliance before Stage 3.
