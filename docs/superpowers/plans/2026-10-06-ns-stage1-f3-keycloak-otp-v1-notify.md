@@ -7,7 +7,7 @@
 **Architecture:**
 - **One NS client.** A new `NsNotifyClient` in the plugin's `common` module owns the HTTP call, HMAC v2 signing (`METHOD\npath\ntimestamp\nnonce\nsha256(body)`) and the "was it accepted" rule. Both channels use it, with one set of settings (`SMS_HTTP_*`).
 - **SMS.** The existing `http` SMS provider (`HttpSmsProviderFactory`) moves from legacy `/notify` + v1 to `/v1/notify` + v2, sends `template_key: login_otp`, and canonicalises the phone to E.164 first.
-- **Email.** A new `otp-email` SPI (`OtpEmailSender`) replaces the three direct `EmailTemplateProvider` calls. Provider `smtp` (default) is today's behaviour, moved unchanged. Provider `http` sends `template_key: login_otp`, `channel: email` to NS. Selected per cluster with `KC_SPI_OTP_EMAIL_PROVIDER`, like `KC_SPI_SMS_PROVIDER`.
+- **Email.** A new `otp-email` SPI (`OtpEmailSender`) replaces the three direct `EmailTemplateProvider` calls. Provider `smtp` (default) is today's behaviour, moved unchanged. Provider `http` sends `template_key: login_otp`, `channel: email` to NS. Selected per cluster with `KC_SPI_OTP_EMAIL__PROVIDER`, like `KC_SPI_SMS_PROVIDER`.
 - **Email copy in NS.** The catalogue generator (signals-dpg `tools/ns-catalogue`) gains an email `login_otp` template, ported from the deployed Keycloak theme with each network's sign-off. The nine bluedots-schemas catalogues are regenerated.
 
 **Tech Stack:**
@@ -58,7 +58,7 @@
 - **F3-4 — One configuration for both channels.** The client reads `url`, `secret`, `key-id`, `timeout-ms` from its SPI scope first, then the existing env names `SMS_HTTP_URL`, `SMS_HTTP_SECRET`, `SMS_HTTP_KEY_ID`, `SMS_HTTP_TIMEOUT_MS`. The email `http` provider reads the same env names, so a cluster configures NS once. `SMS_HTTP_URL` now names the full `/v1/notify` URL.
 - **F3-5 — E.164 before sending.** The SMS provider canonicalises with `IdentifierUtil.canonicalize(session, phone)` (region from the realm attribute `phoneDefaultRegion`, else the realm locale, else `IN`). A number that cannot be canonicalised fails with `SmsException` and no request is made.
 - **F3-6 — 409 rule.** `duplicate-fallback` (NS saw this exact payload within 5 s) means the code is already on its way: treated as sent. `idempotency_in_progress` cannot occur (no key is sent); any 409 other than `duplicate-fallback` fails.
-- **F3-7 — Email SPI with `smtp` as the default.** New SPI `otp-email` (`OtpEmailSenderSpi`, `OtpEmailSender`, `OtpEmailSenderFactory`). `smtp` returns `order() = 100`, `http` returns `0`, so Keycloak picks `smtp` when `KC_SPI_OTP_EMAIL_PROVIDER` is unset.
+- **F3-7 — Email SPI with `smtp` as the default.** New SPI `otp-email` (`OtpEmailSenderSpi`, `OtpEmailSender`, `OtpEmailSenderFactory`). `smtp` returns `order() = 100`, `http` returns `0`, so Keycloak picks `smtp` when `KC_SPI_OTP_EMAIL__PROVIDER` is unset.
 - **F3-8 — Email `login_otp` lives in the NS catalogue.** It is addressed by `template_key`, so it has no policy. Its only variable is `message` (string, required, sensitive), because `template_key` sends are strict.
 - **F3-9 — Email copy is the deployed Keycloak theme.** Subject `OTP to verify access`. HTML body is `emailOtpBodyHtml` and text body is `emailOtpBody` from aggregator-dpg `infra/keycloak/themes/otp/email/messages/messages_en.properties`, with `{0}` → `{{message}}` and `{1}` → the directory's sign-off. The HTML uses Keycloak's base email layout as FreeMarker renders it: `<html lang="en" dir="ltr">\n<body>\n…\n</body>\n</html>\n`, and the text body ends with `\n` (as built in Task 5, byte-identical to the deployed theme).
 - **F3-10 — Sign-off per directory** comes from aggregator-dpg `config/<network>[/<brand>]/keycloak.env` `EMAIL_SIGNOFF`. Where a directory sets none, the theme build default `Team EkStep` (`themes.Dockerfile` `ARG EMAIL_SIGNOFF="Team EkStep"`) applies — that is what the theme image bakes for it today.
@@ -75,7 +75,7 @@
   | `orange_dot` | Team Orange Dots | keycloak.env |
   | `orange_dot/onetac` | Team OneTAC | keycloak.env |
 
-- **F3-11 — Deployment is F4.** Bumping the jar in bluedots-automation, the Keycloak chart (`SMS_HTTP_URL` default `/v1/notify`, `KC_SPI_OTP_EMAIL_PROVIDER`), and the per-cluster flip are out of scope here.
+- **F3-11 — Deployment is F4.** Bumping the jar in bluedots-automation, the Keycloak chart (`SMS_HTTP_URL` default `/v1/notify`, `KC_SPI_OTP_EMAIL__PROVIDER`), and the per-cluster flip are out of scope here.
 
 ## Review Focus
 
@@ -950,7 +950,7 @@ import org.keycloak.provider.Provider;
 import org.keycloak.provider.ProviderFactory;
 import org.keycloak.provider.Spi;
 
-/** SPI {@code otp-email}; choose the provider with {@code KC_SPI_OTP_EMAIL_PROVIDER} (default {@code smtp}). */
+/** SPI {@code otp-email}; choose the provider with {@code KC_SPI_OTP_EMAIL__PROVIDER} (default {@code smtp}). */
 public class OtpEmailSenderSpi implements Spi {
     @Override public boolean isInternal() { return false; }
     @Override public String getName() { return "otp-email"; }
@@ -1012,7 +1012,7 @@ public class SmtpOtpEmailSenderFactory implements OtpEmailSenderFactory {
     @Override public void postInit(KeycloakSessionFactory factory) { }
     @Override public void close() { }
     @Override public String getId() { return PROVIDER_ID; }
-    /** Highest order wins when KC_SPI_OTP_EMAIL_PROVIDER is unset, so SMTP stays the default. */
+    /** Highest order wins when KC_SPI_OTP_EMAIL__PROVIDER is unset, so SMTP stays the default. */
     @Override public int order() { return 100; }
 }
 ```
@@ -1156,7 +1156,7 @@ import org.keycloak.models.UserModel;
  * Hands the login OTP email to notification-service {@code POST /v1/notify} as
  * {@code template_key: login_otp}, {@code channel: email}. notification-service owns the
  * copy (per-network catalogue) and the sender identity. Activated with
- * {@code KC_SPI_OTP_EMAIL_PROVIDER=http}; uses the same {@code SMS_HTTP_*} client settings
+ * {@code KC_SPI_OTP_EMAIL__PROVIDER=http}; uses the same {@code SMS_HTTP_*} client settings
  * as the SMS {@code http} provider, plus {@code template-id} (default {@code login_otp}) and
  * {@code otp-var-name} (default {@code message}) in this SPI's scope.
  */
@@ -1235,7 +1235,7 @@ hr.delmisoft.keycloak.otp.email.SmtpOtpEmailSenderFactory
 hr.delmisoft.keycloak.otp.email.HttpOtpEmailSenderFactory
 ```
 
-- [ ] **Step 4: README.** Add "Email OTP providers": SPI `otp-email`; `smtp` (default, realm SMTP + theme `email-otp-code.ftl`); `http` (notification-service `login_otp` email template; same `SMS_HTTP_URL`/`SMS_HTTP_SECRET`/`SMS_HTTP_KEY_ID`/`SMS_HTTP_TIMEOUT_MS`); select with `KC_SPI_OTP_EMAIL_PROVIDER=http`; notification-service must carry the email `login_otp` template (seeded from the network's `ns-catalogue.json`) and `EMAIL_FROM_ADDRESS`.
+- [ ] **Step 4: README.** Add "Email OTP providers": SPI `otp-email`; `smtp` (default, realm SMTP + theme `email-otp-code.ftl`); `http` (notification-service `login_otp` email template; same `SMS_HTTP_URL`/`SMS_HTTP_SECRET`/`SMS_HTTP_KEY_ID`/`SMS_HTTP_TIMEOUT_MS`); select with `KC_SPI_OTP_EMAIL__PROVIDER=http`; notification-service must carry the email `login_otp` template (seeded from the network's `ns-catalogue.json`) and `EMAIL_FROM_ADDRESS`.
 - [ ] **Step 5: Run.** `mvn -q clean verify -B` → PASS; `dist/target/keycloak-otp-1.2.0-SNAPSHOT.jar` contains `META-INF/services/hr.delmisoft.keycloak.otp.email.OtpEmailSenderFactory` listing both factories (`unzip -p dist/target/keycloak-otp-*.jar META-INF/services/hr.delmisoft.keycloak.otp.email.OtpEmailSenderFactory`).
 - [ ] **Step 6: Commit.** `feat(email): http provider sends login OTP email to /v1/notify`
 
@@ -1414,16 +1414,16 @@ git diff -U0 | grep '^[+-]' | grep -v '^+++\|^---' | grep -v 'login_otp\|OTP to 
 - keycloak-otp-authenticator: `mvn clean verify -B` passes locally and CI is green on the PR; the jar registers SPI `otp-email` with `smtp` and `http`, and `sms` with `http` on `/v1/notify`.
 - The HMAC v2 vector test matches notification-service's `canonicalString` + `signHmac` output.
 - With no new configuration, SMS and email OTP behave exactly as today (`msg91` / `smtp`).
-- With `KC_SPI_SMS_PROVIDER=http` and `KC_SPI_OTP_EMAIL_PROVIDER=http`, both channels post `template_key: login_otp`, `priority: urgent`, E.164 phone / user email, `{message: <code>}`, to the `SMS_HTTP_URL`.
+- With `KC_SPI_SMS_PROVIDER=http` and `KC_SPI_OTP_EMAIL__PROVIDER=http`, both channels post `template_key: login_otp`, `priority: urgent`, E.164 phone / user email, `{message: <code>}`, to the `SMS_HTTP_URL`.
 - signals-dpg `pnpm --filter ns-catalogue test` and `typecheck` pass; every catalogue has one email `login_otp` template with the F3-10 sign-off.
 - bluedots-schemas: nine catalogues regenerated and validated with NS `parseCatalogue`.
 
 ## Follow-ups owned by F4
 
 - **bluedots-automation, Keycloak image:** build the jar from the merged `main`, replace `dockerfiles/keycloak/providers/keycloak-otp-1.2.0-SNAPSHOT.jar`, update its sha256 and `providers/README.md` (it still names the `enhancements` branch as the build source).
-- **bluedots-automation, Keycloak chart:** `SMS_HTTP_URL` default `…/v1/notify`; a `KC_SPI_OTP_EMAIL_PROVIDER` value (default `smtp`); update the values/README comments that describe `/notify` and the v1 base string.
-- **NS deployment:** the catalogue mount (`NS_SEED_FILE`) delivers the email `login_otp` template; `EMAIL_FROM_ADDRESS` / `EMAIL_FROM_NAME` must be set before any cluster uses `KC_SPI_OTP_EMAIL_PROVIDER=http`.
-- **Plan G (deferred):** per-cluster flip of `KC_SPI_SMS_PROVIDER` and `KC_SPI_OTP_EMAIL_PROVIDER` to `http`, confirming the NS SMS `login_otp` template matches each cluster's current MSG91 flow and adding the Keycloak HMAC secret where missing (Test-dev).
+- **bluedots-automation, Keycloak chart:** `SMS_HTTP_URL` default `…/v1/notify`; a `KC_SPI_OTP_EMAIL__PROVIDER` value (default `smtp`); update the values/README comments that describe `/notify` and the v1 base string.
+- **NS deployment:** the catalogue mount (`NS_SEED_FILE`) delivers the email `login_otp` template; `EMAIL_FROM_ADDRESS` / `EMAIL_FROM_NAME` must be set before any cluster uses `KC_SPI_OTP_EMAIL__PROVIDER=http`.
+- **Plan G (deferred):** per-cluster flip of `KC_SPI_SMS_PROVIDER` and `KC_SPI_OTP_EMAIL__PROVIDER` to `http`, confirming the NS SMS `login_otp` template matches each cluster's current MSG91 flow and adding the Keycloak HMAC secret where missing (Test-dev).
 - **Keycloak version alignment** was done in Task 4b (compile = runtime = 26.7.3).
 
 ## Self-review
@@ -1432,3 +1432,22 @@ git diff -U0 | grep '^[+-]' | grep -v '^+++\|^---' | grep -v 'login_otp\|OTP to 
 - **Placeholders.** None; every code step carries code. Task 5 uses the existing `renderNsEmail`, `escapeHtml` (`render_ns.ts`), `emailPublishErrors` (`ns_rules.ts`) and `F2_7_DIRS` (`schemas_repo.ts`).
 - **Type consistency.** `NsNotifyClient.send(String)`, `isConfigured()`, `json(String)`, `readConfigOrDefault(...)`, `NsNotifyException.status()` are used identically in Tasks 2 and 4. `OtpEmailSender.send(RealmModel, UserModel, String)` is the same in Tasks 3 and 4 and all three call sites. `loginOtpSignoffFor(dir)` / `loginOtpEmailTemplate(signoff)` match between Task 5's tests and implementation.
 - **Review Focus.** Each of the five lines names its test in the owning task.
+
+---
+
+## Plan G readiness (from the F3 final review, 2026-10-06)
+
+Before any cluster switches Keycloak's SMS or email OTP to `http`:
+
+1. **Image.** The F3 jar (built from merged `main`) is in the Keycloak image. The F4 chart (`/v1/notify` default, `otpEmailProvider`) is deployed.
+2. **Signing secret.** `sms_http_secret` is set on the cluster. It renders both the Keycloak secret and NS's `keycloak` key. Today every cluster has it empty.
+3. **Values.** Set `keycloak.smsProvider: http` and/or `keycloak.otpEmailProvider: http`, with `optimized: false`.
+4. **SMS row.** NS has an active SMS `login_otp` row for its vendor:
+   - msg91: `SMS_LOGIN_OTP_TEMPLATE_ID`;
+   - Pinnacle: `PINNACLE_LOGIN_OTP_TEMPLATE_ID` plus `SMS_LOGIN_OTP_BODY`.
+
+   Confirm each MSG91 flow's placeholder. NS's msg91 provider sends a lone `message` variable as `var`, which matches Keycloak's direct msg91 provider (`var`).
+5. **Email row.** NS has the email `login_otp` row. That needs bluedots-schemas#47 merged, then the F4 catalogue mount. Rows that already exist are never overwritten.
+6. **NS email sender.** `EMAIL_FROM_ADDRESS` and `EMAIL_FROM_NAME` are set. On SES, the address is a verified identity.
+7. **Locale.** `NS_DEFAULT_LOCALE` is the same at seed time and send time. It is unset today.
+8. **Accepted change.** Over `http`, a vendor-side failure happens after NS answers 202, so the login page no longer shows a send error for it. Errors that still surface are NS being unreachable, auth failures, and 4xx responses. Clocks must agree within ±30 s.

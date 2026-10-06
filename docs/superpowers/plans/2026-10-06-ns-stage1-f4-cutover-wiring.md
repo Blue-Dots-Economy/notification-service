@@ -65,7 +65,7 @@ Plan G (per-cluster OTP flip to `http`) is out of scope.
   - NS never reads it: NS reads `SMS_LOGIN_OTP_TEMPLATE_ID`, which is already rendered from the same variable.
   - Keycloak's own `msg91TemplateId` is unchanged.
 - **F4-7 — Keycloak email OTP is a chart value.**
-  - `otpEmailProvider` (`smtp` by default, or `http`) renders `KC_SPI_OTP_EMAIL_PROVIDER`.
+  - `otpEmailProvider` (`smtp` by default, or `http`) renders `KC_SPI_OTP_EMAIL__PROVIDER`.
   - When either `smsProvider` or `otpEmailProvider` is `http`, the chart renders the shared NS block (`SMS_HTTP_URL`, `SMS_HTTP_KEY_ID`, `SMS_HTTP_TIMEOUT_MS`, …), whose default URL now ends `/v1/notify`.
   - The env names must equal those in Plan F3's NS client. Task A4 Step 0 confirms this.
 - **F4-8 — e2e asserts delivery, not acceptance.**
@@ -458,7 +458,7 @@ grep -q 'dpg-api-client' <<<"$ns" || fail "Part A must keep dpg-api-client in in
 - Create: `helm/keycloak/tests/render_test.sh`. Add it to the same CI step as Task A1's test.
 
 - [ ] **Step 0: Confirm names.** Read Plan F3's NS client section and record the exact env names in the task report:
-  - the email-provider SPI env (expected `KC_SPI_OTP_EMAIL_PROVIDER`, values `smtp` | `http`);
+  - the email-provider SPI env (expected `KC_SPI_OTP_EMAIL__PROVIDER`, values `smtp` | `http`);
   - the shared NS config env (expected `SMS_HTTP_URL`, `SMS_HTTP_SECRET`, `SMS_HTTP_KEY_ID`, `SMS_HTTP_TIMEOUT_MS`, `SMS_HTTP_TEMPLATE_ID`, `SMS_HTTP_OTP_VAR_NAME`, plus any email template key F3 adds).
 
   If F3 differs, use F3's names throughout this task.
@@ -474,7 +474,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 render() { helm template kc "$CHART" --namespace keycloak --show-only templates/configmap.yaml "$@"; }
 
 out="$(render)"
-grep -q 'KC_SPI_OTP_EMAIL_PROVIDER: "smtp"' <<<"$out" || fail "email OTP provider default is not smtp"
+! grep -q 'KC_SPI_OTP_EMAIL__PROVIDER' <<<"$out" || fail "default renders an email OTP provider (smtp is the plugin default)"
 grep -q 'SMS_HTTP_URL' <<<"$out" && fail "NS block rendered with nothing on http"
 
 out="$(render --set smsProvider=http)"
@@ -482,7 +482,7 @@ grep -q 'SMS_HTTP_URL: "http://signals-notification-service.signals.svc.cluster.
   || fail "default NS URL is not /v1/notify"
 
 out="$(render --set otpEmailProvider=http)"
-grep -q 'KC_SPI_OTP_EMAIL_PROVIDER: "http"' <<<"$out" || fail "email provider not rendered"
+grep -q 'KC_SPI_OTP_EMAIL__PROVIDER: "http"' <<<"$out" || fail "email provider not rendered"
 grep -q 'SMS_HTTP_URL' <<<"$out" || fail "email over http needs the NS block"
 echo "keycloak render_test: ok"
 ```
@@ -503,7 +503,7 @@ otpEmailProvider: smtp
   - **`templates/configmap.yaml`:**
 
 ```yaml
-  KC_SPI_OTP_EMAIL_PROVIDER: "{{ .Values.otpEmailProvider }}"
+  KC_SPI_OTP_EMAIL__PROVIDER: "{{ .Values.otpEmailProvider }}"
   {{- if or (eq .Values.smsProvider "http") (eq .Values.otpEmailProvider "http") }}
   SMS_HTTP_URL: "{{ .Values.smsHttp.url | default (printf "http://%s-notification-service.%s.svc.cluster.local:3000/v1/notify" (.Values.global.signalsRelease | default "signals") (.Values.global.signalsNamespace | default "signals")) }}"
   ... (the remaining SMS_HTTP_* lines unchanged)
