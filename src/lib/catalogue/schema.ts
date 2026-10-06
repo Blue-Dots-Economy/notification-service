@@ -2,6 +2,8 @@ import { z } from 'zod';
 import { VariableContractSchema } from '../templates/contract';
 
 const nullableText = (max: number) => z.string().max(max).nullable().optional();
+// Slug requires at least one character, so an empty string can never collide with NULL
+// under the DB's coalesce-based unique indexes.
 const Slug = (max: number) => z.string().regex(/^[a-z0-9_.-]+$/).max(max);
 
 /** The admin template create body; the catalogue entry is this plus `provider`. */
@@ -34,7 +36,17 @@ export const PolicyCreateSchema = z
   .object({ domain: Slug(64).nullable().optional(), event_type: Slug(64).nullable().optional(), mode: PolicyModeSchema, channels: Channels })
   .strict();
 
-export const TemplateEntrySchema = TemplateCreateSchema.extend({ provider: z.string().min(1).max(32).optional() }).strict();
+/**
+ * Only email entries may omit `provider` (they seed for the deployment's email vendor).
+ * SMS and WhatsApp entries carry vendor-specific ids, so each names the vendor it is for.
+ */
+export const TemplateEntrySchema = TemplateCreateSchema.extend({ provider: z.string().min(1).max(32).optional() })
+  .strict()
+  .superRefine((t, ctx) => {
+    if (t.channel !== 'email' && t.provider === undefined) {
+      ctx.addIssue({ code: 'custom', path: ['provider'], message: 'provider is required for non-email channels' });
+    }
+  });
 export const PolicyEntrySchema = PolicyCreateSchema;
 
 export const CatalogueSchema = z

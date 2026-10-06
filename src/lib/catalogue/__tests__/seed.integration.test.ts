@@ -14,6 +14,8 @@ vi.mock('../../providers', () => ({
   },
 }));
 
+import { parseContentDocument } from '../../content/configmap';
+import { setContentForTests } from '../../content/resolver';
 import { closeDb, getPool } from '../../db/client';
 import { runMigrations } from '../../db/migrate';
 import { listPolicies, resolvePolicy, retirePolicy } from '../../policies/repo';
@@ -58,7 +60,7 @@ beforeEach(async () => {
   state.sms = msg91;
   await getPool().query(`DELETE FROM notification_policy; DELETE FROM template;`);
 });
-afterEach(() => { vi.restoreAllMocks(); });
+afterEach(() => { vi.restoreAllMocks(); setContentForTests(null); });
 
 async function seedFile(content: unknown): Promise<string> {
   const p = path.join(dir, `catalogue-${Math.random().toString(36).slice(2)}.json`);
@@ -149,9 +151,31 @@ describe('seedCatalogue', () => {
     expect(await resolvePolicy('seeker', 'item.paused')).toBeNull();
   });
 
+  it('a content_ref template publishes when content is loaded, and stays a draft when it is not', async () => {
+    const tncCat = () => cat({
+      templates: [{
+        channel: 'email', template_key: 'tnc.accepted', subject: 'Terms',
+        body_html: '<p>Hi {{name}}, see <a href="{{tnc_url}}">the terms</a></p>',
+        variables: [{ name: 'name' }, { name: 'tnc_url', type: 'url', source: 'content_ref', contentKey: 'tnc.in_force.url' }],
+      }],
+      policies: [{ domain: 'seeker', event_type: 'tnc.accepted', mode: 'all', channels: [{ channel: 'email', template_key: 'tnc.accepted' }] }],
+    });
+
+    setContentForTests(parseContentDocument({ version: 'c1', entries: { 'tnc.in_force.url': { en: 'https://example.org/terms' } } }));
+    expect(await seedCatalogue(tncCat())).toEqual({ templates: tpl({ created_active: 1 }), policies: pol({ created_active: 1 }) });
+    expect((await listTemplates({ templateKey: 'tnc.accepted' }))[0]!.status).toBe('active');
+
+    await getPool().query(`DELETE FROM notification_policy; DELETE FROM template;`);
+    setContentForTests(null);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    expect(await seedCatalogue(tncCat())).toEqual({ templates: tpl({ created_draft: 1 }), policies: pol({ created_draft: 1 }) });
+    expect((await listTemplates({ templateKey: 'tnc.accepted' }))[0]!.status).toBe('draft');
+    expect(warn.mock.calls.map((c) => String(c[0])).join('\n')).toContain('left as draft: content_unavailable');
+  });
+
   it('skips a channel this deployment has no provider for', async () => {
     const report = await seedCatalogue(cat({
-      templates: [{ channel: 'whatsapp', template_key: 'item.paused', provider_template_id: 'W1' }],
+      templates: [{ channel: 'whatsapp', template_key: 'item.paused', provider: 'twilio', provider_template_id: 'W1' }],
       policies: [],
     }));
     expect(report).toEqual({ templates: tpl({ skipped_channel: 1 }), policies: pol({}) });
