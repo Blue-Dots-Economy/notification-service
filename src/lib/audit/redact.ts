@@ -50,6 +50,10 @@ export function toAcceptedRecord(job: Job, source: string): AcceptedRecord {
     priority: job.priority,
     channel: job.channel,
     templateId: job.template_id,
+    // An event send names an event, not a template: its templates are per attempt.
+    templateKey: job.audit.eventType ? null : job.template_id,
+    eventType: job.audit.eventType ?? null,
+    domain: job.audit.domain ?? null,
     payload: realtime
       ? { to, variable_names: job.audit.variableNames ?? Object.keys(job.variables ?? {}), ...contentRefs }
       : {

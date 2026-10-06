@@ -181,6 +181,26 @@ describe('POST /v1/notify', () => {
     expect(dump).not.toContain('providerTemplateId');
   });
 
+  it('event sends carry the event type and the domain as sent on every job', async () => {
+    plan.planSend.mockResolvedValue({ mode: 'all', deliveries: [delivery('sms'), delivery('email')], redact: false, variables: {} });
+    await post({ ...body, domain: 'seeker' });
+    for (const job of queue.pushManyToPriority.mock.calls[0]![0]) {
+      expect(job.audit).toMatchObject({ eventType: 'apply', domain: 'seeker' });
+    }
+    const recs = store.recordAcceptedMany.mock.calls[0]![0] as any[];
+    expect(recs[0]).toMatchObject({ eventType: 'apply', domain: 'seeker', templateKey: null });
+  });
+
+  it('a template_key send without a domain carries neither', async () => {
+    plan.planSend.mockResolvedValue({ mode: 'single', deliveries: [delivery('sms')], redact: false, variables: {} });
+    await post({ template_key: 'k_sms', channel: 'sms', to: { phone: '+919999999999' }, variables: {} });
+    const job = queue.pushManyToPriority.mock.calls[0]![0][0];
+    expect(job.audit).not.toHaveProperty('eventType');
+    expect(job.audit).not.toHaveProperty('domain');
+    const recs = store.recordAcceptedMany.mock.calls[0]![0] as any[];
+    expect(recs[0]).toMatchObject({ eventType: null, domain: null, templateKey: 'k_sms' });
+  });
+
   it('redacted sends carry no variable values on the job', async () => {
     plan.planSend.mockResolvedValue({ mode: 'single', deliveries: [delivery('sms')], redact: true, variables: { message: '123456' } });
     await post({ template_key: 'login_otp', channel: 'sms', to: { phone: '+919999999999' }, variables: { message: '123456' } });

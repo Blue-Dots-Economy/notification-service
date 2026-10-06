@@ -624,6 +624,14 @@ a 5-second content guard answers a repeat with `409 duplicate-fallback`.
 **Correlation id.** The body's `correlation_id` (trimmed, at most 128, else `400`) wins over the
 `x-correlation-id` header; blank falls back to the header, then the event id.
 
+**Event row identity.** `notification_event.event_type` and `domain` are the request's `event_type`
+and recipient `domain` as sent, null when absent (never the policy's matched domain, so a send that
+fell back to a network-wide policy still records the caller's domain). They ride on `job.audit`, so
+every writer of the row records the same values: the accepted insert, a worker upsert that lands
+first (urgent), a fall-through, a DLQ replay and a recovered job. `template_key` is the request's
+`template_key` (legacy `/notify`: its `template_id`) and is **null for event sends**: their templates
+are per delivery and live on `delivery_attempt.template_id`.
+
 **Response:** `202 {notification_event_id, correlation_id, status: "accepted", mode, deliveries:
 [{channel}]}`. See README for examples.
 
@@ -759,7 +767,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 746 unit tests across 56 files, plus 135 integration tests across 17 files. The unit suite runs in about a second because Redis
+vitest 4, 755 unit tests across 56 files, plus 138 integration tests across 17 files. The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
