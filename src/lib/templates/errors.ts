@@ -14,7 +14,8 @@ export type TemplateErrorCode =
   | 'unknown_content_key'
   | 'content_unavailable'
   | 'content_unresolved'
-  | 'invalid_content';
+  | 'invalid_content'
+  | 'export_invalid';
 
 /** A template/policy rule violation. Messages name variables, never their values. */
 export class TemplateError extends Error {

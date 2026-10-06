@@ -12,6 +12,7 @@ vi.mock('../../lib/catalogue/export', () => exp);
 const Fastify = (await import('fastify')).default;
 const { adminExportRoutes } = await import('../admin-export');
 const { NetworkNotConfigured } = await import('../../lib/network');
+const { TemplateError } = await import('../../lib/templates/errors');
 
 async function build() {
   const app = Fastify({ logger: false });
@@ -38,5 +39,14 @@ describe('GET /v1/admin/export', () => {
     const res = await (await build()).inject({ method: 'GET', url: '/v1/admin/export' });
     expect(res.statusCode).toBe(503);
     expect(res.json()).toEqual({ error: 'network_not_configured' });
+  });
+
+  it('answers 422 export_invalid naming paths when the store does not fit the catalogue format', async () => {
+    exp.exportCatalogue.mockImplementation(async () => {
+      throw new TemplateError('export_invalid', 'export does not fit the catalogue format at: templates');
+    });
+    const res = await (await build()).inject({ method: 'GET', url: '/v1/admin/export' });
+    expect(res.statusCode).toBe(422);
+    expect(res.json()).toEqual({ error: 'export_invalid', message: 'export does not fit the catalogue format at: templates' });
   });
 });

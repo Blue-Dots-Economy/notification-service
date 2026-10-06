@@ -24,11 +24,22 @@ describe('openApiDocument', () => {
     }
   });
 
-  it('documents GET /v1/admin/export with admin security and 200/401/403/503', () => {
-    const doc = openApiDocument() as { paths: Record<string, Record<string, { security?: unknown[]; responses: Record<string, unknown> }>> };
+  it('documents GET /v1/admin/export with admin security and 200/401/403/422/503', () => {
+    const doc = openApiDocument() as { paths: Record<string, Record<string, { security?: unknown[]; responses: Record<string, any> }>> };
     const op = doc.paths['/v1/admin/export']!.get!;
     expect(op.security).toEqual(ADMIN_SECURITY);
-    for (const code of ['200', '401', '403', '503']) expect(op.responses[code], code).toBeDefined();
+    for (const code of ['200', '401', '403', '422', '503']) expect(op.responses[code], code).toBeDefined();
+    expect(op.responses['422'].description).toContain('export_invalid');
+  });
+
+  it('documents catalogue templates as a strict TemplateEntry with provider', () => {
+    const schemas = (openApiDocument() as { components: { schemas: Record<string, any> } }).components.schemas;
+    expect(schemas.Catalogue.properties.templates.items).toEqual({ $ref: '#/components/schemas/TemplateEntry' });
+    const entry = schemas.TemplateEntry;
+    expect(entry.additionalProperties).toBe(false);
+    expect(entry.properties.provider).toMatchObject({ type: 'string', minLength: 1, maxLength: 32 });
+    const create = schemas.TemplateCreate.properties;
+    expect(Object.keys(entry.properties).sort()).toEqual([...Object.keys(create), 'provider'].sort());
   });
 
   it('declares the bearer and HMAC v2 security schemes, and no adminKey scheme', () => {
