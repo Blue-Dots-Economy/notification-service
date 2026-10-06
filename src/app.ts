@@ -1,6 +1,7 @@
 import Fastify from 'fastify';
 import { adminTemplateRoutes } from './routes/admin-templates';
 import { adminPolicyRoutes } from './routes/admin-policies';
+import { adminExportRoutes } from './routes/admin-export';
 import { docsRoutes } from './routes/docs';
 import { metricsRoutes } from './routes/metrics';
 import { notifyRoutes } from './routes/notify';
@@ -20,6 +21,7 @@ registerRawJsonBody(app);
 app.register(docsRoutes);
 app.register(adminTemplateRoutes);
 app.register(adminPolicyRoutes);
+app.register(adminExportRoutes);
 app.register(notifyRoutes);
 app.register(v1NotifyRoutes);
 app.register(providerRoutes);
