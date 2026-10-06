@@ -36,7 +36,8 @@ function build(logLines?: string[]) {
     : Fastify();
   registerRawJsonBody(app);
   const echo = async (req: any) => ({ principal: { kind: req.principal.kind, id: req.principal.id } });
-  app.post('/notify', { preHandler: authenticate({ scope: 'notify:send', legacyHmacV1: true }), bodyLimit: 8 * 1024 * 1024 }, echo);
+  // A route with a raised bodyLimit, as /v1/notify has for attachments.
+  app.post('/upload', { preHandler: authenticate({ scope: 'notify:send' }), bodyLimit: 8 * 1024 * 1024 }, echo);
   app.post('/v1/notify', { preHandler: authenticate({ scope: 'notify:send' }) }, echo);
   app.post('/v1/admin/templates', { preHandler: authenticate({ scope: 'templates:admin' }) }, echo);
   app.get('/providers', { preHandler: authenticate({ scope: 'any' }) }, echo);
@@ -44,17 +45,25 @@ function build(logLines?: string[]) {
 }
 
 let n = 0;
-function hmacHeaders(o: { method: string; url: string; body?: string | Buffer; key?: string; secret?: string; version?: 'v1' | 'v2'; ts?: string; nonce?: string }) {
+function hmacHeaders(o: { method: string; url: string; body?: string | Buffer; key?: string; secret?: string; ts?: string; nonce?: string }) {
   const ts = o.ts ?? String(Math.floor(Date.now() / 1000));
   const nonce = o.nonce ?? `nonce-${(n += 1)}`;
   const body = o.body === undefined ? undefined : Buffer.from(o.body);
-  const canonical = canonicalString(o.version ?? 'v2', o.method, o.url, ts, nonce, body);
+  const canonical = canonicalString(o.method, o.url, ts, nonce, body);
   return {
     'x-ns-key': o.key ?? 'sender',
     'x-ns-timestamp': ts,
     'x-ns-nonce': nonce,
-    'x-ns-signature': signHmac(o.version ?? 'v2', o.secret ?? 'send-secret', canonical),
+    'x-ns-signature': signHmac(o.secret ?? 'send-secret', canonical),
   };
+}
+
+/** A retired HMAC v1 signature: no body digest in the canonical string, `v1=` prefix. */
+function v1Headers(o: { method: string; url: string; secret?: string }) {
+  const ts = String(Math.floor(Date.now() / 1000));
+  const nonce = `nonce-${(n += 1)}`;
+  const mac = crypto.createHmac('sha256', o.secret ?? 'send-secret').update([o.method, o.url, ts, nonce].join('\n')).digest('hex');
+  return { 'x-ns-key': 'sender', 'x-ns-timestamp': ts, 'x-ns-nonce': nonce, 'x-ns-signature': `v1=${mac}` };
 }
 
 const json = { 'content-type': 'application/json' };
@@ -88,16 +97,16 @@ describe('authenticate — HMAC', () => {
 
   it('verifies a large body (attachment-sized)', async () => {
     const body = JSON.stringify({ data: 'x'.repeat(6 * 1024 * 1024) });
-    const res = await build().inject({ method: 'POST', url: '/notify', payload: body, headers: { ...json, ...hmacHeaders({ method: 'POST', url: '/notify', body }) } });
+    const res = await build().inject({ method: 'POST', url: '/upload', payload: body, headers: { ...json, ...hmacHeaders({ method: 'POST', url: '/upload', body }) } });
     expect(res.statusCode).toBe(200);
   });
 
-  it('accepts v1 only on legacy /notify', async () => {
-    const legacy = await build().inject({ method: 'POST', url: '/notify', payload: '{}', headers: { ...json, ...hmacHeaders({ method: 'POST', url: '/notify', version: 'v1' }) } });
-    expect(legacy.statusCode).toBe(200);
-    const v1 = await build().inject({ method: 'POST', url: '/v1/notify', payload: '{}', headers: { ...json, ...hmacHeaders({ method: 'POST', url: '/v1/notify', version: 'v1' }) } });
-    expect(v1.statusCode).toBe(401);
-    expect(v1.json()).toEqual({ error: 'Signature version not accepted' });
+  it('rejects a v1 signature on every route with the same 401 as any bad signature', async () => {
+    for (const [method, url] of [['POST', '/v1/notify'], ['POST', '/upload'], ['GET', '/providers']] as const) {
+      const res = await build().inject({ method, url, ...(method === 'POST' ? { payload: '{}' } : {}), headers: { ...(method === 'POST' ? json : {}), ...v1Headers({ method, url }) } });
+      expect(res.statusCode).toBe(401);
+      expect(res.json()).toEqual({ error: 'Invalid signature' });
+    }
   });
 
   it('does not burn the nonce on a bad signature; a replay of a good one is rejected', async () => {
@@ -253,7 +262,7 @@ describe('raw JSON body parser', () => {
 
   it('applies the route bodyLimit to the raw parser', async () => {
     const body = JSON.stringify({ data: 'x'.repeat(9 * 1024 * 1024) });
-    const res = await build().inject({ method: 'POST', url: '/notify', payload: body, headers: { ...json, ...hmacHeaders({ method: 'POST', url: '/notify', body }) } });
+    const res = await build().inject({ method: 'POST', url: '/upload', payload: body, headers: { ...json, ...hmacHeaders({ method: 'POST', url: '/upload', body }) } });
     expect(res.statusCode).toBe(413);
   });
 

@@ -59,7 +59,6 @@ export function toAcceptedRecord(job: Job, source: string): AcceptedRecord {
       : {
           to,
           variables: withoutAttachmentBodies(job.channel, job.variables),
-          ...(job.body ? { body: job.body } : {}),
           ...contentRefs,
         },
     job: realtime ? undefined : (job as unknown as Record<string, unknown>),

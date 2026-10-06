@@ -10,8 +10,6 @@ export interface Job {
   template_id: string;
   /** Request variables for the audit payload ({} when redacted). The worker never sends them. */
   variables: any;
-  /** Written only by legacy /notify, which still records it in the audit payload. */
-  body?: string;
   attempt?: number; // number of tries so far
   next_attempt_at?: number; // timestamp of when to retry
   /** Audit identity, assigned at /notify and carried to every status write. */

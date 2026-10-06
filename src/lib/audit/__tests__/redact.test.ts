@@ -37,6 +37,16 @@ describe('toAcceptedRecord', () => {
   });
 });
 
+describe('toAcceptedRecord — payload', () => {
+  it('records recipient and variables only; a stray legacy body is not copied into the payload', () => {
+    const job = {
+      job_id: 'j', channel: 'sms', priority: 'other', to: '+919999999999',
+      template_id: 't', variables: { name: 'A' }, body: 'Hi {{name}}', audit: ids,
+    } as unknown as Job;
+    expect(toAcceptedRecord(job, 's').payload).toEqual({ to: '+919999999999', variables: { name: 'A' } });
+  });
+});
+
 describe('toAcceptedRecord — sticky redaction', () => {
   it('keeps a realtime-origin job redacted after a DLQ replay moves it to other', () => {
     const job: Job = {
