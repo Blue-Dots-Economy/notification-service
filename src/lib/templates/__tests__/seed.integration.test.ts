@@ -118,11 +118,21 @@ describe('seedBuiltinTemplates', () => {
     expect(Date.now() - started).toBeGreaterThanOrEqual(5500);
     expect(outcome).toBe('seeded_active');
     expect(await listTemplates({ templateKey: 'login_otp' })).toHaveLength(1);
-    // The seeding connection went back to the pool at the normal bound.
-    const settings = await Promise.all(
-      Array.from({ length: 3 }, () => getPool().query<{ statement_timeout: string }>('SHOW statement_timeout')),
-    );
-    for (const r of settings) expect(r.rows[0]!.statement_timeout).not.toBe('2min');
+    // The seeding connection went back to the pool at the normal bound: check out
+    // every idle connection at once (the seeding one is among them unless it was
+    // destroyed) and read each one's own setting.
+    const pool = getPool();
+    const idle = pool.idleCount;
+    expect(idle).toBeGreaterThan(0);
+    const clients = await Promise.all(Array.from({ length: idle }, () => pool.connect()));
+    try {
+      for (const c of clients) {
+        const r = await c.query<{ statement_timeout: string }>('SHOW statement_timeout');
+        expect(r.rows[0]!.statement_timeout).toBe('5s');
+      }
+    } finally {
+      for (const c of clients) c.release();
+    }
   }, 30_000);
 
   it('skips without a network or an id', async () => {
