@@ -22,7 +22,7 @@
 ## Global Constraints
 
 - **Copy lives in NS.** The catalogue only seeds what is absent. It never updates, retires or replaces an existing template or policy, of any status. After seeding, changes go through the admin API.
-- **One vendor per channel per deployment.** A catalogue template entry may name a `provider`. An entry for a vendor this deployment does not use is skipped, so one catalogue can carry both msg91 and pinnacle variants of an SMS template. An entry without `provider` is for the deployment's vendor.
+- **One vendor per channel per deployment.** A catalogue template entry may name a `provider`. An entry for a vendor this deployment does not use is skipped, so one catalogue can carry both msg91 and pinnacle variants of an SMS template. Only `email` entries may omit `provider` (ruling R4 during execution): an SMS or WhatsApp entry without it is rejected, because on a vendor switch it would be seeded for the new vendor with the old vendor's ids.
 - **Field rules are the admin create rules.** The catalogue entry schemas *are* the admin create schemas. A catalogue cannot contain anything the admin API would refuse.
 - **Publish validation applies.** A seeded template or policy that fails publish validation is left as a draft and logged by code, without values. Seeding never blocks the boot. A missing, unreadable or invalid catalogue file is logged and skipped.
 - **Order.** Templates are seeded before policies, because a policy publish requires its templates to be active. `login_otp` env seeding still runs first; a catalogue `login_otp` SMS entry is then skipped as "exists".
