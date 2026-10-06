@@ -81,8 +81,23 @@ describe('V1NotifySchema attachments', () => {
 
   it('rejects a total size over the configured budget, re-read per request', () => {
     process.env.NOTIFY_ATTACHMENT_MAX_TOTAL_BYTES = '2048';
-    expect(email([att(1500), att(1500)]).success).toBe(false);
+    const r = email([att(1500), att(1500)]);
+    expect(r.success).toBe(false);
+    expect(JSON.stringify(r.error)).toContain('2048 byte total limit');
     delete process.env.NOTIFY_ATTACHMENT_MAX_TOTAL_BYTES;
     expect(email([att(1500), att(1500)]).success).toBe(true);
+  });
+
+  it('reports the limits in force when the request is parsed', () => {
+    process.env.NOTIFY_ATTACHMENT_MAX_FILES = '1';
+    const files = email([att(16), att(16)]);
+    expect(files.success).toBe(false);
+    expect(JSON.stringify(files.error)).toContain('at most 1 attachments');
+
+    process.env.NOTIFY_ATTACHMENT_MAX_FILES = '5';
+    process.env.NOTIFY_ATTACHMENT_MAX_TOTAL_BYTES = '1000';
+    const bytes = email([att(600), att(600)]);
+    expect(bytes.success).toBe(false);
+    expect(JSON.stringify(bytes.error)).toContain('1000 byte total limit');
   });
 });
