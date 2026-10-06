@@ -1,3 +1,4 @@
+import { loadCatalogueFile, seedCatalogue } from '../catalogue/seed';
 import { getPool } from '../db/client';
 import { providers } from '../providers';
 import { currentNetwork, NetworkNotConfigured } from '../network';
@@ -25,6 +26,10 @@ function configuredLoginOtpId(sms: { vendor: string; templates: Record<string, s
  * If rows exist only for another vendor (the deployment switched vendor), the
  * current vendor's configured template is seeded and published, which retires
  * the old vendor's active row — its ids mean nothing to the new vendor.
+ *
+ * Then, when `NS_SEED_FILE` names a catalogue, every catalogue template and
+ * policy that has no row yet is created and published (existing rows always
+ * win); the login_otp outcome is still what this returns.
  *
  * Replicas booting together serialise on a session advisory lock held on a
  * dedicated connection, so the existence check and the create+publish cannot
@@ -59,6 +64,20 @@ export async function seedBuiltinTemplates(): Promise<SeedOutcome> {
 }
 
 async function seedLocked(): Promise<SeedOutcome> {
+  const outcome = await seedLoginOtp();
+  const file = process.env.NS_SEED_FILE?.trim();
+  if (file) {
+    const catalogue = await loadCatalogueFile(file);
+    if (catalogue) {
+      const report = await seedCatalogue(catalogue);
+      // Counts only: the report never carries template bodies or variable values.
+      console.log(`catalogue ${catalogue.version} seeded: ${JSON.stringify(report)}`);
+    }
+  }
+  return outcome;
+}
+
+async function seedLoginOtp(): Promise<SeedOutcome> {
   const sms = providers.sms;
   const existing = await listTemplates({ channel: 'sms', templateKey: 'login_otp' });
   const own = sms ? existing.filter((t) => t.provider === sms.vendor) : [];
