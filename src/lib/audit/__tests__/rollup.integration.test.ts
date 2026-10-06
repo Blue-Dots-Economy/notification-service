@@ -14,7 +14,7 @@ function records(n: number, mode: 'all' | 'first_available'): AcceptedRecord[] {
   return Array.from({ length: n }, (_, i) => ({
     ids: { eventId, attemptId: randomUUID(), createdAt, correlationId: 'c', deliveryMode: mode },
     network: 'n', source: 's', priority: 'other', channel: i === 0 ? 'sms' : 'email',
-    templateId: 't', payload: {}, recoverable: true, job: { job_id: `j${i}` },
+    templateId: 't', templateKey: 't', eventType: null, domain: null, payload: {}, recoverable: true, job: { job_id: `j${i}` },
   }));
 }
 async function eventStatus(r: AcceptedRecord) {

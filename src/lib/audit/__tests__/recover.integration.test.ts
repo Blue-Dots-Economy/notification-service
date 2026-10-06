@@ -38,7 +38,7 @@ function rec(priority: 'realtime' | 'other' | 'bulk', createdAt = new Date()): A
   const recoverable = priority !== 'realtime';
   return {
     ids: { eventId: randomUUID(), attemptId: randomUUID(), createdAt: createdAt.toISOString(), correlationId: jobId },
-    network: 'n', source: 's', priority, channel: 'email', templateId: 't',
+    network: 'n', source: 's', priority, channel: 'email', templateId: 't', templateKey: 't', eventType: null, domain: null,
     payload: {}, recoverable,
     job: recoverable ? { job_id: jobId, channel: 'email', priority, to: 'x', template_id: 't', variables: {} } : undefined,
   };
