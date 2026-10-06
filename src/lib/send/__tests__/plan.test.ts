@@ -41,12 +41,12 @@ function policy(mode: 'first_available' | 'all') {
 }
 
 describe('planSend', () => {
-  it('variables are checked against the union of planned contracts', async () => {
+  it('each planned template renders only its own variables', async () => {
     policy('first_available');
     const plan = await planSend(req({ event_type: 'apply', to: { phone: '+919999999999', email: 'a@b.co' }, variables: { name: 'A', link: 'https://x.org/' } }));
     expect(plan.deliveries.map((d) => d.channel)).toEqual(['sms', 'email']);
     expect(plan.deliveries[0]!.rendered).toMatchObject({ mode: 'provider', variables: { name: 'A' } });
-    expect(await codeOf(planSend(req({ event_type: 'apply', to: { phone: '+919999999999' }, variables: { name: 'A', bogus: 'x' } })))).toBe('unknown_variable');
+    expect(plan.deliveries[1]!.rendered).toMatchObject({ mode: 'ns' });
   });
 
   it('drops channels without a contact point', async () => {
@@ -198,21 +198,29 @@ describe('planSend — event variables span every policy template', () => {
     expect(Object.keys((plan.deliveries[0]!.rendered as { variables: object }).variables)).toEqual(['message']);
   });
 
-  it('a variable no policy template declares is still unknown_variable', async () => {
+  it('an event variable no template uses is ignored', async () => {
     setup();
-    const e = await planSend(req({ event_type: 'guardian.otp.account', to: phoneOnly, variables: { message: '1', bogus: 'x' } })).catch((x) => x);
-    expect(e).toMatchObject({ code: 'unknown_variable', message: 'unknown variables: bogus' });
+    const plan = await planSend(req({ event_type: 'guardian.otp.account', to: phoneOnly, variables: { message: '1', bogus: 'x' } }));
+    expect(plan.deliveries[0]!.rendered).toMatchObject({ variables: { message: '1' } });
+    expect(Object.keys((plan.deliveries[0]!.rendered as { variables: object }).variables)).toEqual(['message']);
   });
 
-  it('a template that fails to resolve does not widen the union', async () => {
-    setup(false);
-    expect(await codeOf(planSend(req({ event_type: 'guardian.otp.account', to: phoneOnly, variables: { message: '1', parentName: 'P' } })))).toBe('unknown_variable');
+  it('planning resolves only the delivered candidate', async () => {
+    setup();
+    await planSend(req({ event_type: 'guardian.otp.account', to: phoneOnly, variables: { message: '1', parentName: 'P' } }));
+    expect(templates.resolveTemplate).toHaveBeenCalledTimes(1);
+    expect(templates.resolveTemplate.mock.calls[0]![0]).toBe('sms');
   });
 
-  it('each policy template is resolved once', async () => {
+  it('template_key send with an unknown variable is still unknown_variable', async () => {
+    templates.resolveTemplate.mockResolvedValue({ template: loginOtp, renders: 'provider' });
+    const e = await planSend(req({ template_key: 'login_otp', channel: 'sms', to: phoneOnly, variables: { message: '1', bogus: 'x' } })).catch((x) => x);
+    expect(e).toMatchObject({ code: 'unknown_variable', kind: 'caller' });
+  });
+
+  it('event send missing a required variable of a planned template is missing_variable', async () => {
     setup();
-    await planSend(req({ event_type: 'guardian.otp.account', to: phoneOnly, variables: { message: '1' } }));
-    expect(templates.resolveTemplate).toHaveBeenCalledTimes(2);
+    expect(await codeOf(planSend(req({ event_type: 'guardian.otp.account', to: phoneOnly, variables: { parentName: 'P' } })))).toBe('missing_variable');
   });
 });
 

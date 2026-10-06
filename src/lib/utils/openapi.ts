@@ -465,7 +465,13 @@ export function openApiDocument() {
                 },
               },
               locale: { type: 'string', pattern: '^[a-z]{2,3}(-[A-Z]{2})?$' },
-              variables: { type: 'object', additionalProperties: true, default: {} },
+              variables: {
+                type: 'object',
+                additionalProperties: true,
+                default: {},
+                description:
+                  'With `event_type`, variables are data: each planned template takes the ones it declares and the rest are ignored; a required one that is missing is `missing_variable`. With `template_key`, a name the template does not declare is `422 unknown_variable`.',
+              },
               priority: { type: 'string', enum: ['urgent', 'normal', 'bulk'], default: 'normal' },
               idempotency_key: { type: 'string', minLength: 1, maxLength: 128 },
               deadline: {
