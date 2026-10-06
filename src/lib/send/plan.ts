@@ -50,6 +50,7 @@ export async function planSend(req: V1Request, now = Date.now()): Promise<SendPl
 
   let mode: DeliveryMode;
   let candidates: { channel: string; template_key: string }[];
+  let policyChannels: { channel: string; template_key: string }[] = [];
   if (req.template_key) {
     const need = CHANNEL_CONTACT[req.channel!];
     if (!need || !contacts[need]) throw new SendError('no_reachable_channel', `no ${need ?? 'contact point'} for ${req.channel}`);
@@ -61,6 +62,7 @@ export async function planSend(req: V1Request, now = Date.now()): Promise<SendPl
     candidates = planDelivery(policy, contacts).candidates;
     if (candidates.length === 0) throw new SendError('no_reachable_channel', 'no channel in the policy matches the supplied contact points');
     mode = policy.mode;
+    policyChannels = policy.channels;
   }
 
   let firstConfigError: SendError | undefined;
@@ -70,11 +72,16 @@ export async function planSend(req: V1Request, now = Date.now()): Promise<SendPl
   };
 
   const resolved: { channel: string; key: string; template: TemplateRow; renders: 'ns' | 'provider' }[] = [];
+  // Every resolution attempt, keyed by channel and template, so no template is resolved twice.
+  const attempted = new Map<string, TemplateRow | null>();
+  const slot = (channel: string, key: string) => `${channel}\u0000${key}`;
   for (const c of candidates) {
     try {
       const { template, renders } = await cachedResolveTemplate(c.channel, c.template_key, req.locale);
+      attempted.set(slot(c.channel, c.template_key), template);
       resolved.push({ channel: c.channel, key: c.template_key, template, renders });
     } catch (e) {
+      attempted.set(slot(c.channel, c.template_key), null);
       if (!(e instanceof TemplateError)) throw e;
       if (classify(e.code) === 'caller') throw toSendError(e);
       skip(e);
@@ -83,7 +90,26 @@ export async function planSend(req: V1Request, now = Date.now()): Promise<SendPl
   if (resolved.length === 0) throw firstConfigError ?? new SendError('no_reachable_channel', 'nothing to send');
 
   // Content variables are filled by NS, never the caller: naming one is unknown_variable.
-  const union = new Set(resolved.flatMap((r) => callerVariables(r.template.variables).map((s) => s.name)));
+  // For an event the union spans every template the policy names, so a send that reaches only
+  // some channels may still carry the others' variables. A template that cannot resolve adds nothing.
+  const contract: TemplateRow[] = resolved.map((r) => r.template);
+  for (const c of policyChannels) {
+    const k = slot(c.channel, c.template_key);
+    if (attempted.has(k)) {
+      const t = attempted.get(k);
+      if (t && !resolved.some((r) => r.template === t)) contract.push(t);
+      continue;
+    }
+    try {
+      const { template } = await cachedResolveTemplate(c.channel, c.template_key, req.locale);
+      attempted.set(k, template);
+      contract.push(template);
+    } catch (e) {
+      if (!(e instanceof TemplateError)) throw e;
+      attempted.set(k, null);
+    }
+  }
+  const union = new Set(contract.flatMap((t) => callerVariables(t.variables).map((s) => s.name)));
   const unknown = Object.keys(req.variables).filter((k) => !union.has(k));
   if (unknown.length) throw new SendError('unknown_variable', `unknown variables: ${unknown.join(', ')}`, { variables: unknown });
 
