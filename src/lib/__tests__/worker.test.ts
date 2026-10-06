@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Job } from 'src/types';
+import type { PlannedDelivery } from '../send/plan';
 
 // The queue is mocked rather than faked here: these tests are about which queue
 // call processJob makes and with what delay, not about Redis behaviour (that is
@@ -95,6 +96,19 @@ vi.mock('node:child_process', () => ({ fork }));
 const queue = await import('../queue');
 const { processJob, spawnWorker, validateWorkerConfig } = await import('../worker');
 
+/** A planned delivery on `channel`, with the vendor the mocked provider has. */
+const delivery = (channel: string) =>
+  ({
+    channel,
+    to: channel === 'email' ? 'someone@example.com' : '+910000000000',
+    templateKey: `k_${channel}`,
+    provider: channel === 'email' ? 'smtp' : 'msg91',
+    providerTemplateId: 'f',
+    rendered: { mode: 'provider', channel, providerTemplateId: 'f', variables: {} },
+    dlt: { senderId: null, dltEntityId: null, dltHeaderId: null, dltTagId: null },
+  }) as unknown as PlannedDelivery;
+
+/** A single-delivery v1 email job: it never falls through, so its fate is the shared one. */
 const job = (over: Partial<Job> = {}): Job => ({
   job_id: 'job-1',
   channel: 'email',
@@ -102,6 +116,7 @@ const job = (over: Partial<Job> = {}): Job => ({
   to: 'someone@example.com',
   template_id: 'welcome',
   variables: {},
+  v1: { mode: 'all', deliveries: [delivery('email')], index: 0 },
   ...over,
 });
 
@@ -170,8 +185,74 @@ describe('spawnWorker', () => {
   });
 });
 
+
+describe('processJob — a job with no v1 plan', () => {
+  // Recovery (24 h) or a DLQ replay can still hand the worker a job queued by
+  // the removed legacy /notify. It is dead-lettered, never sent and never thrown.
+  const legacyJob = (over: Record<string, unknown> = {}) =>
+    ({
+      job_id: 'j1', channel: 'sms', priority: 'other', to: '+911234567890',
+      template_id: 'login_otp', variables: { message: '1' }, ...over,
+    }) as unknown as Job;
+  const audit = { eventId: 'e', attemptId: 'att-1', createdAt: '2026-10-04T00:00:00.000Z', correlationId: 'c' };
+
+  it('a job with no v1 plan is dead-lettered as legacy_job_shape', async () => {
+    const j = legacyJob();
+    await expect(processJob(j)).resolves.not.toThrow();
+    expect(queue.pushDLQ).toHaveBeenCalledWith(j);
+    expect(incr).toHaveBeenCalledWith('ns_job_dlq_total', { channel: 'sms', reason: 'legacy_job_shape' });
+    expect(send).not.toHaveBeenCalled();
+    expect(smsSendRendered).not.toHaveBeenCalled();
+    expect(emailSendRendered).not.toHaveBeenCalled();
+    expect(acquireSendToken).not.toHaveBeenCalled();
+    expect(queue.scheduleRetryWithMarker).not.toHaveBeenCalled();
+  });
+
+  it('closes the attempt it was popped for: marker and stamp failed with the reason', async () => {
+    // Recovery pushes attempt = attempt_no - 1, so the row being closed is attempt + 1.
+    await processJob(legacyJob({ attempt: 2, audit }));
+    expect(markAttempt).toHaveBeenCalledWith(expect.anything(), 'failed', 3);
+    expect(stamp.mock.calls.map((c) => c[1])).toEqual([{ status: 'failed', attemptNo: 3, error: 'legacy_job_shape' }]);
+  });
+
+  it('a DLQ replay of a legacy job (attempt reset, fresh attempt id) is dead-lettered again', async () => {
+    const j = legacyJob({ attempt: 0, replays: 1, deadline: undefined, audit: { ...audit, attemptId: 'att-2' } });
+    await processJob(j);
+    expect(queue.pushDLQ).toHaveBeenCalledWith(j);
+    expect(stamp).toHaveBeenLastCalledWith(j, { status: 'failed', attemptNo: 1, error: 'legacy_job_shape' });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('a redacted legacy job is dropped, not dead-lettered, like every redacted failure', async () => {
+    await processJob(legacyJob({ priority: 'realtime' }));
+    expect(queue.pushDLQ).not.toHaveBeenCalled();
+    expect(incr).toHaveBeenCalledWith('ns_job_dropped_total', { channel: 'sms', reason: 'legacy_job_shape' });
+    expect(incr).not.toHaveBeenCalledWith('ns_job_dlq_total', expect.anything());
+  });
+
+  it.each([
+    ['null', null],
+    ['false', false],
+  ])('v1: %s is a legacy shape too', async (_label, v1) => {
+    await processJob(legacyJob({ v1 }));
+    expect(incr).toHaveBeenCalledWith('ns_job_dlq_total', { channel: 'sms', reason: 'legacy_job_shape' });
+  });
+
+  it('dead-letters even past its deadline or on an unknown channel, without throwing', async () => {
+    await expect(processJob(legacyJob({ deadline: Date.now() - 1 }))).resolves.not.toThrow();
+    await expect(processJob(legacyJob({ channel: 'carrier-pigeon' }))).resolves.not.toThrow();
+    expect(incr).toHaveBeenCalledWith('ns_job_dlq_total', { channel: 'sms', reason: 'legacy_job_shape' });
+    expect(incr).toHaveBeenCalledWith('ns_job_dlq_total', { channel: 'carrier-pigeon', reason: 'legacy_job_shape' });
+    expect(incr).not.toHaveBeenCalledWith('ns_job_expired_total', expect.anything());
+  });
+});
+
+// The suites below drive the shared machinery (token, ladder, stamps, markers,
+// deadlines, redaction) through single-delivery v1 jobs: a one-delivery `all`
+// job never falls through, so its fate is the shared one.
 describe('processJob — rate limit', () => {
   it('defers (does not lose) the job when the token check itself fails', async () => {
+    vi.spyOn(console, 'error').mockImplementationOnce(() => {});
     acquireSendToken.mockRejectedValueOnce(new Error('redis down'));
     const j = job({ attempt: 1 });
 
@@ -179,10 +260,11 @@ describe('processJob — rate limit', () => {
 
     expect(queue.deferJob).toHaveBeenCalledWith(j, 321);
     expect(j.attempt).toBe(1);
-    expect(send).not.toHaveBeenCalled();
+    expect(emailSendRendered).not.toHaveBeenCalled();
   });
 
   it('lets a failing defer propagate', async () => {
+    vi.spyOn(console, 'error').mockImplementationOnce(() => {});
     acquireSendToken.mockRejectedValueOnce(new Error('redis down'));
     vi.mocked(queue.deferJob).mockRejectedValueOnce(new Error('still down'));
     await expect(processJob(job())).rejects.toThrow('still down');
@@ -196,14 +278,14 @@ describe('processJob — rate limit', () => {
 
     expect(queue.deferJob).toHaveBeenCalledWith(j, 321);
     expect(j.attempt).toBe(2);
-    expect(send).not.toHaveBeenCalled();
+    expect(emailSendRendered).not.toHaveBeenCalled();
     expect(stamp).not.toHaveBeenCalled();
     expect(markAttempt).not.toHaveBeenCalled();
     expect(queue.pushDLQ).not.toHaveBeenCalled();
     expect(incr).toHaveBeenCalledWith('ns_rate_limited_total', { channel: 'email', priority: 'bulk' });
   });
 
-  it('proceeds as before when a token is granted', async () => {
+  it('proceeds when a token is granted', async () => {
     const j = job({ priority: 'realtime' });
 
     expect(await processJob(j)).toBeUndefined(); // not a deferral
@@ -211,75 +293,27 @@ describe('processJob — rate limit', () => {
     expect(acquireSendToken).toHaveBeenCalledWith('email', 'smtp', 'realtime');
     expect(queue.deferJob).not.toHaveBeenCalled();
     expect(j.attempt).toBe(1);
-    expect(send).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe('processJob — routing', () => {
-  it('sends via the provider using the mapped template id, not the public key', async () => {
-    await processJob(job());
-
-    expect(send).toHaveBeenCalledWith({
-      to: 'someone@example.com',
-      template_id: 'provider-template-123',
-      variables: {},
-      body: undefined,
-      job_id: 'job-1',
-    });
-  });
-
-  it('does not retry or dead-letter a delivered job', async () => {
-    await processJob(job());
-
-    expect(queue.scheduleRetryWithMarker).not.toHaveBeenCalled();
-    expect(queue.pushDLQ).not.toHaveBeenCalled();
-  });
-
-  it('dead-letters an unknown channel without attempting a send', async () => {
-    await processJob(job({ channel: 'carrier-pigeon' }));
-
-    expect(send).not.toHaveBeenCalled();
-    expect(queue.pushDLQ).toHaveBeenCalledTimes(1);
-    expect(queue.scheduleRetryWithMarker).not.toHaveBeenCalled();
-  });
-
-  it('dead-letters an unknown template without attempting a send', async () => {
-    await processJob(job({ template_id: 'no-such-template' }));
-
-    expect(send).not.toHaveBeenCalled();
-    expect(queue.pushDLQ).toHaveBeenCalledTimes(1);
+    expect(emailSendRendered).toHaveBeenCalledTimes(1);
   });
 });
 
 describe('processJob — attempt counting', () => {
   it('counts a first attempt as 1 when the job has no counter yet', async () => {
     const j = job();
-
     await processJob(j);
-
     expect(j.attempt).toBe(1);
   });
 
   it('increments an existing counter', async () => {
     const j = job({ attempt: 2 });
-
     await processJob(j);
-
     expect(j.attempt).toBe(3);
-  });
-
-  it('counts the attempt even when the channel is unknown, so the DLQ record is honest', async () => {
-    const j = job({ channel: 'nope', attempt: 1 });
-
-    await processJob(j);
-
-    expect(j.attempt).toBe(2);
   });
 });
 
 describe('processJob — backoff ladder on failure', () => {
   beforeEach(() => {
-    send.mockResolvedValue({ ok: false, error: 'provider said no' });
+    emailSendRendered.mockResolvedValue({ ok: false, error: 'provider said no' });
   });
 
   it.each([
@@ -311,9 +345,7 @@ describe('processJob — backoff ladder on failure', () => {
   });
 
   it('dead-letters a job that somehow arrives past the limit', async () => {
-    const j = job({ attempt: 9 });
-
-    await processJob(j);
+    await processJob(job({ attempt: 9 }));
 
     expect(queue.pushDLQ).toHaveBeenCalledTimes(1);
     expect(queue.scheduleRetryWithMarker).not.toHaveBeenCalled();
@@ -324,123 +356,39 @@ describe('processJob — backoff ladder on failure', () => {
 
     for (let i = 0; i < 5; i += 1) await processJob(j);
 
-    expect(
-      (queue.scheduleRetryWithMarker as unknown as { mock: { calls: unknown[][] } }).mock.calls.map(
-        (c) => c[1],
-      ),
-    ).toEqual([5, 10, 20, 40]);
+    expect(vi.mocked(queue.scheduleRetryWithMarker).mock.calls.map((c) => c[1])).toEqual([5, 10, 20, 40]);
     expect(queue.pushDLQ).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe('processJob — body resolution (providers that cannot render)', () => {
-  it('prefers the body the provider owns for a template it names', async () => {
-    await processJob(job({ channel: 'sms', template_id: 'login_otp', body: 'caller text' }));
-
-    expect(send).toHaveBeenCalledWith(
-      expect.objectContaining({ template_id: 'DLT-1', body: '{{message}} is your OTP' })
-    );
-  });
-
-  it('falls back to the caller body for a raw pass-through id', async () => {
-    await processJob(job({ channel: 'sms', template_id: 'RAW-DLT-9', body: 'caller text' }));
-
-    expect(send).toHaveBeenCalledWith(
-      expect.objectContaining({ template_id: 'RAW-DLT-9', body: 'caller text' })
-    );
-  });
-
-  it('dead-letters a named template whose id is not configured yet', async () => {
-    await processJob(job({ channel: 'sms', template_id: 'pending_case' }));
-
-    expect(send).not.toHaveBeenCalled();
-    expect(queue.pushDLQ).toHaveBeenCalledTimes(1);
-    // Must not leak through as a raw id: the vendor would answer with a generic
-    // "invalid template" and hide that this is simply unapproved copy.
-    expect(queue.scheduleRetryWithMarker).not.toHaveBeenCalled();
   });
 });
 
 describe('processJob — permanent failures', () => {
   it('dead-letters immediately when the provider says the failure is permanent', async () => {
-    send.mockResolvedValue({ ok: false, error: 'pinnacle EC1013', retryable: false });
-
-    await processJob(job());
-
-    expect(queue.pushDLQ).toHaveBeenCalledTimes(1);
+    emailSendRendered.mockResolvedValueOnce({ ok: false, error: 'template not registered', retryable: false });
+    const j = job();
+    await processJob(j);
+    expect(queue.pushDLQ).toHaveBeenCalledWith(j);
     expect(queue.scheduleRetryWithMarker).not.toHaveBeenCalled();
   });
 
-  it('still retries a failure that is not marked permanent', async () => {
-    send.mockResolvedValue({ ok: false, error: 'timeout', retryable: true });
-
+  it('keeps retrying when the provider expresses no opinion', async () => {
+    emailSendRendered.mockResolvedValueOnce({ ok: false, error: 'vendor 503' });
     await processJob(job());
-
     expect(queue.scheduleRetryWithMarker).toHaveBeenCalledTimes(1);
     expect(queue.pushDLQ).not.toHaveBeenCalled();
-  });
-
-  it('keeps retrying when the provider expresses no opinion (back-compat)', async () => {
-    send.mockResolvedValue({ ok: false });
-
-    await processJob(job());
-
-    expect(queue.scheduleRetryWithMarker).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe('processJob — a blank body is a config gap, not a caller opening', () => {
-  // The security case: `bodies` declares that THIS service owns the template's
-  // text. If a declared-but-blank body fell back to the caller's `body`, any
-  // caller could put arbitrary text on the wire under a DLT-approved template
-  // id — a compliance break and a phishing primitive in one.
-  it('dead-letters rather than letting a caller body ride a named template', async () => {
-    await processJob(job({ channel: 'sms', template_id: 'blank_body', body: 'CLAIM YOUR PRIZE' }));
-
-    expect(send).not.toHaveBeenCalled();
-    expect(queue.pushDLQ).toHaveBeenCalledTimes(1);
-  });
-
-  it('records why the job was dead-lettered', async () => {
-    await processJob(job({ channel: 'sms', template_id: 'blank_body', body: 'x' }));
-
-    expect(incr).toHaveBeenCalledWith(
-      'ns_job_dlq_total',
-      expect.objectContaining({ reason: 'template_not_configured' })
-    );
   });
 });
 
 describe('processJob — DLQ paths are observable', () => {
-  it.each([
-    ['unknown channel', { channel: 'carrier-pigeon' }, 'unknown_channel'],
-    ['unknown template', { template_id: 'no-such-template' }, 'unknown_template'],
-  ])('counts a %s dead-letter', async (_label, over, reason) => {
-    await processJob(job(over));
-
-    expect(incr).toHaveBeenCalledWith('ns_job_dlq_total', expect.objectContaining({ reason }));
-  });
-
   it('counts a permanent-failure dead-letter', async () => {
-    send.mockResolvedValue({ ok: false, retryable: false });
-
+    emailSendRendered.mockResolvedValue({ ok: false, retryable: false });
     await processJob(job());
-
-    expect(incr).toHaveBeenCalledWith(
-      'ns_job_dlq_total',
-      expect.objectContaining({ reason: 'permanent_failure' })
-    );
+    expect(incr).toHaveBeenCalledWith('ns_job_dlq_total', expect.objectContaining({ reason: 'permanent_failure' }));
   });
 
   it('counts a max-retries dead-letter', async () => {
-    send.mockResolvedValue({ ok: false });
-
+    emailSendRendered.mockResolvedValue({ ok: false });
     await processJob(job({ attempt: 4 }));
-
-    expect(incr).toHaveBeenCalledWith(
-      'ns_job_dlq_total',
-      expect.objectContaining({ reason: 'max_retries' })
-    );
+    expect(incr).toHaveBeenCalledWith('ns_job_dlq_total', expect.objectContaining({ reason: 'max_retries' }));
   });
 });
 
@@ -448,7 +396,7 @@ describe('processJob — a provider that throws must not lose the job', () => {
   it('retries instead of dropping the notification', async () => {
     // The job is already popped and not yet in the DLQ, so an escaping throw
     // would lose it with no record anywhere.
-    send.mockRejectedValue(new Error('boom'));
+    emailSendRendered.mockRejectedValue(new Error('boom'));
 
     await processJob(job());
 
@@ -457,7 +405,7 @@ describe('processJob — a provider that throws must not lose the job', () => {
   });
 
   it('still dead-letters a thrower once the ladder is exhausted', async () => {
-    send.mockRejectedValue(new Error('boom'));
+    emailSendRendered.mockRejectedValue(new Error('boom'));
 
     await processJob(job({ attempt: 4 }));
 
@@ -466,8 +414,6 @@ describe('processJob — a provider that throws must not lose the job', () => {
 });
 
 describe('processJob audit stamping', () => {
-  beforeEach(() => stamp.mockClear());
-
   it('stamps dispatching then sent on success', async () => {
     await processJob(job());
     expect(stamp.mock.calls.map((c) => c[1])).toEqual([
@@ -477,32 +423,21 @@ describe('processJob audit stamping', () => {
   });
 
   it('stamps queued for the next attempt when a retry is scheduled', async () => {
-    send.mockResolvedValueOnce({ ok: false, error: 'timeout' });
+    emailSendRendered.mockResolvedValueOnce({ ok: false, error: 'timeout' });
     await processJob(job());
     expect(stamp.mock.calls.at(-1)?.[1]).toEqual({ status: 'queued', attemptNo: 2, error: 'timeout' });
   });
 
   it('stamps failed when dead-lettered', async () => {
-    send.mockResolvedValueOnce({ ok: false, error: 'bad template', retryable: false });
+    emailSendRendered.mockResolvedValueOnce({ ok: false, error: 'bad template', retryable: false });
     await processJob(job());
     expect(stamp.mock.calls.at(-1)?.[1]).toEqual({ status: 'failed', attemptNo: 1, error: 'bad template' });
   });
 
   it('stamps failed with max_retries when the ladder is exhausted', async () => {
-    send.mockResolvedValueOnce({ ok: false });
+    emailSendRendered.mockResolvedValueOnce({ ok: false });
     await processJob(job({ attempt: 4 }));
     expect(stamp.mock.calls.at(-1)?.[1]).toEqual({ status: 'failed', attemptNo: 5, error: 'max_retries' });
-  });
-
-  it('stamps failed for each pre-send dead-letter, without dispatching', async () => {
-    await processJob(job({ channel: 'nope' }));
-    await processJob(job({ channel: 'sms', template_id: 'pending_case' }));
-    await processJob(job({ template_id: 'not-a-template' }));
-    expect(stamp.mock.calls.map((c) => c[1])).toEqual([
-      { status: 'failed', attemptNo: 1, error: 'unknown_channel' },
-      { status: 'failed', attemptNo: 1, error: 'template_not_configured' },
-      { status: 'failed', attemptNo: 1, error: 'unknown_template' },
-    ]);
   });
 });
 
@@ -515,7 +450,7 @@ describe('processJob attempt markers', () => {
   });
 
   it('stamps queued, then schedules the retry and its marker together (no separate marker write)', async () => {
-    send.mockResolvedValueOnce({ ok: false, error: 'timeout' });
+    emailSendRendered.mockResolvedValueOnce({ ok: false, error: 'timeout' });
     const audit = { eventId: 'e', attemptId: 'att-1', createdAt: '2026-10-04T00:00:00.000Z', correlationId: 'c' };
     await processJob(job({ audit }));
     expect(markAttempt).not.toHaveBeenCalled();
@@ -528,20 +463,24 @@ describe('processJob attempt markers', () => {
   });
 
   it('marks failed on every dead-letter path', async () => {
-    send.mockResolvedValueOnce({ ok: false, error: 'bad', retryable: false });
+    emailSendRendered.mockResolvedValueOnce({ ok: false, error: 'bad', retryable: false });
     await processJob(job());
-    await processJob(job({ channel: 'nope' }));
-    expect(markAttempt.mock.calls.map((c) => [c[1], c[2]])).toEqual([['failed', 1], ['failed', 1]]);
+    await processJob(job({ v1: { mode: 'all', deliveries: [delivery('pigeon')], index: 0 } }));
+    await processJob({ job_id: 'legacy', channel: 'sms', priority: 'other', to: 'x', template_id: 't', variables: {} });
+    expect(markAttempt.mock.calls.map((c) => [c[1], c[2]])).toEqual([['failed', 1], ['failed', 1], ['failed', 1]]);
   });
 });
 
 describe('deadlines and redacted jobs', () => {
   const smsJob = (over: Partial<Job> = {}) =>
-    job({ channel: 'sms', template_id: 'login_otp', to: '+910000000000', variables: { message: '1' }, ...over });
+    job({
+      channel: 'sms', template_id: 'login_otp', to: '+910000000000', variables: { message: '1' },
+      v1: { mode: 'all', deliveries: [delivery('sms')], index: 0 }, ...over,
+    });
 
   it('an expired job is not sent, ends expired, and is not dead-lettered', async () => {
     await processJob(smsJob({ priority: 'realtime', deadline: Date.now() - 1 }));
-    expect(send).not.toHaveBeenCalled();
+    expect(smsSendRendered).not.toHaveBeenCalled();
     expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'expired' }));
     expect(markAttempt).toHaveBeenCalledWith(expect.anything(), 'expired', 1);
     expect(markAttempt).not.toHaveBeenCalledWith(expect.anything(), 'failed', expect.anything());
@@ -550,14 +489,14 @@ describe('deadlines and redacted jobs', () => {
   });
 
   it('retry past the deadline expires instead', async () => {
-    send.mockResolvedValueOnce({ ok: false, error: 'timeout' });
+    smsSendRendered.mockResolvedValueOnce({ ok: false, error: 'timeout' });
     await processJob(smsJob({ priority: 'realtime', deadline: Date.now() + 1000 })); // first retry delay is 5s
     expect(queue.scheduleRetryWithMarker).not.toHaveBeenCalled();
     expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'expired' }));
   });
 
   it('expiry after a failed attempt keeps the provider error', async () => {
-    send.mockResolvedValueOnce({ ok: false, error: 'vendor 503' });
+    smsSendRendered.mockResolvedValueOnce({ ok: false, error: 'vendor 503' });
     await processJob(smsJob({ priority: 'realtime', deadline: Date.now() + 1000 }));
     expect(stamp).toHaveBeenLastCalledWith(
       expect.anything(),
@@ -567,7 +506,7 @@ describe('deadlines and redacted jobs', () => {
 
   it('log lines say dropped for redacted jobs and DLQ otherwise, without values', async () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
-    send.mockResolvedValue({ ok: false, retryable: false, error: 'bad template' });
+    smsSendRendered.mockResolvedValue({ ok: false, retryable: false, error: 'bad template' });
     await processJob(smsJob({ priority: 'realtime' }));
     await processJob(smsJob({ priority: 'other' }));
     const lines = log.mock.calls.map((c) => c.join(' '));
@@ -578,7 +517,7 @@ describe('deadlines and redacted jobs', () => {
   });
 
   it('redacted jobs are never dead-lettered', async () => {
-    send.mockResolvedValueOnce({ ok: false, error: 'bad template', retryable: false });
+    smsSendRendered.mockResolvedValueOnce({ ok: false, error: 'bad template', retryable: false });
     await processJob(smsJob({ priority: 'realtime' }));
     expect(queue.pushDLQ).not.toHaveBeenCalled();
     expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'failed' }));
@@ -588,14 +527,14 @@ describe('deadlines and redacted jobs', () => {
   });
 
   it('redacted jobs exhausting retries are dropped, not dead-lettered', async () => {
-    send.mockResolvedValueOnce({ ok: false, error: 'timeout' });
+    smsSendRendered.mockResolvedValueOnce({ ok: false, error: 'timeout' });
     await processJob(smsJob({ priority: 'realtime', attempt: 4 }));
     expect(queue.pushDLQ).not.toHaveBeenCalled();
     expect(incr).toHaveBeenCalledWith('ns_job_dropped_total', expect.objectContaining({ reason: 'max_retries' }));
   });
 
   it('non-redacted jobs still dead-letter', async () => {
-    send.mockResolvedValueOnce({ ok: false, error: 'bad template', retryable: false });
+    smsSendRendered.mockResolvedValueOnce({ ok: false, error: 'bad template', retryable: false });
     await processJob(smsJob({ priority: 'other' }));
     expect(queue.pushDLQ).toHaveBeenCalled();
     expect(incr).toHaveBeenCalledWith('ns_job_dlq_total', expect.objectContaining({ reason: 'permanent_failure' }));
@@ -615,6 +554,7 @@ describe('deadlines and redacted jobs', () => {
   });
 
   it('a token-check error past the deadline expires instead of deferring', async () => {
+    vi.spyOn(console, 'error').mockImplementationOnce(() => {});
     acquireSendToken.mockRejectedValueOnce(new Error('redis down'));
     await processJob(smsJob({ priority: 'realtime', deadline: Date.now() + 10 }));
     expect(queue.deferJob).not.toHaveBeenCalled();

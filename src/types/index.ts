@@ -1,22 +1,3 @@
-export interface NotifyRequest {
-  channel: string;
-  to: string;
-  template_id: string;
-  priority?: 'realtime' | 'other';
-  variables: any;
-  dedupe_id?: string;
-  /**
-   * Optional message body template, for providers that do not render
-   * server-side (Pinnacle SMS). Ignored by providers that do (MSG91 renders
-   * from the DLT flow; SES renders from the email template).
-   *
-   * Only needed for a RAW pass-through `template_id` — when the provider names
-   * the template it owns the body too (`ProviderDefinition.bodies`), which is
-   * why the OTP callers need no change.
-   */
-  body?: string;
-}
-
 /** Internal priority. Public API names (Plan C2): urgent → realtime, normal → other, bulk → bulk. */
 export type Priority = 'realtime' | 'other' | 'bulk';
 
@@ -25,8 +6,11 @@ export interface Job {
   channel: string;
   priority: Priority;
   to: string;
+  /** The template key of the current delivery; the audit row's template_id. */
   template_id: string;
+  /** Request variables for the audit payload ({} when redacted). The worker never sends them. */
   variables: any;
+  /** Written only by legacy /notify, which still records it in the audit payload. */
   body?: string;
   attempt?: number; // number of tries so far
   next_attempt_at?: number; // timestamp of when to retry

@@ -661,7 +661,7 @@ are per delivery and live on `delivery_attempt.template_id`.
 - `utils/provider-docs.ts` — Provider schema/payload serialization
 
 **Other**:
-- `types/index.ts` — `NotifyRequest` and `Job`
+- `types/index.ts` — `Job` and `Priority`
 - `types/provider.ts` — `ProviderDefinition` interface
 
 **Tests** (`src/**/__tests__/`):
