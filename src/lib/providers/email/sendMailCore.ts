@@ -18,10 +18,9 @@ interface Email_request {
   replyTo?: string;
   to: string;
   subject: string;
-  /** Legacy /notify always sends `html`; v1 (sendRendered) sends `html` and/or `text`. */
+  /** sendRendered sends `html` and/or `text`; an html-only template has no `text`. */
   html?: string;
   text?: string;
-  activationUrl?: string;
   cc?: string;
   attachments?: Email_attachment[];
 }
@@ -128,13 +127,11 @@ export async function sendMail({
   subject,
   html,
   text,
-  activationUrl,
   cc,
   attachments,
 }: Email_request): Promise<{ ok: boolean }> {
   if (MAIL_LOG === 'true') {
     console.log('📧 Sending mail to:', to);
-    if (activationUrl) console.log('🔗 Activation URL/OTP:', activationUrl);
     // Names and sizes only — never the base64 content, which would dump
     // megabytes of a user's file into the service logs.
     if (attachments?.length) {
@@ -166,9 +163,9 @@ export async function sendMail({
       // "Score  90" and "A => B" became "A = B" — which silently corrupts the
       // plain-text body of ordinary mail. See the mailer test.
       //
-      // Without `text` (legacy /notify) this is exactly the original behaviour:
-      // text derived from `html`, `html` passed as given. sendRendered checks
-      // that a v1 email has a body before it gets here.
+      // Without `text` (an html-only template) the text part is derived from
+      // `html`, and `html` is passed as given. sendRendered checks that an
+      // email has a body before it gets here.
       ...(text === undefined
         ? { text: (html as string).replace(/<[^>]+>/g, '').replace(/</g, ''), html }
         : { text, ...(html ? { html } : {}) }),

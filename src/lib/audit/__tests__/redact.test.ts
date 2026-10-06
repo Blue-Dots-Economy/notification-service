@@ -28,7 +28,7 @@ describe('toAcceptedRecord', () => {
   it('keeps the full job for a normal job so it can be recovered', () => {
     const job: Job = {
       job_id: 'j', channel: 'email', priority: 'other', to: 'a@b.c',
-      template_id: 'basic_email', variables: { subject: 's' }, audit: ids,
+      template_id: 'welcome', variables: { subject: 's' }, audit: ids,
     };
     const rec = toAcceptedRecord(job, 'dpg-api-client');
     expect(rec.recoverable).toBe(true);
@@ -64,7 +64,7 @@ describe('toAcceptedRecord — sticky redaction', () => {
   it('keeps values for a normal-origin job even when replayed as realtime', () => {
     const job: Job = {
       job_id: 'j', channel: 'email', priority: 'realtime', to: 'a@b.c',
-      template_id: 'basic_email', variables: { subject: 's' },
+      template_id: 'welcome', variables: { subject: 's' },
       audit: { ...ids, redactValues: false },
     };
     const rec = toAcceptedRecord(job, 'worker');
@@ -76,7 +76,7 @@ describe('toAcceptedRecord — sticky redaction', () => {
 describe('toAcceptedRecord — email attachments', () => {
   const data = Buffer.from('%PDF-1.7 secret contract body').toString('base64');
   const job: Job = {
-    job_id: 'j', channel: 'email', priority: 'other', to: 'a@b.c', template_id: 'basic_email',
+    job_id: 'j', channel: 'email', priority: 'other', to: 'a@b.c', template_id: 'welcome',
     variables: { subject: 's', attachments: [{ filename: 'c.pdf', contentType: 'application/pdf', data }] },
     audit: ids,
   };

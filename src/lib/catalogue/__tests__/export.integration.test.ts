@@ -2,8 +2,8 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 
 vi.mock('../../providers', () => ({
   providers: {
-    sms: { name: 'sms', vendor: 'msg91', renders: 'provider', templates: { login_otp: 'flow-otp' } },
-    email: { name: 'email', vendor: 'smtp', renders: 'ns', templates: {} },
+    sms: { name: 'sms', vendor: 'msg91', renders: 'provider' },
+    email: { name: 'email', vendor: 'smtp', renders: 'ns' },
   },
 }));
 

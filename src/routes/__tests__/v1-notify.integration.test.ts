@@ -15,8 +15,7 @@ const sms = vi.hoisted(() => ({
 vi.mock('../../lib/providers', () => ({
   providers: {
     sms: {
-      name: 'sms', vendor: 'msg91', renders: 'provider', templates: {},
-      send: vi.fn(async () => ({ ok: true })),
+      name: 'sms', vendor: 'msg91', renders: 'provider',
       sendRendered: sms.sendRendered,
     },
   },

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { parseDeadline, PRIORITY_MAP, V1NotifySchema } from '../request';
 
 const ok = { event_type: 'apply', to: { phone: '+919999999999' }, variables: { name: 'A' } };
@@ -56,5 +56,33 @@ describe('parseDeadline', () => {
   it('rejects past and too-distant deadlines', () => {
     expect(() => parseDeadline('2026-10-03T23:59:00Z', now)).toThrow('future');
     expect(() => parseDeadline('2026-10-05T00:00:01Z', now)).toThrow('24 hours');
+  });
+});
+
+// The attachment limits used to be pinned on the legacy email provider schema;
+// V1NotifySchema enforces the same env-driven bounds.
+describe('V1NotifySchema attachments', () => {
+  const att = (bytes: number) => ({ filename: 'a.png', contentType: 'image/png', data: Buffer.alloc(bytes, 1).toString('base64') });
+  const email = (attachments: unknown[]) => parse({ template_key: 'k', channel: 'email', to: { email: 'a@b.co' }, attachments });
+  afterEach(() => {
+    delete process.env.NOTIFY_ATTACHMENT_MAX_TOTAL_BYTES;
+    delete process.env.NOTIFY_ATTACHMENT_MAX_FILES;
+  });
+
+  it('accepts attachments within both limits', () => {
+    expect(email([att(1024), att(2048)]).success).toBe(true);
+  });
+
+  it('rejects more files than the configured maximum', () => {
+    const r = email([att(16), att(16), att(16), att(16)]);
+    expect(r.success).toBe(false);
+    expect(JSON.stringify(r.error)).toContain('at most 3 attachments');
+  });
+
+  it('rejects a total size over the configured budget, re-read per request', () => {
+    process.env.NOTIFY_ATTACHMENT_MAX_TOTAL_BYTES = '2048';
+    expect(email([att(1500), att(1500)]).success).toBe(false);
+    delete process.env.NOTIFY_ATTACHMENT_MAX_TOTAL_BYTES;
+    expect(email([att(1500), att(1500)]).success).toBe(true);
   });
 });
