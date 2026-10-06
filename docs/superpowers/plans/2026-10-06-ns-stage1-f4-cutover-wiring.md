@@ -863,10 +863,16 @@ EMAIL_FROM_NAME: *smtp_from_display   # up-sdm: "UP SDM"
 - `opentofu/aws/modules/random_passwords/main.tf` (`signals_notification_secret`).
 - `opentofu/aws/_common/output-file.hcl` (`:106`, `:157`).
 - `helm/signals/tests/render_test.sh`: flip the A3 assertion to "no `dpg-api-client`".
-- `helm/CLAUDE.md`.
+- `helm/CLAUDE.md`: remove the "three settings stay one more release" paragraph.
+- **Signals' half of the legacy key (kept in Part A by ruling R4, for rollout restarts and rollback):**
+  - `helm/signals/values.yaml`: the `notificationKeyId`/`notificationSecret` anchors, the `NOTIFICATION_SERVICE_KEY_ID`/`NOTIFICATION_SERVICE_SECRET` data keys, and the `internalSecrets` comment about `notificationSecret`;
+  - `helm/signals/charts/api/values.yaml`: `NOTIFICATION_SERVICE_KEY_ID`/`NOTIFICATION_SERVICE_SECRET`;
+  - `opentofu/aws/template/global-values.yaml`: `notificationKeyId` and `api.config.NOTIFICATION_FROM_EMAIL`;
+  - tfpl: `notificationSecret` and `NOTIFICATION_SERVICE_SECRET`.
+- Runbook for this release: remove `notificationKeyId` and `NOTIFICATION_FROM_EMAIL` from each cluster's own `global-values.yaml`.
 
-- [ ] **Step 1:** Flip the A3 assertion, then run it and confirm FAIL.
-- [ ] **Step 2:** Remove the entry, the random password and its two references.
+- [ ] **Step 1:** Flip the A3 assertions (the "present until Part B" block and `dpg-api-client`) to "absent", then run them and confirm FAIL., then run it and confirm FAIL.
+- [ ] **Step 2:** Remove the entry, Signals' half listed above, the random password and its two references.
 - [ ] **Step 3:** Run `tofu validate` on a cluster module as the repo's CI does, then `render_test.sh`, `helm lint` and `helm template`. Expected: pass.
 - [ ] **Step 4: Commit.** Message: `chore(ns): retire the legacy Signals HMAC key`
 
