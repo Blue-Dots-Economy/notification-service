@@ -277,6 +277,28 @@ describe('planSend — content_ref variables', () => {
     expect(plan.deliveries[0]!.contentRefs).toEqual([]);
   });
 
+  it('an event send renders the resolved content value in every delivered template', async () => {
+    loadTnc();
+    const tncEmail = tpl({ channel: 'email', templateKey: 'tnc_email', provider: 'smtp', providerTemplateId: null, subject: 'Hi {{name}}', bodyText: 'Terms: {{tnc_url}}', variables: [v('name'), tncV] });
+    policies.resolvePolicy.mockResolvedValue({ mode: 'all', channels: [{ channel: 'sms', template_key: 'tnc_sms' }, { channel: 'email', template_key: 'tnc_email' }] });
+    templates.resolveTemplate.mockImplementation(async (channel: string) =>
+      channel === 'sms' ? { template: tncSms, renders: 'provider' } : { template: tncEmail, renders: 'ns' });
+    const plan = await planSend(req({ event_type: 'tnc', to: { phone: '+919999999999', email: 'a@b.co' }, variables: { name: 'A' } }));
+    expect(plan.deliveries.map((d) => d.channel)).toEqual(['sms', 'email']);
+    expect(plan.deliveries[0]!.rendered).toMatchObject({ mode: 'provider', variables: { name: 'A', tnc_url: 'https://example.org/tnc' } });
+    expect(plan.deliveries[1]!.rendered).toMatchObject({ mode: 'ns', channel: 'email', text: 'Terms: https://example.org/tnc' });
+    for (const d of plan.deliveries) expect(d.contentRefs).toEqual([{ key: 'tnc.in_force.url', version: 'v3', locale: 'en' }]);
+  });
+
+  it('an event send carrying a content variable name renders the content value, not the caller value', async () => {
+    loadTnc();
+    policies.resolvePolicy.mockResolvedValue({ mode: 'first_available', channels: [{ channel: 'sms', template_key: 'tnc_sms' }] });
+    templates.resolveTemplate.mockResolvedValue({ template: tncSms, renders: 'provider' });
+    const plan = await planSend(req({ event_type: 'tnc', to: { phone: '+919999999999' }, variables: { name: 'A', tnc_url: 'https://example.org/other' } }));
+    expect(plan.deliveries[0]!.rendered).toMatchObject({ mode: 'provider', variables: { name: 'A', tnc_url: 'https://example.org/tnc' } });
+    expect(plan.deliveries[0]!.contentRefs).toEqual([{ key: 'tnc.in_force.url', version: 'v3', locale: 'en' }]);
+  });
+
   it('first_available: when every candidate fails on content, the first configuration error is thrown', async () => {
     const tncEmail = tpl({ channel: 'email', templateKey: 'tnc_email', provider: 'smtp', providerTemplateId: null, subject: 'Hi {{name}}', bodyText: '{{tnc_url}}', variables: [v('name'), tncV] });
     policies.resolvePolicy.mockResolvedValue({ mode: 'first_available', channels: [{ channel: 'sms', template_key: 'tnc_sms' }, { channel: 'email', template_key: 'tnc_email' }] });
