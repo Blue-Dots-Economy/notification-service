@@ -737,7 +737,7 @@ EMAIL_FROM_NAME: *smtp_from_display   # up-sdm: "UP SDM"
 | ALIMCO-TCS | `purple_dot/alimco/` | decrypt and confirm the vendor and `_brand: "alimco"` (a brand is required to fetch its catalogue); for Pinnacle, set `pinnacle_login_otp_template_id` and `sms_login_otp_body`; confirm `keycloak.smsProvider` is not `http` (or pin `smsHttp.url` to the legacy path until the F3 jar ships) |
 
 **Every cluster, also:**
-- **Operator key.** The release generates an `ns-admin` HMAC key (scope `templates:admin`) per cluster (ruling R8). Note where its secret lands for the operators who run the verify and recovery steps below.
+- **Operator key (ruling R8).** Each cluster gets an `ns-admin` HMAC key with scope `templates:admin`. Order: `bash install.sh apply_tf_random_passwords` (or `create_tf_resources`) creates `random_id.ns_admin_secret`; then `apply_tf_output_file`; then deploy signals (NS restarts once). If the output file is rendered before the password exists, the entry renders blank and NS skips it. Read the key with `kubectl -n signals get secret signals-notification-service-internal -o jsonpath='{.data.internal-secrets\.json}' | base64 -d | jq -r '."ns-admin".secret'`, and call the admin API with `X-NS-Key: ns-admin` and an HMAC v2 signature (NS README, Admin API). ALIMCO-TCS: add the entry by hand.
 - **Keycloak.** Confirm `keycloak.smsProvider` is not `http` and `otpEmailProvider` is unset or `smtp`. The chart's default NS URL is now `/v1/notify`, which only the F3 jar speaks.
 - **Test-dev From name.** Its `_smtp_from_display` is "blue Dots"; set `EMAIL_FROM_NAME: "Blue Dots"` as a literal.
 
