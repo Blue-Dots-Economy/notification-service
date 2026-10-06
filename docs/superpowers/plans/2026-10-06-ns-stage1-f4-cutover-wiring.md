@@ -751,7 +751,7 @@ EMAIL_FROM_NAME: *smtp_from_display   # up-sdm: "UP SDM"
 
 **Part B release gate.** Merge Part B for the next release only when all of these hold:
 - every cluster above runs the Signals image with #792;
-- no Keycloak on any cluster is on a jar older than F3 with `smsProvider: http`;
+- the F3 jar is in the automation Keycloak image (providers README sha256 updated), and no Keycloak on any cluster runs an older jar with `smsProvider: http` or `otpEmailProvider: http` (the older jar signs v1, which Part B rejects);
 - 24 h have passed since the last cluster upgraded, which is the recovery window;
 - each cluster's NS DLQ (`ns_queue_depth{queue="dlq"}`) shows no legacy job awaiting replay.
 
