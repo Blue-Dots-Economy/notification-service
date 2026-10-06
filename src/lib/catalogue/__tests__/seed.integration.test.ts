@@ -3,14 +3,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-type Def = { name: string; vendor: string; renders: 'ns' | 'provider'; templates: Record<string, string>; bodies?: Record<string, string> };
-const msg91: Def = { name: 'sms', vendor: 'msg91', renders: 'provider', templates: { login_otp: 'flow-otp' } };
-const pinnacle: Def = { name: 'sms', vendor: 'pinnacle', renders: 'ns', templates: { login_otp: '' }, bodies: { login_otp: '' } };
+type Def = { name: string; vendor: string; renders: 'ns' | 'provider' };
+const msg91: Def = { name: 'sms', vendor: 'msg91', renders: 'provider' };
+const pinnacle: Def = { name: 'sms', vendor: 'pinnacle', renders: 'ns' };
 const state = vi.hoisted(() => ({ sms: undefined as unknown as Def }));
 vi.mock('../../providers', () => ({
   providers: {
     get sms() { return state.sms; },
-    email: { name: 'email', vendor: 'smtp', renders: 'ns', templates: {} },
+    email: { name: 'email', vendor: 'smtp', renders: 'ns' },
   },
 }));
 
@@ -57,6 +57,7 @@ beforeEach(async () => {
   delete process.env.NS_SEED_FILE;
   delete process.env.SMS_LOGIN_OTP_TEMPLATE_ID;
   delete process.env.SMS_LOGIN_OTP_BODY;
+  delete process.env.PINNACLE_LOGIN_OTP_TEMPLATE_ID;
   state.sms = msg91;
   await getPool().query(`DELETE FROM notification_policy; DELETE FROM template;`);
 });

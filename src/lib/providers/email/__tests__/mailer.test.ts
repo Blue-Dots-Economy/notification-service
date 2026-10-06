@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // SMTP_HOST is read at module load by sendMailCore, so it has to be set before
 // the dynamic import below — and nodemailer mocked so no transport is opened.
@@ -12,15 +12,9 @@ vi.mock('nodemailer', () => ({
   createTransport: () => ({ sendMail: sendMailSpy }),
 }));
 
-const { emailProvider } = await import('../mailer');
-const { serializeProvider } = await import('../../../utils/provider-docs');
+process.env.EMAIL_FROM_ADDRESS = 'no-reply@example.com';
 
-const base = {
-  fromName: 'Signals Support',
-  fromEmail: 'hello@example.com',
-  subject: 'Complaint from Asha',
-  html: '<p>details</p>',
-};
+const { EmailAttachmentSchema, emailProvider } = await import('../mailer');
 
 const attachment = (bytes: number, over: Record<string, unknown> = {}) => ({
   filename: 'evidence.png',
@@ -29,51 +23,20 @@ const attachment = (bytes: number, over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
+/** A v1 email rendered at accept. `text: null` is an html-only template. */
+const rendered = (html: string | null, text: string | null = null) =>
+  ({ mode: 'ns', channel: 'email', subject: 'Complaint from Asha', html, text }) as const;
+
+const send = (html: string | null, text: string | null = null, email?: Parameters<typeof emailProvider.sendRendered>[0]['email']) =>
+  emailProvider.sendRendered({ to: 'support@example.com', providerTemplateId: null, rendered: rendered(html, text), email });
+
 beforeEach(() => {
   sendMailSpy.mockClear();
 });
 
-afterEach(() => {
-  delete process.env.NOTIFY_ATTACHMENT_MAX_TOTAL_BYTES;
-  delete process.env.NOTIFY_ATTACHMENT_MAX_FILES;
-});
-
-describe('emailProvider.schema', () => {
-  it('accepts variables with no attachments (every existing caller)', () => {
-    expect(emailProvider.schema.safeParse(base).success).toBe(true);
-  });
-
-  it('accepts attachments within both limits', () => {
-    const parsed = emailProvider.schema.safeParse({
-      ...base,
-      attachments: [attachment(1024), attachment(2048)],
-    });
-    expect(parsed.success).toBe(true);
-  });
-
-  it('rejects more files than the configured maximum', () => {
-    const four = [attachment(16), attachment(16), attachment(16), attachment(16)];
-    const parsed = emailProvider.schema.safeParse({ ...base, attachments: four });
-    expect(parsed.success).toBe(false);
-    expect(JSON.stringify(parsed.error)).toContain('at most 3 attachments');
-  });
-
-  it('rejects a total size over the configured budget', () => {
-    process.env.NOTIFY_ATTACHMENT_MAX_TOTAL_BYTES = '2048';
-    const parsed = emailProvider.schema.safeParse({
-      ...base,
-      attachments: [attachment(1500), attachment(1500)],
-    });
-    expect(parsed.success).toBe(false);
-    expect(JSON.stringify(parsed.error)).toContain('2048 byte total limit');
-  });
-
-  it('re-reads the limits per request, so an env change needs no redeploy of callers', () => {
-    process.env.NOTIFY_ATTACHMENT_MAX_FILES = '1';
-    const two = [attachment(16), attachment(16)];
-    expect(emailProvider.schema.safeParse({ ...base, attachments: two }).success).toBe(false);
-    delete process.env.NOTIFY_ATTACHMENT_MAX_FILES;
-    expect(emailProvider.schema.safeParse({ ...base, attachments: two }).success).toBe(true);
+describe('EmailAttachmentSchema', () => {
+  it('accepts a well-formed attachment', () => {
+    expect(EmailAttachmentSchema.safeParse(attachment(1024)).success).toBe(true);
   });
 
   it('rejects a structurally invalid attachment', () => {
@@ -83,15 +46,8 @@ describe('emailProvider.schema', () => {
       { filename: 'a.png', contentType: 'image/png', data: '' },
       { filename: 'a.png', contentType: 'image/png' },
     ]) {
-      expect(emailProvider.schema.safeParse({ ...base, attachments: [bad] }).success).toBe(false);
+      expect(EmailAttachmentSchema.safeParse(bad).success).toBe(false);
     }
-  });
-
-  it('still serialises to JSON Schema for the /providers docs route', () => {
-    // The size/count bounds are env-driven refinements; z.toJSONSchema throws on
-    // constructs it cannot represent, so this guards the docs route.
-    const serialised = serializeProvider(emailProvider);
-    expect(JSON.stringify(serialised)).toContain('attachments');
   });
 
   it('rejects a data value that is not base64', () => {
@@ -99,19 +55,15 @@ describe('emailProvider.schema', () => {
     // unvalidated payload is accepted at the 400 boundary and delivered as
     // garbage bytes — no crash, no DLQ loop, just a corrupt file.
     for (const bad of ['data:image/png;base64,aGVsbG8=', 'nope!!', 'aGVsbG8=tail', 'aGVs bG8=']) {
-      const parsed = emailProvider.schema.safeParse({
-        ...base,
-        attachments: [{ filename: 'a.png', contentType: 'image/png', data: bad }],
-      });
-      expect(parsed.success).toBe(false);
+      expect(EmailAttachmentSchema.safeParse({ filename: 'a.png', contentType: 'image/png', data: bad }).success).toBe(false);
     }
   });
 });
 
-describe('emailProvider.send', () => {
-  // The text/plain alternative is derived from `html` by stripping tags. Two
-  // properties matter and pull in opposite directions, so both are pinned here:
-  // no `<script` may survive an unterminated tag (CodeQL
+describe('emailProvider.sendRendered', () => {
+  // An html-only template gets a text/plain alternative derived from `html` by
+  // stripping tags. Two properties matter and pull in opposite directions, so
+  // both are pinned here: no `<script` may survive an unterminated tag (CodeQL
   // js/incomplete-multi-character-sanitization), and legitimate `>` in visible
   // copy must NOT be eaten — a blanket /[<>]/ strip turned "Score > 90" into
   // "Score  90" in review.
@@ -120,38 +72,23 @@ describe('emailProvider.send', () => {
     ['<p>Score > 90</p>', 'Score > 90'],
     ['<p>Use A => B</p>', 'Use A => B'],
     ['<p>x<script', 'xscript'],
-  ])('derives the text/plain body from %j as %j', async (html, expected) => {
-    await emailProvider.send({
-      to: 'support@example.com',
-      template_id: 'BASIC_EMAIL',
-      variables: { ...base, html },
-    });
-    const sent = sendMailSpy.mock.calls[0][0] as { text: string };
+  ])('derives the text/plain body of an html-only email from %j as %j', async (html, expected) => {
+    await send(html);
+    const sent = sendMailSpy.mock.calls[0][0] as { text: string; html: string };
     expect(sent.text).toBe(expected);
     expect(sent.text).not.toContain('<script');
+    expect(sent.html).toBe(html);
   });
 
-  it('ignores a caller `text` variable and derives the plain body from html', async () => {
-    await emailProvider.send({
-      to: 'support@example.com',
-      template_id: 'BASIC_EMAIL',
-      variables: { ...base, html: '<p>Hello</p>', text: 'something else' },
-    });
-    const sent = sendMailSpy.mock.calls[0][0] as { text: string };
-    expect(sent.text).toBe('Hello');
+  it('sends the rendered text as given when the template has one', async () => {
+    await send('<p>Hello</p>', 'Hello there');
+    expect(sendMailSpy.mock.calls[0][0]).toMatchObject({ text: 'Hello there', html: '<p>Hello</p>' });
   });
 
   it('decodes attachments into nodemailer buffers', async () => {
     const content = Buffer.from('a tiny png');
-    await emailProvider.send({
-      to: 'support@example.com',
-      template_id: 'BASIC_EMAIL',
-      variables: {
-        ...base,
-        attachments: [
-          { filename: 'evidence.png', contentType: 'image/png', data: content.toString('base64') },
-        ],
-      },
+    await send('<p>details</p>', null, {
+      attachments: [{ filename: 'evidence.png', contentType: 'image/png', data: content.toString('base64') }],
     });
 
     const sent = sendMailSpy.mock.calls[0][0] as {
@@ -164,24 +101,7 @@ describe('emailProvider.send', () => {
   });
 
   it('omits the attachments key entirely when there are none', async () => {
-    await emailProvider.send({
-      to: 'support@example.com',
-      template_id: 'BASIC_EMAIL',
-      variables: base,
-    });
+    await send('<p>details</p>');
     expect(sendMailSpy.mock.calls[0][0]).not.toHaveProperty('attachments');
-  });
-
-  // Legacy /notify behaviour is unchanged by the v1 html-or-text work: an empty
-  // html still sends (an empty body), it is not turned into a thrown error.
-  it('legacy send with an empty html still sends, as before v1', async () => {
-    const res = await emailProvider.send({
-      to: 'support@example.com',
-      template_id: 'BASIC_EMAIL',
-      variables: { ...base, html: '' },
-    });
-    expect(res).toEqual({ ok: true });
-    expect(sendMailSpy).toHaveBeenCalledTimes(1);
-    expect(sendMailSpy.mock.calls[0][0]).toMatchObject({ html: '', text: '' });
   });
 });

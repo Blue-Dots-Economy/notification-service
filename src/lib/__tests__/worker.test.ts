@@ -49,44 +49,16 @@ vi.mock('../queue', () => ({
 
 // ../providers auto-discovers by reading the directory and `require`-ing each
 // index.js, which only exists in compiled output — so it has to be mocked to be
-// importable from source at all, quite apart from controlling send() outcomes.
-const send = vi.fn(
-  async () => ({ ok: true }) as { ok: boolean; error?: string; retryable?: boolean }
-);
+// importable from source at all, quite apart from controlling sendRendered() outcomes.
 type SendResult = { ok: boolean; error?: string; retryable?: boolean; provider_message_id?: string };
 const smsSendRendered = vi.fn(async (_args: unknown): Promise<SendResult> => ({ ok: true }));
 const emailSendRendered = vi.fn(async (_args: unknown): Promise<SendResult> => ({ ok: true }));
 vi.mock('../providers', () => ({
   providers: {
-    email: {
-      name: 'email',
-      vendor: 'smtp',
-      templates: { welcome: 'provider-template-123' },
-      schema: { safeParse: () => ({ success: true, data: {} }) },
-      send,
-      sendRendered: emailSendRendered,
-    },
-    // Mirrors the SMS shape: raw ids pass through, one named template carries a
-    // provider-owned body, and a named template with no id is the "DLT approval
-    // has not landed yet" placeholder.
-    sms: {
-      name: 'sms',
-      vendor: 'msg91',
-      templates: { login_otp: 'DLT-1', pending_case: '', blank_body: 'DLT-2' },
-      bodies: { login_otp: '{{message}} is your OTP', blank_body: '' },
-      allowRawTemplateId: true,
-      schema: { safeParse: () => ({ success: true, data: {} }) },
-      send,
-      sendRendered: smsSendRendered,
-    },
-    // A channel whose provider predates sendRendered.
-    whatsapp: {
-      name: 'whatsapp',
-      vendor: 'twilio',
-      templates: {},
-      schema: { safeParse: () => ({ success: true, data: {} }) },
-      send,
-    },
+    email: { name: 'email', vendor: 'smtp', renders: 'ns', sendRendered: emailSendRendered },
+    sms: { name: 'sms', vendor: 'msg91', renders: 'provider', sendRendered: smsSendRendered },
+    // Malformed on purpose: the worker still refuses a provider with no sendRendered.
+    whatsapp: { name: 'whatsapp', vendor: 'twilio', renders: 'provider' },
   },
 }));
 
@@ -122,7 +94,6 @@ const job = (over: Partial<Job> = {}): Job => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
-  send.mockResolvedValue({ ok: true });
   smsSendRendered.mockResolvedValue({ ok: true });
   emailSendRendered.mockResolvedValue({ ok: true });
   acquireSendToken.mockResolvedValue(true);
@@ -201,7 +172,6 @@ describe('processJob — a job with no v1 plan', () => {
     await expect(processJob(j)).resolves.not.toThrow();
     expect(queue.pushDLQ).toHaveBeenCalledWith(j);
     expect(incr).toHaveBeenCalledWith('ns_job_dlq_total', { channel: 'sms', reason: 'legacy_job_shape' });
-    expect(send).not.toHaveBeenCalled();
     expect(smsSendRendered).not.toHaveBeenCalled();
     expect(emailSendRendered).not.toHaveBeenCalled();
     expect(acquireSendToken).not.toHaveBeenCalled();
@@ -220,7 +190,6 @@ describe('processJob — a job with no v1 plan', () => {
     await processJob(j);
     expect(queue.pushDLQ).toHaveBeenCalledWith(j);
     expect(stamp).toHaveBeenLastCalledWith(j, { status: 'failed', attemptNo: 1, error: 'legacy_job_shape' });
-    expect(send).not.toHaveBeenCalled();
   });
 
   it('a redacted legacy job is dropped, not dead-lettered, like every redacted failure', async () => {
@@ -607,7 +576,6 @@ describe('v1 jobs', () => {
   it('sends pre-rendered content via sendRendered', async () => {
     await processJob(v1Job() as never);
     expect(smsSendRendered).toHaveBeenCalledWith(expect.objectContaining({ to: '+919999999999', providerTemplateId: 'f', job_id: 'j', email: undefined }));
-    expect(send).not.toHaveBeenCalled();
     expect(markAttempt).toHaveBeenCalledWith(expect.anything(), 'sent', 1);
     expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'sent', attemptNo: 1 }));
   });
@@ -617,11 +585,13 @@ describe('v1 jobs', () => {
     expect(emailSendRendered).toHaveBeenCalledWith(expect.objectContaining({ to: 'a@b.c', email: { cc: ['x@y.z'] } }));
   });
 
-  it('takes the token for the delivery channel and vendor, deferring like legacy jobs', async () => {
+  it('takes the token for the delivery channel and vendor, deferring without counting an attempt', async () => {
     acquireSendToken.mockResolvedValueOnce(false);
-    const res = await processJob(v1Job() as never);
+    const j = { ...v1Job(), attempt: 2 };
+    const res = await processJob(j as never);
     expect(acquireSendToken).toHaveBeenCalledWith('sms', 'msg91', 'other');
     expect(res).toEqual({ deferredMs: 321 });
+    expect(j.attempt).toBe(2);
     expect(smsSendRendered).not.toHaveBeenCalled();
   });
 
@@ -783,7 +753,6 @@ describe('v1 jobs', () => {
 
   it('a provider without sendRendered fails permanently', async () => {
     await processJob({ ...v1Job('all'), channel: 'whatsapp', v1: { mode: 'all', deliveries: [{ ...d('whatsapp'), provider: 'twilio' }], index: 0 } } as never);
-    expect(send).not.toHaveBeenCalled();
     expect(stamp).toHaveBeenLastCalledWith(expect.anything(), expect.objectContaining({ status: 'failed', error: 'rendered send unsupported' }));
   });
 

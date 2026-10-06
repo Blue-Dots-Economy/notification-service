@@ -14,14 +14,24 @@ const LOCK_WAIT_QUERY_TIMEOUT_MS = 125_000;
 type SeedOutcome = 'seeded_active' | 'seeded_draft' | 'exists' | 'skipped_no_network' | 'skipped_no_id';
 
 /**
- * The login_otp id this deployment explicitly configured for its SMS vendor, or
- * undefined. Read from the environment directly rather than the provider map:
- * msg91's map falls back to a hardcoded legacy flow id, which must never be
- * published into the registry (the seed would never revisit it).
+ * The login_otp template this deployment explicitly configured for its SMS
+ * vendor, or undefined (seed outcome `skipped_no_id`):
+ * - msg91: `SMS_LOGIN_OTP_TEMPLATE_ID`. Only the env value counts, never a
+ *   built-in fallback flow id, which the seed would publish and never revisit.
+ * - pinnacle: `PINNACLE_LOGIN_OTP_TEMPLATE_ID`.
+ * A blank id is unset. The body is `SMS_LOGIN_OTP_BODY` as written (byte-exact,
+ * since the DLT operator matches on it), or null when unset or empty; pinnacle
+ * without a body seeds a draft, because publish requires a body when NS renders.
  */
-function configuredLoginOtpId(sms: { vendor: string; templates: Record<string, string> }): string | undefined {
-  const id = sms.vendor === 'msg91' ? process.env.SMS_LOGIN_OTP_TEMPLATE_ID : sms.templates.login_otp;
-  return id?.trim() || undefined;
+export function configuredLoginOtp(
+  vendor: string,
+  env: NodeJS.ProcessEnv = process.env,
+): { id: string; body: string | null } | undefined {
+  const raw =
+    vendor === 'msg91' ? env.SMS_LOGIN_OTP_TEMPLATE_ID : vendor === 'pinnacle' ? env.PINNACLE_LOGIN_OTP_TEMPLATE_ID : undefined;
+  const id = raw?.trim();
+  if (!id) return undefined;
+  return { id, body: env.SMS_LOGIN_OTP_BODY || null };
 }
 
 /**
@@ -109,15 +119,15 @@ async function seedLoginOtp(): Promise<SeedOutcome> {
   // before the body); anything an admin made, edited or published wins.
   if (own.length > 0 && !own.every(isUntouchedSeedDraft)) return 'exists';
 
-  const id = sms ? configuredLoginOtpId(sms) : undefined;
-  if (!sms || !id) {
+  const configured = sms ? configuredLoginOtp(sms.vendor) : undefined;
+  if (!sms || !configured) {
     console.log('login_otp is not configured for the SMS provider; template not seeded');
     return 'skipped_no_id';
   }
 
   const values = {
-    providerTemplateId: id,
-    bodyText: sms.bodies?.login_otp || process.env.SMS_LOGIN_OTP_BODY || null,
+    providerTemplateId: configured.id,
+    bodyText: configured.body,
     variables: [{ name: 'message', required: true, type: 'string' as const, sensitive: true, raw: false }],
   };
   let draftId: string;

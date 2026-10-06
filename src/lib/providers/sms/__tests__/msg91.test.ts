@@ -105,10 +105,27 @@ describe('msg91 SMS provider', () => {
     expect(res.retryable).toBe(true);
   });
 
-  it('allows raw template ids and accepts named-variable payloads', () => {
-    expect(smsProvider.allowRawTemplateId).toBe(true);
-    expect(smsProvider.schema.safeParse({ name: 'Asha', link: 'https://x' }).success).toBe(true);
-    expect(smsProvider.schema.safeParse({ message: '123' }).success).toBe(true);
+  // Keycloak and guardian OTP send one `message` variable; the DLT flow has a
+  // single ##var## slot. sendRendered must keep that mapping.
+  it('sendRendered maps a lone {message} to var and spreads named variables', async () => {
+    const fetchMock = mockFetchOk();
+    const rendered = (variables: Record<string, string>) =>
+      ({ mode: 'provider', channel: 'sms', providerTemplateId: 'flow-otp', variables }) as const;
+    expect((await smsProvider.sendRendered({ to: '+919000000005', providerTemplateId: 'flow-otp', rendered: rendered({ message: '123456' }) })).ok).toBe(true);
+    await smsProvider.sendRendered({ to: '+919000000005', providerTemplateId: 'flow-2', rendered: rendered({ name: 'Asha', link: 'https://x' }) });
+    expect(bodyOf(fetchMock)).toMatchObject({ template_id: 'flow-otp', recipients: [{ mobiles: '919000000005', var: '123456' }] });
+    const second = JSON.parse((fetchMock.mock.calls[1]![1] as { body: string }).body);
+    expect(second).toMatchObject({ template_id: 'flow-2', recipients: [{ mobiles: '919000000005', name: 'Asha', link: 'https://x' }] });
+  });
+
+  it('sendRendered refuses content without a provider template id', async () => {
+    const fetchMock = mockFetchOk();
+    const res = await smsProvider.sendRendered({
+      to: '+919000000005', providerTemplateId: null,
+      rendered: { mode: 'provider', channel: 'sms', providerTemplateId: 'x', variables: {} } as never,
+    });
+    expect(res).toMatchObject({ ok: false, retryable: false });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('declares its vendor and render mode', () => {

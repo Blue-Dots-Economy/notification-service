@@ -1,9 +1,8 @@
-import { z } from 'zod';
 import { ProviderDefinition, ProviderSendResult } from '../../../types/provider';
 import * as metrics from '../../metrics';
 import { isRetryableHttpStatus } from './http_status';
 import { isTimeoutError, providerTimeoutMs } from '../http';
-import { MAX_LENGTH, messageType, renderBody, UnresolvedTemplateVariables } from './render';
+import { MAX_LENGTH, messageType } from './render';
 
 /**
  * Pinnacle Teleservices SMS provider — the JSON endpoint (`/index.php/sms/json`).
@@ -12,12 +11,13 @@ import { MAX_LENGTH, messageType, renderBody, UnresolvedTemplateVariables } from
  * MSG91's Flow API takes a flow id plus named variables and renders the
  * DLT-approved body itself. Pinnacle renders NOTHING: it takes final `text` and
  * carries the DLT identifiers alongside, for the operator to match against the
- * registered template. So this adapter renders the body (see `./render`) and
- * attaches the DLT metadata from config.
+ * registered template. NS renders the stored body at accept (renders: 'ns'),
+ * and this adapter sends that text with the DLT metadata.
  *
  * DLT ids are issued by the DLT platform against the sending *principal entity*
- * — the adopter — so `sender`/`dltentityid` are deployment-wide config, while
- * `dlttempid` varies per template and arrives as the `template_id`.
+ * — the adopter — so `sender`/`dltentityid` are deployment-wide config (a
+ * template may override them), while `dlttempid` varies per template and is the
+ * template's provider template id.
  */
 
 const DEFAULT_BASE_URL = 'https://api.pinnacle.in';
@@ -101,49 +101,6 @@ function readResponse(payload: any): { ok: boolean; code: string; message?: stri
     message: payload?.msg ?? payload?.message ?? payload?.description,
     uniqueid: Array.isArray(payload?.data) ? payload.data[0]?.uniqueid : undefined,
   };
-}
-
-export async function sendSmsWithPinnacle(
-  to: string,
-  template_id: string,
-  variables: Record<string, string>,
-  body: string | undefined,
-  job_id: string | undefined,
-  env = process.env
-): Promise<ProviderSendResult> {
-  const config = loadPinnacleConfig(env);
-  if ('error' in config) {
-    await metrics.incr('ns_sms_send_total', { provider: 'pinnacle', result: 'failed' });
-    return { ok: false, error: config.error, retryable: false };
-  }
-
-  if (!body) {
-    // Pinnacle cannot render, so a template with no configured body cannot be
-    // sent at all. Permanent: no number of retries produces a body.
-    await metrics.incr('ns_sms_send_total', { provider: 'pinnacle', result: 'failed' });
-    return {
-      ok: false,
-      error: `no body configured for template_id=${template_id}; pinnacle renders no templates`,
-      retryable: false,
-    };
-  }
-
-  let text: string;
-  try {
-    text = renderBody(body, variables ?? {});
-  } catch (err) {
-    await metrics.incr('ns_sms_send_total', { provider: 'pinnacle', result: 'failed' });
-    return {
-      ok: false,
-      error:
-        err instanceof UnresolvedTemplateVariables
-          ? `missing template variables: ${err.missing.join(', ')}`
-          : 'body render failed',
-      retryable: false,
-    };
-  }
-
-  return sendPinnacleText(to, template_id, text, {}, job_id, env);
 }
 
 export interface PinnacleDltOverrides {
@@ -320,24 +277,6 @@ export const pinnacleSmsProvider: ProviderDefinition = {
   name: 'sms',
   vendor: 'pinnacle',
   renders: 'ns',
-
-  // Pinnacle's `dlttempid` IS the DLT template id, so unlike MSG91 there is no
-  // vendor-internal indirection — a raw pass-through id needs no entry here.
-  // Only the templates this service NAMES need a mapping, and they need a body
-  // to go with it, since Pinnacle renders nothing.
-  templates: {
-    login_otp: process.env.PINNACLE_LOGIN_OTP_TEMPLATE_ID ?? '',
-  },
-  bodies: {
-    login_otp: process.env.SMS_LOGIN_OTP_BODY ?? '',
-  },
-  allowRawTemplateId: true,
-
-  schema: z.record(z.string(), z.string()),
-
-  async send({ to, template_id, variables, body, job_id }) {
-    return await sendSmsWithPinnacle(to, template_id, variables, body, job_id);
-  },
 
   async sendRendered({ to, rendered, providerTemplateId, dlt, job_id }) {
     if (rendered.mode !== 'ns' || rendered.channel !== 'sms' || !providerTemplateId) {

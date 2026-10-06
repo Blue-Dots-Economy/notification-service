@@ -9,7 +9,7 @@ vi.mock('../../metrics', () => ({
 
 import { providerTimeoutMs } from '../http';
 import { sendSmsWithMsg91 } from '../sms/msg91';
-import { pollPinnacleBalance, sendSmsWithPinnacle } from '../sms/pinnacle';
+import { pollPinnacleBalance, sendPinnacleText } from '../sms/pinnacle';
 import { sendWhatsAppMessage } from '../whatsapp/twilioSend';
 
 describe('providerTimeoutMs', () => {
@@ -60,7 +60,7 @@ describe('vendor call timeouts', () => {
     const env = {
       PINNACLE_API_KEY: 'k', PINNACLE_SENDER_ID: 'S', PINNACLE_DLT_ENTITY_ID: 'E', PROVIDER_TIMEOUT_MS: '30',
     } as unknown as NodeJS.ProcessEnv;
-    expect(await sendSmsWithPinnacle('+919000000001', 'tpl', {}, 'hello', 'j1', env)).toEqual(timedOut);
+    expect(await sendPinnacleText('+919000000001', 'tpl', 'hello', {}, 'j1', env)).toEqual(timedOut);
   });
 
   it('pinnacle balance poll gives up instead of hanging', async () => {

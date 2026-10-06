@@ -5,12 +5,10 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 // recovery or a DLQ replay. Over real Postgres + Redis, both paths must end in
 // the DLQ as legacy_job_shape, never at a vendor and never as a throw.
 const sms = vi.hoisted(() => ({
-  send: vi.fn(async () => ({ ok: true as const })),
   sendRendered: vi.fn(async () => ({ ok: true as const })),
 }));
 vi.mock('../providers', () => ({
-  // The provider still names login_otp, so the old legacy branch would have sent it.
-  providers: { sms: { name: 'sms', vendor: 'msg91', renders: 'provider', templates: { login_otp: 'DLT-1' }, ...sms } },
+  providers: { sms: { name: 'sms', vendor: 'msg91', renders: 'provider', ...sms } },
 }));
 
 const redis = (await import('../redis')).default;
@@ -50,7 +48,6 @@ async function popAndProcess(): Promise<Job> {
 beforeAll(async () => { await runMigrations(); });
 afterAll(async () => { await closeDb(); redis.disconnect(); });
 beforeEach(async () => {
-  sms.send.mockClear();
   sms.sendRendered.mockClear();
   await redis.del(REDIS_RECOVERY_LOCK_KEY, ...Object.values(QUEUE_KEYS), 'queue:retry', DLQ);
   await redis.set(REDIS_EPOCH_KEY, 'x');
@@ -67,8 +64,6 @@ describe('legacy-shaped jobs after the legacy path is gone', () => {
 
     expect((await recoverLostJobs({ staleDispatchMs: 60_000 })).requeued).toBe(1);
     await popAndProcess();
-
-    expect(sms.send).not.toHaveBeenCalled();
     expect(sms.sendRendered).not.toHaveBeenCalled();
     expect(await dlqIds()).toEqual([job.job_id]);
     // Recovery bumped the row to attempt 2; the guard closes that attempt.
@@ -83,8 +78,6 @@ describe('legacy-shaped jobs after the legacy path is gone', () => {
 
     expect((await retryFailedJobs({ jobId: job.job_id })).retried).toEqual([job.job_id]);
     await popAndProcess();
-
-    expect(sms.send).not.toHaveBeenCalled();
     expect(sms.sendRendered).not.toHaveBeenCalled();
     const entries = (await redis.lrange(DLQ, 0, -1)).map((raw) => JSON.parse(raw) as Job);
     expect(entries.map((j) => j.job_id)).toEqual([job.job_id]);
