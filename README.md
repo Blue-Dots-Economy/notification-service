@@ -323,10 +323,13 @@ re-read every `NS_CONTENT_RELOAD_MS`; a bad file keeps the last good version.
 
 `NS_SEED_FILE` names a JSON file of templates and policies. At boot, each entry whose key has no
 row of any status is created and published; existing rows are never changed, so admin edits survive
-restarts. Entries use the admin create bodies; a template may name a `provider`, and an entry for a
-vendor this deployment does not use is skipped. An entry that fails publish validation stays a draft
-and is logged by code; publish it through the admin API. Seeding never blocks the boot, and the file
-is read only at boot.
+restarts. Entries use the admin create bodies plus `provider` on a template. SMS and WhatsApp entries
+must name their `provider`; only email entries may omit it, and those seed for the deployment's email
+vendor. An entry for a vendor this deployment does not use is skipped. An entry that fails publish
+validation stays a draft and is logged by code; publish it through the admin API. A template with a
+`content_ref` variable publishes only if content is loaded at its first boot; otherwise it, and any
+policy that lists it, stays a draft, so publish them through the admin API once content loads.
+Seeding never blocks the boot, and the file is read only at boot.
 
 ```json
 {
@@ -343,7 +346,9 @@ is read only at boot.
 ```
 
 `GET /v1/admin/export` returns the active templates and policies of the network in this format,
-without ids or timestamps, so it can seed another environment:
+without ids or timestamps, so it can seed another environment. Output is sorted, so two exports of
+one store are identical apart from `version`, the export timestamp. A store that does not fit the
+format (for example more than 500 active templates) answers `422 export_invalid`, naming paths only:
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" https://ns.example.com/v1/admin/export > catalogue.json

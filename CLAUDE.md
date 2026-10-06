@@ -442,16 +442,22 @@ skipped, and the boot always continues.
   serialise, and the wait for the lock is bounded at about 2 minutes. A catalogue change reaches a
   cluster at the next rollout.
 - **Providers.** A template entry naming a vendor other than the deployment's is skipped, so one
-  catalogue can carry msg91 and pinnacle variants of an SMS template. An entry without `provider`
-  is for the deployment's vendor.
+  catalogue can carry msg91 and pinnacle variants of an SMS template. Only email entries may omit
+  `provider` (they seed for the deployment's email vendor); SMS and WhatsApp entries must name it
+  (`TemplateEntrySchema` refine). A provider-less SMS entry would otherwise seed the old vendor's
+  ids under the new vendor after a vendor switch, and its publish would retire the old row.
 - **Drafts.** An entry that fails publish validation is left as a draft and logged by code, never
   with values; a database error between create and publish logs `left as draft: db_error`. A draft
   counts as existing on later boots, so an operator publishes it through the admin API (fix it with
-  `PATCH`, then `POST .../publish`).
+  `PATCH`, then `POST .../publish`). A template with a `content_ref` variable needs content loaded
+  at its first boot: without it the template, and every policy that lists it, is created as a
+  draft and stays one on later boots. Publish them through the admin API once content loads.
 - **Export and round trip (F1-3).** `GET /v1/admin/export` (`templates:admin`) returns the active
   templates (current vendors only) and active policies of `NS_NETWORK` as a catalogue with no ids,
-  versions, actors or timestamps. Output is sorted, so two exports of one store are byte-identical,
-  and `version` is the export timestamp. Seeding an empty network from an export reproduces the
+  versions, actors or timestamps. Output is sorted by code point, so two exports of one store are
+  identical apart from `version`, which is the export timestamp. A store that does not fit the
+  catalogue format (e.g. more than 500 active templates) answers `422 export_invalid`, naming paths
+  only. Seeding an empty network from an export reproduces the
   export. Unset `NS_NETWORK` answers `503 network_not_configured`.
 
 ### Content resolver
@@ -749,7 +755,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 735 unit tests across 55 files, plus 134 integration tests across 17 files. The unit suite runs in about a second because Redis
+vitest 4, 741 unit tests across 56 files, plus 135 integration tests across 17 files. The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
