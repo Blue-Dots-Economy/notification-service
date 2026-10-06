@@ -717,6 +717,14 @@ Each cluster's values live in bluedots-infra-deployments, which is private and p
 
 **Per cluster, before the release is applied:**
 
+Every cluster's own `global-values.yaml` was copied from the template, so add these under `notification-service.config` in each one (the chart refuses to render without a From address):
+
+```yaml
+EMAIL_FROM_ADDRESS: *smtp_user
+EMAIL_FROM_NAME: *smtp_from_display   # up-sdm: "UP SDM"
+```
+
+
 | Cluster | Catalogue | Before the first boot with `NS_SEED_FILE` |
 |---|---|---|
 | Ekstep-blue-dots-dev | `blue_dot/` | `msg91_template_id` set → `SMS_LOGIN_OTP_TEMPLATE_ID` |
@@ -724,8 +732,8 @@ Each cluster's values live in bluedots-infra-deployments, which is private and p
 | Ka-dhwd-blue-dots-prod | `blue_dot/ka-dhwd/` | same |
 | Ontac-orange-dots-prod | `orange_dot/onetac/` | same |
 | up-gzb-blue-dots-prod | `blue_dot/up-gzb/` | same |
-| up-sdm-blue-dots-prod | `blue_dot/upsdm/` | same; `_smtp_from_display` is "Aggregator" (confirm with product) |
-| Test-dev | `blue_dot/up-gzb/` | add `msg91_template_id` (or Pinnacle settings) and `sms_http_secret`; both are unset today |
+| up-sdm-blue-dots-prod | `blue_dot/upsdm/` | same; `EMAIL_FROM_NAME: "UP SDM"` as a literal (Keycloak keeps "Aggregator") |
+| Test-dev | `blue_dot/up-gzb/` | add `msg91_template_id` (or Pinnacle settings) and `sms_http_secret`; both are unset today. Its `notification-service` block also needs an email transport: `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_FROM` |
 | ALIMCO-TCS | `purple_dot/alimco/` | decrypt and confirm the vendor and `_brand: "alimco"` (a brand is required to fetch its catalogue); for Pinnacle, set `pinnacle_login_otp_template_id` and `sms_login_otp_body` |
 
 **Apply order:**
