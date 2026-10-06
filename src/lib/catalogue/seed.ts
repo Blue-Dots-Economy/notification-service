@@ -67,9 +67,12 @@ export async function seedCatalogue(c: Catalogue): Promise<SeedReport> {
       await publishTemplate(draft.id, ACTOR);
       report.templates.created_active++;
     } catch (e) {
+      // A non-rule error (e.g. the database) also leaves the draft behind: say
+      // so, then let it fail the seed.
+      const code = e instanceof TemplateError ? e.code : 'db_error';
+      console.warn(`catalogue template ${t.channel}/${t.template_key}/${locale} left as draft: ${code}`);
       if (!(e instanceof TemplateError)) throw e;
       report.templates.created_draft++;
-      console.warn(`catalogue template ${t.channel}/${t.template_key}/${locale} left as draft: ${e.code}`);
     }
   }
 
@@ -82,9 +85,10 @@ export async function seedCatalogue(c: Catalogue): Promise<SeedReport> {
       await publishPolicy(draft.id, ACTOR);
       report.policies.created_active++;
     } catch (e) {
+      const code = e instanceof TemplateError ? e.code : 'db_error';
+      console.warn(`catalogue policy ${domain ?? '*'}/${eventType ?? '*'} left as draft: ${code}`);
       if (!(e instanceof TemplateError)) throw e;
       report.policies.created_draft++;
-      console.warn(`catalogue policy ${domain ?? '*'}/${eventType ?? '*'} left as draft: ${e.code}`);
     }
   }
   return report;
