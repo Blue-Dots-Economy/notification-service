@@ -12,7 +12,7 @@ export interface Job {
   variables: any;
   attempt?: number; // number of tries so far
   next_attempt_at?: number; // timestamp of when to retry
-  /** Audit identity, assigned at /notify and carried to every status write. */
+  /** Audit identity, assigned at /v1/notify and carried to every status write. */
   audit?: import('../lib/audit/store').AuditIds;
   /** Times this job has been replayed from the DLQ (capped; see queue.ts). */
   replays?: number;

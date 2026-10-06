@@ -73,10 +73,11 @@ const smtp = resolveSmtp();
 const useSes = isTrue(SMTP_AWS_SES);
 
 /**
- * Sender override, or `undefined` to use the caller's `fromEmail`.
+ * Sender override, or `undefined` to use `fromEmail` (`EMAIL_FROM_ADDRESS`).
  *
- * Gmail rewrites a From that is not the authenticated account, so it overrides the
- * caller. Other relays keep it — their username is often not a mailbox at all.
+ * Gmail rewrites a From that is not the authenticated account, so it sends as
+ * that account. Other relays keep `fromEmail` — their username is often not a
+ * mailbox at all.
  */
 const envelopeFrom = useSes
   ? undefined

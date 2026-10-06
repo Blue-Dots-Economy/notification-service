@@ -94,8 +94,8 @@ async function holdForToken(
  * rendered at accept and decides the job's fate (delivered, retried with
  * exponential backoff, fallen through, or dead-lettered).
  *
- * A job with no `v1` plan was queued by legacy /notify (retired in Part B) and can
- * still arrive through recovery or a DLQ replay. It is never sent: its attempt
+ * A job with no `v1` plan has the pre-v1 job shape and can still arrive
+ * through recovery or a DLQ replay. It is never sent: its attempt
  * is counted and closed `failed`, and it is dead-lettered (dropped when
  * redacted) with reason `legacy_job_shape`, like any other DLQ reason.
  *
@@ -148,7 +148,7 @@ async function fallThrough(job: Job, next: PlannedDelivery, attemptNo: number, e
     v1: { ...v1, index: v1.index + 1 },
     audit: { ...job.audit!, attemptId: randomUUID() },
   };
-  // Record before queue, as on /notify: the row exists before the job can be popped.
+  // Record before queue, as on /v1/notify: the row exists before the job can be popped.
   await stamp(advanced, { status: 'queued', attemptNo: 1 });
   try {
     await pushToPriorityWithMarker(advanced, attemptMarker(job, 'failed', attemptNo));

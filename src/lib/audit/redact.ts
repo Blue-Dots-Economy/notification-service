@@ -31,10 +31,10 @@ function withoutAttachmentBodies(channel: string, variables: unknown): unknown {
  * NAMES only, and no job copy — so they are also not recoverable after a Redis
  * loss, which is acceptable because the user simply requests a new code.
  *
- * The decision keys on `audit.redactValues`, set once at /notify from the
- * original priority, not on the job's current priority: a DLQ replay may move
- * an OTP job to 'other', and it must stay redacted. Jobs queued before the flag
- * existed fall back to the priority.
+ * The decision keys on `audit.redactValues`, set once at /v1/notify (urgent
+ * priority, or a template with a sensitive variable), not on the job's current
+ * priority: an OTP job stays redacted under any later priority. Jobs queued
+ * before the flag existed fall back to the priority.
  */
 export function toAcceptedRecord(job: Job, source: string): AcceptedRecord {
   if (!job.audit) throw new Error(`job ${job.job_id} has no audit ids`);

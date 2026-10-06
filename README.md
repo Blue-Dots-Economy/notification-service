@@ -1,19 +1,22 @@
 # Notification Service
 
-A Fastify notification service for queueing provider-agnostic email, SMS, and
-WhatsApp messages. Requests are validated up front, written to Redis, and then
-processed asynchronously by a worker.
+A Fastify notification service for email, SMS and WhatsApp. Callers send through
+the Send API v1 (`POST /v1/notify`); the service renders and validates the message
+from a stored template before it accepts the request, records the send in Postgres,
+queues it in Redis, and a worker delivers it asynchronously.
 
 ## What It Does
 
-- Accepts notifications through one `POST /notify` API.
-- Supports provider-specific templates and variable schemas.
-- Exposes provider metadata with complete request payload examples.
-- Uses Redis lists for realtime and lower-priority work.
-- Uses a Redis sorted set for delayed retries.
-- Deduplicates repeated requests for a short window.
+- Accepts sends through one API, `POST /v1/notify`: by `event_type` (a published
+  policy picks the channels) or by `template_key` plus `channel`.
+- Stores versioned templates and policies per network, managed through the admin API
+  and seeded from a catalogue file.
+- Renders and validates content at accept time, against each template's variable contract.
+- Uses one Redis queue per priority (urgent, normal, bulk) and a sorted set for retries.
+- Makes sends safe to retry with `idempotency_key`.
 - Sends failed jobs to a dead-letter queue after retry exhaustion.
-- Serves Scalar API docs at `/`.
+- Reports the configured vendor per channel at `GET /providers`.
+- Serves Scalar API docs at `/` when `NS_DOCS_ENABLED=true`.
 
 ## Project Layout
 
@@ -24,7 +27,8 @@ src/
 ├─ routes/
 │  ├─ docs.ts                # Scalar docs and OpenAPI JSON
 │  ├─ metrics.ts             # Queue metrics route
-│  ├─ notify.ts              # Notification enqueue route
+│  ├─ v1-notify.ts           # Send API v1
+│  ├─ admin-*.ts             # Template, policy and catalogue-export admin API
 │  ├─ providers.ts           # Provider discovery routes
 │  └─ retry.ts               # Manual failed-job retry route
 ├─ lib/
@@ -32,7 +36,7 @@ src/
 │  ├─ worker.ts              # Background job processor
 │  ├─ utils/
 │  │  ├─ openapi.ts          # OpenAPI document builder
-│  │  └─ provider-docs.ts    # Provider payload/schema serialization
+│  │  └─ provider-docs.ts    # Provider metadata ({name, vendor, renders})
 │  └─ providers/             # Provider implementations
 └─ plugins/
    ├─ auth.ts                # Bearer token / HMAC v2 guard and route scopes
@@ -122,10 +126,10 @@ is for local runs only).
 An invalid value in any of these exits the worker at boot rather than dropping jobs later. Urgent
 sends take the shared quota first, then the reserved share; normal and bulk use the shared quota only.
 
-A normal-priority `/notify` that cannot be recorded returns
-`503 {"error": "audit store unavailable", "enqueued": false}` and the dedupe
-claim is released, so retrying the same request is accepted. Realtime sends
-are queued first and recorded best-effort (recipient and variable names only).
+A normal or bulk send that cannot be recorded returns
+`503 {"error": "audit store unavailable"}` and its idempotency claim is released,
+so retrying the same request is accepted. Urgent sends are queued first and
+recorded best-effort (recipients and variable names only).
 If Redis loses its data, NS re-queues recoverable open sends from Postgres at
 boot; this needs `INFO` allowed on Redis.
 
@@ -153,8 +157,8 @@ SMTP connection variables:
 | `SMTP_PASS` | — | `auth` is omitted entirely when either half is missing, for an unauthenticated relay. |
 | `SMTP_FROM` | — | Fixed envelope sender; see below. |
 
-**Which address mail is sent from.** Normally the caller's `variables.fromEmail`
-is used as-is. Two exceptions:
+**Which address mail is sent from.** Normally `EMAIL_FROM_ADDRESS`, with
+`EMAIL_FROM_NAME` as the display name. Two exceptions:
 
 - `SMTP_FROM`, when set, replaces it for every message. Use this with a relay
   that only accepts one sender identity.
@@ -162,7 +166,7 @@ is used as-is. Two exceptions:
   rejects a `From` that is not the mailbox that authenticated. Other providers
   do not have that constraint, and their SMTP username is frequently not a
   mailbox at all (`postmaster@mg.example`, an SES `AKIA…` key id) — putting it
-  in the `From` header would be wrong, so they keep the caller's address.
+  in the `From` header would be wrong, so they keep `EMAIL_FROM_ADDRESS`.
 
 **Gmail is not a special case.** Point `SMTP_HOST` at `smtp.gmail.com` with
 `SMTP_PORT=465`, `SMTP_SECURE=true` and an App Password in `SMTP_PASS`. The
@@ -174,8 +178,8 @@ ignored if a stale values file still sets them.
 
 ```bash
 pnpm test              # unit suite (vitest) — no Docker/Redis; Redis is faked in-process
-pnpm test:integration  # integration suite — needs a real Redis
-                       # e.g. redis-server --port 6399 --daemonize yes; REDIS_PORT=6399 pnpm test:integration
+pnpm test:integration  # integration suite — needs a real Redis and Postgres
+                       # the local env is in the header of vitest.integration.config.ts
 ```
 
 CI (`ci.yaml`) runs a frozen install, `pnpm build` (which is `tsc`, so also the
@@ -206,10 +210,9 @@ authentication (a bearer token or HMAC v2 headers; see [Authentication](#authent
 ```text
 GET  /                    # Scalar API reference HTML
 GET  /openapi.json        # OpenAPI document
-POST /notify              # Enqueue a notification (legacy)
 POST /v1/notify           # Send API v1: policy-routed or template-key send
-GET  /providers           # List providers and complete payload examples
-GET  /providers/:name     # Find one provider by name
+GET  /providers           # Configured provider per channel: name, vendor, renders
+GET  /providers/:name     # One channel's provider
 GET  /metrics/queue       # Queue depths and retry/DLQ metrics
 POST /failed/retry        # Requeue jobs from the DLQ
 ```
@@ -435,8 +438,7 @@ async function signedRequest(method, path, payload) {
 }
 ```
 
-The legacy `POST /notify` also accepts `v1=` signatures (`METHOD\npath\ntimestamp\nnonce`,
-no body digest) until the cutover release removes that route. Every other route needs `v2=`.
+Every route requires `v2=` signatures with the body digest.
 
 ### Keys and scopes
 
@@ -454,7 +456,7 @@ string is skipped with a boot warning naming its key id; any other malformed ent
 
 | Scope | Routes |
 |---|---|
-| `notify:send` | `POST /v1/notify`, `POST /notify` |
+| `notify:send` | `POST /v1/notify` |
 | `templates:admin` | `/v1/admin/templates*`, `/v1/admin/policies*`, `GET /v1/admin/export`, `POST /failed/retry` |
 | any authenticated | `GET /providers`, `GET /providers/:name`, `GET /metrics/queue` |
 
@@ -477,7 +479,9 @@ caller; the role grant adds the audience, so no client definition changes. A bad
 - The admin key-id environment list is removed. Grant admin access through `scopes` in the secrets file instead.
 - Audit `source` and admin `created_by`/`published_by` are now `hmac:<keyId>` or
   `bearer:<id>`. Rows written earlier keep the bare key id.
-- Admin and v1 routes require `v2=` signatures with the body digest.
+- Every route requires `v2=` signatures with the body digest.
+- Send through `POST /v1/notify`, by `event_type` or `template_key`. `GET /providers`
+  returns `{name, vendor, renders}` per channel.
 
 ## Send API v1
 
@@ -518,7 +522,7 @@ keys return `400`.
 | `priority` | `urgent`, `normal` (default) or `bulk` |
 | `idempotency_key` | 1-128 chars. A repeat returns `200` with the original response |
 | `deadline` | ISO-8601 with offset, in the future, at most 24 h ahead |
-| `cc`, `reply_to`, `attachments` | Email only. `attachments` items are `{filename, contentType, data}` (base64), with the `/notify` limits |
+| `cc`, `reply_to`, `attachments` | Email only. `attachments` items are `{filename, contentType, data}` (base64); see [Email attachments](#email-attachments) |
 | `correlation_id` | Optional, trimmed, at most 128 chars. Wins over the `x-correlation-id` header; blank falls back to the header, then the event id |
 
 | Status | Meaning |
@@ -541,283 +545,151 @@ Urgent sends and sends using a template with a `sensitive` variable are redacted
 are stored, and they are never dead-lettered. See `CLAUDE.md` (Send API v1) for planning, fallthrough,
 deadline and idempotency rules.
 
-## Queue A Notification
+### Email attachments
 
-```text
-POST /notify
-```
-
-Request body:
+Email deliveries accept an optional top-level `attachments` array:
 
 ```json
 {
+  "template_key": "complaint_received",
   "channel": "email",
-  "template_id": "basic_email",
-  "to": "user@example.com",
-  "priority": "realtime",
-  "variables": {
-    "fromName": "Notification Service",
-    "fromEmail": "no-reply@example.com",
-    "subject": "Welcome",
-    "html": "<h1>Hello</h1>",
-    "replyTo": "support@example.com"
-  },
-  "dedupe_id": "optional-client-id"
-}
-```
-
-Fields:
-
-- `channel`: provider name, such as `email`, `sms`, or `whatsapp`.
-- `template_id`: a public template key from the provider metadata, or — for
-  providers that accept raw provider-side ids (SMS; see "SMS Templates &
-  Variables" below) — a provider template id passed through verbatim.
-- `to`: recipient address or phone number.
-- `priority`: optional, either `realtime` or `other`; defaults to `other`.
-- `variables`: provider-specific variables validated by that provider schema.
-- `dedupe_id`: optional dedupe key, and the recommended one. Supplying it means
-  "send this message once": it is used verbatim, with a **1 hour** window, and a
-  suppressed repeat answers `200` with `reason: duplicate`. Without it the service
-  falls back to `channel:to:template_id:<sha256 of the rendered payload>` with a
-  **5 second** window, and a suppressed repeat answers `409`. The hash covers
-  `variables`, so the fallback only ever collapses a byte-identical resend — it
-  used to key on `channel:to:template_id` alone, which for a generic template such
-  as `basic_email` meant one email per recipient per window regardless of content.
-
-Response:
-
-```json
-{
-  "job_id": "uuid",
-  "enqueued": true
-}
-```
-
-### Email Attachments
-
-`channel=email` accepts an optional `variables.attachments` array:
-
-```json
-{
-  "variables": {
-    "fromName": "Signals Support",
-    "fromEmail": "no-reply@example.com",
-    "subject": "Complaint from Asha",
-    "html": "<p>details</p>",
-    "attachments": [
-      { "filename": "evidence.png", "contentType": "image/png", "data": "<base64>" }
-    ]
-  }
+  "to": { "email": "support@example.com" },
+  "variables": { "name": "Asha" },
+  "attachments": [
+    { "filename": "evidence.png", "contentType": "image/png", "data": "<base64>" }
+  ]
 }
 ```
 
 `data` is base64 with no `data:` prefix. Two limits apply, both env-configurable:
-`NOTIFY_ATTACHMENT_MAX_FILES` (default 3) and
-`NOTIFY_ATTACHMENT_MAX_TOTAL_BYTES` (default 5 MB, decoded). Over either bound
-the request is rejected with a 400 rather than enqueued. The HTTP `bodyLimit` on
-**this route only** (every other route keeps Fastify's 1 MB default) is derived
-from the byte budget (base64 inflates payloads by 4/3, plus envelope
-headroom), so raising the cap does not need a second config change;
-`NOTIFY_BODY_LIMIT_BYTES` overrides it if you need to.
+`NOTIFY_ATTACHMENT_MAX_FILES` (default 3) and `NOTIFY_ATTACHMENT_MAX_TOTAL_BYTES`
+(default 5 MB, decoded). A request within both limits is accepted; one over either
+is answered `400` and nothing is queued. The HTTP `bodyLimit` on `/v1/notify` (every
+other route keeps Fastify's 1 MB default) is derived from the byte budget (base64
+inflates payloads by 4/3, plus envelope headroom), so raising the cap needs no
+second config change; `NOTIFY_BODY_LIMIT_BYTES` overrides it if you need to.
 
 Operational notes:
 
-- The relay does **not** restrict content types — that is the calling product's
-  policy. It enforces only count and size, which are its own resource limits.
-- **This is an outbound-content capability, not just a size change.** Any caller
-  holding a valid internal key can now emit arbitrary file bytes from the
-  organisation's sending identity (SES domain or Gmail account), under whatever
-  filename it chooses. Nothing here inspects those bytes. Two consequences worth
-  planning for: a caller's own type policy is the only filter, so treat internal
-  keys as capable of sending attachments on the org's behalf; and recipient
-  mailboxes must have attachment scanning enabled, since a mislabelled file
-  reaches them intact.
-- An attachment-bearing job is JSON-serialised into the Redis queue like any
-  other, so a 5 MB attachment occupies roughly 6.7 MB of Redis (base64) from
-  enqueue until delivery — and stays there in the retry ZSET or DLQ if delivery
-  keeps failing. Size Redis accordingly if attachment traffic is expected to be
-  heavy.
-- `MAIL_LOG=true` logs attachment filenames, content types and encoded sizes,
-  never the content itself.
-- Transport ceilings still apply on top of these limits: SES caps a message at
-  10 MB **after** base64 inflation, so ~7 MB of original file is the practical
-  maximum regardless of configuration.
+- The service enforces count and size, which are its own resource limits. Content-type
+  policy belongs to the calling product.
+- A credential with `notify:send` can attach files to mail sent from the organisation's
+  sending identity. Grant `notify:send` accordingly, and keep attachment scanning enabled
+  on recipient mailboxes.
+- An attachment-bearing job is JSON-serialised into the Redis queue like any other, so a
+  5 MB attachment occupies roughly 6.7 MB of Redis (base64) until delivery, including
+  time spent in the retry set or DLQ. Size Redis for the attachment traffic you expect.
+- `MAIL_LOG=true` logs attachment filenames, content types and encoded sizes, never the
+  content itself.
+- Transport ceilings apply on top of these limits: SES caps a message at 10 MB **after**
+  base64 inflation, so about 7 MB of original file is the practical maximum.
 
-If the request is a duplicate inside the dedupe window, **nothing is sent** — and
-the two cases are answered differently, because only one of them is intentional:
+### Idempotency and duplicates
 
-```text
-POST /notify  with dedupe_id  ->  200  {"job_id":"uuid","enqueued":false,"reason":"duplicate"}
-POST /notify  without         ->  409  {"job_id":"uuid","enqueued":false,"reason":"duplicate-fallback"}
-```
+Send an `idempotency_key` to make a send safe to retry. The first request is processed;
+a repeat returns `200` with the original response, and a repeat while the first is still
+in flight is `409 {"error":"idempotency_in_progress"}`. Urgent keys are held for
+15 minutes; normal and bulk keys for 90 days.
 
-The caller asked for suppression in the first case, so it is not an error. In the
-second nobody did, so it is a dropped message and the status code says so — a
-client that checks only `res.ok` would otherwise read it as a delivery. Either way
-the service logs a warning carrying the dedupe key.
+Without a key, a byte-identical request repeated within 5 seconds is answered
+`409 {"error":"duplicate-fallback"}` and nothing is sent. Use an `idempotency_key` for
+deliberate retries.
 
 ## Provider Discovery
 
-List all providers:
-
 ```text
 GET /providers
+GET /providers/:name     # email, sms or whatsapp
 ```
 
-This route requires authentication (any scope).
-
-Find one provider by name:
-
-```text
-GET /providers/email
-GET /providers/sms
-GET /providers/whatsapp
-```
-
-These routes require authentication (any scope).
-
-Provider responses include:
-
-- `name`: provider channel name used in `/notify`.
-- `templates`: public template keys mapped to provider template identifiers.
-- `template_payloads`: complete `/notify` payload examples per template.
-- `variables_schema`: JSON Schema for the `variables` object.
-- `notify_payload`: generic complete `/notify` payload shape for the provider.
-
-Example shape:
+Both routes require authentication (any scope). Each entry names the channel, the vendor
+configured for it in this deployment, and who renders the message text:
 
 ```json
-{
-  "name": "sms",
-  "templates": {
-    "login_otp": "6896c26d6eb66c66340e1242"
-  },
-  "template_payloads": [
-    {
-      "template_id": "login_otp",
-      "provider_template_id": "6896c26d6eb66c66340e1242",
-      "payload": {
-        "channel": "sms",
-        "template_id": "login_otp",
-        "to": "+918888888888",
-        "priority": "other",
-        "variables": {
-          "message": "string"
-        }
-      }
-    }
-  ],
-  "variables_schema": {
-    "type": "object"
-  },
-  "notify_payload": {
-    "channel": "sms",
-    "template_id": "<template_id>",
-    "to": "+918888888888",
-    "priority": "other",
-    "variables": {
-      "message": "string"
-    }
-  }
-}
+[
+  { "name": "email", "vendor": "smtp", "renders": "ns" },
+  { "name": "sms", "vendor": "msg91", "renders": "provider" },
+  { "name": "whatsapp", "vendor": "twilio", "renders": "provider" }
+]
 ```
+
+- `renders: "ns"` — the service renders the stored template body (email, Pinnacle SMS).
+- `renders: "provider"` — the service sends the template's `provider_template_id` with the
+  validated variables, and the vendor renders its registered template (MSG91 Flow, Twilio
+  Content).
+
+`GET /providers/sms` returns the single `sms` entry; an unknown name is `404`.
 
 ## Request Examples
 
-Email:
+Email, by template:
 
 ```json
 {
+  "template_key": "welcome",
   "channel": "email",
-  "template_id": "basic_email",
-  "to": "user@example.com",
-  "priority": "realtime",
-  "variables": {
-    "fromName": "Notification Service",
-    "fromEmail": "no-reply@example.com",
-    "subject": "Welcome",
-    "html": "<h1>Hello</h1>",
-    "replyTo": "support@example.com"
-  }
+  "to": { "email": "user@example.com" },
+  "variables": { "name": "Asha" },
+  "reply_to": "support@example.com"
 }
 ```
 
-SMS:
+SMS OTP, by event (the published policy picks the channel):
 
 ```json
 {
-  "channel": "sms",
-  "template_id": "login_otp",
-  "to": "+918888888888",
-  "variables": {
-    "message": "Your OTP is 987654"
-  }
+  "event_type": "login_otp",
+  "to": { "phone": "+918888888888" },
+  "variables": { "message": "987654" },
+  "priority": "urgent"
 }
 ```
 
-### SMS Templates & Variables
+WhatsApp, by template:
 
-**Two SMS vendors, selected per deployment by `SMS_PROVIDER`** — `msg91`
-(default) or `pinnacle` (#132). One is picked at boot and an unknown name throws
-rather than falling back, because sending through the wrong vendor would use the
-wrong sender id and DLT entity. Both declare `name: 'sms'`, so the channel key,
-the rate-limit key and every caller are identical either way.
+```json
+{
+  "template_key": "application_update",
+  "channel": "whatsapp",
+  "to": { "phone": "+918888888888" },
+  "variables": { "name": "Asha" }
+}
+```
 
-The two are not the same shape, and it changes what a `/notify` call must carry:
+Every template is a catalogue or admin-API template for the deployment's network; see
+[Admin API](#admin-api) and [Catalogue](#catalogue).
+
+### SMS vendors
+
+**One SMS vendor per deployment, selected by `SMS_PROVIDER`**: `msg91` (default) or
+`pinnacle`. An unknown name fails the boot. Both register as channel `sms`, so callers
+are identical either way. Each SMS template names its vendor in `provider`, and a
+template is sent only by the vendor it names.
 
 | | MSG91 Flow | Pinnacle JSON |
 | --- | --- | --- |
-| What is sent | flow id + named variables | fully **rendered** message text |
-| Who renders the body | **MSG91**, from the DLT template | **nobody** — the text is supplied |
-| DLT metadata | hidden inside the flow | explicit `dltentityid` / `dlttempid` / `sender` |
-| `template_id` means | an MSG91-internal flow id | the **DLT template id itself** |
+| `renders` | `provider` | `ns` |
+| What is sent | the template's flow id (`provider_template_id`) + named variables | the rendered template body |
+| Who renders the body | MSG91, from the DLT template | this service, from the stored body |
+| DLT metadata | held in the flow | the template's DLT ids (`sender_id`, `dlt_entity_id`, …), falling back to `PINNACLE_*` env |
 | Errors | HTTP status | HTTP 200 with `code: EC1xxx` in the body |
 
-Because Pinnacle renders nothing, a provider definition also carries `bodies` —
-the same public keys as `templates`, mapped to their message text — and the
-worker resolves `provider.bodies[key] ?? job.body`. So a **named** template
-(`login_otp`) carries its own body and needs no caller change; the existing OTP
-callers were untouched by the Pinnacle work. A **raw pass-through** id has no
-entry, so under Pinnacle its body must come from the caller's optional `body`
-field on `/notify`. See `example.env` for the `PINNACLE_*` keys (three are
-required when `SMS_PROVIDER=pinnacle`, and a missing one fails the send
-permanently rather than retrying).
+- **MSG91.** Each variable is sent as an MSG91 recipient variable. A template whose only
+  variable is `message` sends it as MSG91's `##var##` placeholder. A variable named
+  `mobiles` never overrides the recipient phone.
+- **Pinnacle.** The stored body must be **byte-identical** to the DLT-approved text,
+  because the operator matches on it. `PINNACLE_API_KEY`, `PINNACLE_SENDER_ID` and
+  `PINNACLE_DLT_ENTITY_ID` are required when `SMS_PROVIDER=pinnacle`; see `example.env`.
 
-The rest of this section describes the MSG91 path, which is the default.
+**`login_otp` seeding.** At boot the SMS `login_otp` template is created for the current
+vendor from explicit configuration, unless one already exists for that vendor:
 
-SMS is delivered through the MSG91 Flow API and accepts **raw provider-side
-template ids** (#86/#532/#535). Two ways to pass `template_id`:
+- msg91: `SMS_LOGIN_OTP_TEMPLATE_ID` (the flow id).
+- pinnacle: `PINNACLE_LOGIN_OTP_TEMPLATE_ID` (the DLT template id) with the body
+  `SMS_LOGIN_OTP_BODY`. Without a body the template is created as a draft.
 
-- **Named template** — `login_otp` is the one key in the SMS provider metadata. Its
-  MSG91 flow id comes from `SMS_LOGIN_OTP_TEMPLATE_ID` (a built-in default applies
-  if unset), so it is deployment-specific per MSG91 account. The template registry's boot
-  seed only uses an explicitly set `SMS_LOGIN_OTP_TEMPLATE_ID`, never the built-in default.
-- **Raw DLT flow id** — any other `template_id` is passed through verbatim to MSG91
-  (the SMS provider sets `allowRawTemplateId`). Signalstack sends its per-event
-  DLT-approved flow ids directly this way; they need no entry in the templates map.
-
-`variables` is an open map of named string values
-(`z.record(z.string(), z.string())`) — the DLT template's placeholders. Each key is
-spread as an MSG91 recipient variable, so a multi-variable flow is sent as, e.g.,
-`{ "name": "Asha", "link": "https://…" }`. Two rules:
-
-- **Legacy back-compat:** a lone `{ "message": "…" }` is mapped to MSG91's `##var##`
-  placeholder, so existing single-variable OTP callers are byte-for-byte unchanged.
-- A caller variable named `mobiles` can never override the resolved recipient phone.
-
-WhatsApp:
-
-```json
-{
-  "channel": "whatsapp",
-  "template_id": "dialflow",
-  "to": "+918888888888",
-  "variables": {
-    "contentSid": null,
-    "contentVariables": {}
-  }
-}
-```
+With no id configured, nothing is seeded. Set the id before the first boot with a
+catalogue (`NS_SEED_FILE`), so the catalogue's OTP policies can publish.
 
 ## Queue Metrics
 
@@ -964,32 +836,27 @@ export { pushProvider } from './push';
 Implement the provider:
 
 ```ts
-import { z } from 'zod';
 import { ProviderDefinition } from '../../../types/provider';
 
 export const pushProvider: ProviderDefinition = {
-  name: 'push',
+  name: 'push',          // the channel name callers use
 
   // The vendor behind this channel, and who renders templates: 'ns' renders the
   // stored body here, 'provider' sends a template id plus variables.
   vendor: 'fcm',
   renders: 'provider',
 
-  templates: {
-    welcome: 'PUSH_TEMPLATE_1',
-  },
-
-  schema: z.object({
-    title: z.string(),
-    message: z.string(),
-  }),
-
-  async send({ to, template_id, variables }) {
-    console.log(to, template_id, variables);
+  // Sends content the service already rendered and validated at accept time.
+  // With renders: 'provider', `providerTemplateId` names the vendor's template.
+  async sendRendered({ to, rendered, providerTemplateId }) {
+    console.log(to, rendered, providerTemplateId);
     return { ok: true };
   },
 };
 ```
 
 Provider folders are auto-loaded by `src/lib/providers/index.ts`. The provider
-name becomes the `channel` value for `/notify`.
+`name` becomes a `channel` value for `/v1/notify`, and templates for the channel
+name `vendor` in their `provider` field. Return `retryable: false` for a failure
+that a retry cannot fix (an unknown template id, for example), so the job is
+dead-lettered on its first attempt.

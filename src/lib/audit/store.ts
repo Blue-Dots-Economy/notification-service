@@ -13,8 +13,8 @@ export interface AuditIds {
   correlationId: string;
   /**
    * Persist variable NAMES only, never values, and keep no job copy. Fixed at
-   * /notify from the ORIGINAL priority (true for realtime) and carried on the
-   * job, so a DLQ replay under another priority still never persists an OTP.
+   * /v1/notify (true for an urgent send or a sensitive variable) and carried on
+   * the job, so a DLQ replay under another priority still never persists an OTP.
    * Optional only for jobs queued before the flag existed.
    */
   redactValues?: boolean;
@@ -35,7 +35,7 @@ export interface AuditIds {
   contentRefs?: Record<string, ContentRef[]>;
   /**
    * Send API v1 event sends: the request's `event_type`. Absent for
-   * `template_key` sends and legacy /notify. Carried on the job so every
+   * `template_key` sends. Carried on the job so every
    * writer of the event row (the accepted insert, the worker's upsert that may
    * land first, a recovered job) records the same identity.
    */
@@ -58,7 +58,7 @@ export interface AcceptedRecord {
    * delivery_attempt.template_id) and need not be one.
    */
   templateKey: string | null;
-  /** notification_event.event_type: null for template_key and legacy sends. */
+  /** notification_event.event_type: null for template_key sends. */
   eventType: string | null;
   /** notification_event.domain: the recipient domain as sent; null when absent. */
   domain: string | null;
