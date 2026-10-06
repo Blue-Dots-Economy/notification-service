@@ -183,7 +183,15 @@ move rows out of a default partition, and a row in the default for a future rang
 `run_maintenance` skip that partition set. Each tick therefore runs
 `partman.check_default(p_exact_count := false)`, logs a warning and sets
 `ns_partition_default_rows{parent}` (1 = non-empty); move the rows with
-`partman.partition_data_proc`. There is no retention until #65, so nothing is dropped today.
+`partman.partition_data_proc`.
+
+**Retention: 90 days** (`drizzle/0005_audit_retention_90d.sql`). `notification_event` and
+`delivery_attempt` are set to `retention = '90 days'` in `partman.part_config`, so the same
+maintenance run drops a monthly partition once its whole month is older than 90 days. A row lives
+at least 90 days and at most about 121 (the month it was written in, plus 90 days). Partitions are
+dropped, not detached, so the data is gone. Rows in a default partition are not covered (see
+`check_default` above). The `idempotency_key` table is pruned separately after 90 days. Tier-2
+rollups and erasure tooling remain #65.
 
 ### Authentication
 
@@ -714,7 +722,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 711 unit tests across 51 files, plus 119 integration tests across 15 files. The unit suite runs in about a second because Redis
+vitest 4, 711 unit tests across 51 files, plus 121 integration tests across 15 files. The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
