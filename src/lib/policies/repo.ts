@@ -152,3 +152,13 @@ export async function resolvePolicy(domain: string | undefined, eventType: strin
   if (rows.length === 0) return null;
   return rows.sort((a, b) => rank(a) - rank(b))[0]!;
 }
+
+/** Whether any policy row (any status) exists for this scope in the current network. */
+export async function policyRowExists(domain: string | null, eventType: string | null): Promise<boolean> {
+  const rows = await getDb()
+    .select({ id: notificationPolicy.id })
+    .from(notificationPolicy)
+    .where(and(eq(notificationPolicy.network, currentNetwork()), scopeEq(notificationPolicy.domain, domain), scopeEq(notificationPolicy.eventType, eventType)))
+    .limit(1);
+  return rows.length > 0;
+}

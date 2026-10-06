@@ -224,3 +224,21 @@ export async function hasActiveTemplate(channel: string, templateKey: string): P
     .limit(1);
   return rows.length > 0;
 }
+
+/** Whether any row (any status) exists for this key, locale and vendor in the current network. */
+export async function templateRowExists(channel: string, templateKey: string, locale: string, provider: string): Promise<boolean> {
+  const rows = await getDb()
+    .select({ id: template.id })
+    .from(template)
+    .where(
+      and(
+        eq(template.network, currentNetwork()),
+        eq(template.channel, channel),
+        eq(template.templateKey, templateKey),
+        eq(template.locale, locale),
+        eq(template.provider, provider),
+      ),
+    )
+    .limit(1);
+  return rows.length > 0;
+}
