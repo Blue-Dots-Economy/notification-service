@@ -173,6 +173,48 @@ describe('planSend', () => {
   });
 });
 
+describe('planSend — event variables span every policy template', () => {
+  const guardianEmail = tpl({ channel: 'email', templateKey: 'guardian.account', provider: 'smtp', providerTemplateId: null, subject: 'S', bodyHtml: '<p>{{message}} {{parentName}}</p>', variables: [v('message'), v('parentName')] });
+  const loginOtp = tpl({ channel: 'sms', templateKey: 'login_otp', variables: [v('message')] });
+  const phoneOnly = { phone: '+919999999999' };
+  const setup = (emailResolves = true) => {
+    policies.resolvePolicy.mockResolvedValue({ mode: 'first_available', channels: [{ channel: 'email', template_key: 'guardian.account' }, { channel: 'sms', template_key: 'login_otp' }] });
+    templates.resolveTemplate.mockImplementation(async (channel: string) => {
+      if (channel === 'email') {
+        if (!emailResolves) throw new TemplateError('not_found', 'no active email template');
+        return { template: guardianEmail, renders: 'ns' };
+      }
+      return { template: loginOtp, renders: 'provider' };
+    });
+  };
+
+  it('phone-only event accepts email-only variables', async () => {
+    setup();
+    const plan = await planSend(req({ event_type: 'guardian.otp.account', to: phoneOnly, variables: { message: '123456', parentName: 'P' } }));
+    expect(plan.deliveries).toHaveLength(1);
+    expect(plan.deliveries[0]!.channel).toBe('sms');
+    expect(plan.deliveries[0]!.rendered).toMatchObject({ mode: 'provider', variables: { message: '123456' } });
+    expect(Object.keys((plan.deliveries[0]!.rendered as { variables: object }).variables)).toEqual(['message']);
+  });
+
+  it('a variable no policy template declares is still unknown_variable', async () => {
+    setup();
+    const e = await planSend(req({ event_type: 'guardian.otp.account', to: phoneOnly, variables: { message: '1', bogus: 'x' } })).catch((x) => x);
+    expect(e).toMatchObject({ code: 'unknown_variable', message: 'unknown variables: bogus' });
+  });
+
+  it('a template that fails to resolve does not widen the union', async () => {
+    setup(false);
+    expect(await codeOf(planSend(req({ event_type: 'guardian.otp.account', to: phoneOnly, variables: { message: '1', parentName: 'P' } })))).toBe('unknown_variable');
+  });
+
+  it('each policy template is resolved once', async () => {
+    setup();
+    await planSend(req({ event_type: 'guardian.otp.account', to: phoneOnly, variables: { message: '1' } }));
+    expect(templates.resolveTemplate).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe('planSend — content_ref variables', () => {
   const tncV = v('tnc_url', { type: 'url', source: 'content_ref', contentKey: 'tnc.in_force.url', urlHosts: ['example.org'] });
   const tncSms = tpl({ channel: 'sms', templateKey: 'tnc_sms', variables: [v('name'), tncV] });
