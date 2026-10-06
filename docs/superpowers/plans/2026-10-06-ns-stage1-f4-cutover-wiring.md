@@ -883,3 +883,10 @@ Each cluster's values live in bluedots-infra-deployments, which is private and p
 
 - **Plan G:** per-cluster flip of Keycloak SMS and email OTP to `http`.
 - **Plan F3:** the email `login_otp` template in the catalogues, which A4's `otpEmailProvider: http` depends on.
+
+---
+
+## User decisions (2026-10-06)
+
+- **A0:** rebase the automation NS stack (#260 → #261 → #262 → #263) onto `main` and force-push each branch. The user approved this. The new F4 branch is cut from the rebased `feat/ns-content-resolver`.
+- **up-sdm From name:** `EMAIL_FROM_NAME` is `UP SDM` on up-sdm-blue-dots-prod. This overrides that cluster's `_smtp_from_display` ("Aggregator") for NS email only. It is set in the cluster values as a runbook step.
