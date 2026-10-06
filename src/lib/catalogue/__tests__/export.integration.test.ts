@@ -1,14 +1,11 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-type Def = { name: string; vendor: string; renders: 'ns' | 'provider'; templates: Record<string, string>; bodies?: Record<string, string> };
-const msg91: Def = { name: 'sms', vendor: 'msg91', renders: 'provider', templates: { login_otp: 'flow-otp' } };
 vi.mock('../../providers', () => ({
   providers: {
     sms: { name: 'sms', vendor: 'msg91', renders: 'provider', templates: { login_otp: 'flow-otp' } },
     email: { name: 'email', vendor: 'smtp', renders: 'ns', templates: {} },
   },
 }));
-void msg91;
 
 import { closeDb, getPool } from '../../db/client';
 import { runMigrations } from '../../db/migrate';
@@ -51,10 +48,15 @@ describe('exportCatalogue', () => {
     expect(out.policies).toEqual([
       { domain: 'seeker', event_type: 'item.paused', mode: 'first_available', channels: [{ channel: 'email', template_key: 'item.paused' }] },
     ]);
-    const text = JSON.stringify(out);
-    for (const k of ['"id"', 'created_at', 'updated_at', 'created_by', 'published_at', '"version":"v', '"network"', 'status']) {
-      expect(text).not.toContain(k);
-    }
+    // Catalogue fields only: no ids, versions, actors, timestamps, network or status.
+    const templateFields = new Set([
+      'channel', 'template_key', 'locale', 'provider', 'subject', 'body_html', 'body_text', 'variables',
+      'provider_template_id', 'sender_id', 'dlt_entity_id', 'dlt_header_id', 'dlt_tag_id', 'approval_ref', 'default_deadline_s',
+    ]);
+    const policyFields = new Set(['domain', 'event_type', 'mode', 'channels']);
+    expect(Object.keys(out).sort()).toEqual(['policies', 'templates', 'version']);
+    for (const t of out.templates) for (const k of Object.keys(t)) expect(templateFields.has(k), k).toBe(true);
+    for (const p of out.policies) for (const k of Object.keys(p)) expect(policyFields.has(k), k).toBe(true);
   });
 
   it('round-trips: seeding an empty network from an export reproduces the export', async () => {

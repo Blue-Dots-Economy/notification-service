@@ -1,10 +1,20 @@
 import { listPolicies } from '../policies/repo';
 import { listTemplates } from '../templates/repo';
+import { TemplateError } from '../templates/errors';
 import { channelVendor } from '../templates/vendors';
 import { CatalogueSchema, type Catalogue } from './schema';
 
 const strip = <T extends Record<string, unknown>>(o: T) =>
   Object.fromEntries(Object.entries(o).filter(([, v]) => v !== null && v !== undefined)) as Partial<T>;
+
+/** Code-point order, field by field: stable across locales and runtimes. */
+function compareKeys(a: readonly string[], b: readonly string[]): number {
+  for (let i = 0; i < a.length; i++) {
+    if (a[i]! < b[i]!) return -1;
+    if (a[i]! > b[i]!) return 1;
+  }
+  return 0;
+}
 
 /** Active templates (current vendors only) and policies, as a seedable catalogue. */
 export async function exportCatalogue(version: string): Promise<Catalogue> {
@@ -17,10 +27,16 @@ export async function exportCatalogue(version: string): Promise<Catalogue> {
       dlt_header_id: t.dltHeaderId, dlt_tag_id: t.dltTagId, approval_ref: t.approvalRef,
       default_deadline_s: t.defaultDeadlineS,
     }))
-    .sort((a, b) => `${a.channel}\u0000${a.template_key}\u0000${a.locale}`.localeCompare(`${b.channel}\u0000${b.template_key}\u0000${b.locale}`));
+    .sort((a, b) => compareKeys([a.channel!, a.template_key!, a.locale ?? ''], [b.channel!, b.template_key!, b.locale ?? '']));
   const policies = (await listPolicies({ status: 'active' }))
     .map((p) => ({ domain: p.domain, event_type: p.eventType, mode: p.mode, channels: p.channels }))
-    .sort((a, b) => `${a.domain ?? ''}\u0000${a.event_type ?? ''}`.localeCompare(`${b.domain ?? ''}\u0000${b.event_type ?? ''}`));
-  // Parse so a store that somehow holds an invalid row fails here, not at the next seed.
-  return CatalogueSchema.parse({ version, templates, policies });
+    .sort((a, b) => compareKeys([a.domain ?? '', a.event_type ?? ''], [b.domain ?? '', b.event_type ?? '']));
+  // Parse so a store that does not fit the catalogue format (e.g. more than 500
+  // active rows) fails here, not at the next seed. The error names paths only.
+  const parsed = CatalogueSchema.safeParse({ version, templates, policies });
+  if (!parsed.success) {
+    const where = [...new Set(parsed.error.issues.map((i) => i.path.join('.') || '(root)'))].join(', ');
+    throw new TemplateError('export_invalid', `export does not fit the catalogue format at: ${where}`);
+  }
+  return parsed.data;
 }

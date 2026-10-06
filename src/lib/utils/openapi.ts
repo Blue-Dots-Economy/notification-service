@@ -108,7 +108,7 @@ const adminSchemas = {
       templates: {
         type: 'array',
         maxItems: 500,
-        items: { type: 'object', additionalProperties: true, description: 'Template create body plus an optional provider' },
+        items: { $ref: '#/components/schemas/TemplateEntry' },
       },
       policies: { type: 'array', maxItems: 500, items: { $ref: '#/components/schemas/PolicyCreate' } },
     },
@@ -209,6 +209,19 @@ const adminSchemas = {
     },
   },
   TemplatePatch: { type: 'object', additionalProperties: false, properties: templatePatchProperties },
+  TemplateEntry: {
+    type: 'object',
+    description: 'A catalogue template: the template create body plus `provider`. Only email entries may omit `provider`; SMS and WhatsApp entries name the vendor they are for.',
+    required: ['channel', 'template_key'],
+    additionalProperties: false,
+    properties: {
+      channel: { type: 'string', minLength: 1, maxLength: 32, example: 'sms' },
+      template_key: { type: 'string', pattern: '^[a-z0-9_.-]+$', maxLength: 128, example: 'welcome' },
+      locale: { type: 'string', pattern: '^[a-z]{2,3}(-[A-Z]{2})?$', description: 'Defaults to NS_DEFAULT_LOCALE.' },
+      provider: { type: 'string', minLength: 1, maxLength: 32, example: 'msg91', description: 'Required unless channel is email.' },
+      ...templatePatchProperties,
+    },
+  },
   Policy: {
     type: 'object',
     properties: {
@@ -386,7 +399,7 @@ const adminExportPath = {
   '/v1/admin/export': {
     get: adminOp(
       'Export the active catalogue',
-      'Active templates (for the deployment\'s current vendors) and policies of NS_NETWORK, in the catalogue format that NS_SEED_FILE reads. Carries no ids, versions, actors or timestamps; output is sorted so two exports of one store are identical.',
+      'Active templates (for the deployment\'s current vendors) and policies of NS_NETWORK, in the catalogue format that NS_SEED_FILE reads. Carries no ids, versions, actors or timestamps; output is sorted so two exports of one store are identical apart from `version` (the export timestamp).',
       {
         responses: {
           '200': {
@@ -395,6 +408,7 @@ const adminExportPath = {
           },
           '401': adminErrors['401'],
           '403': adminErrors['403'],
+          '422': errorBody('export_invalid: the active rows do not fit the catalogue format (e.g. more than 500 templates); the message names paths only'),
           '503': adminErrors['503'],
         },
       }
