@@ -99,6 +99,20 @@ const policyChannels = {
 };
 
 const adminSchemas = {
+  Catalogue: {
+    type: 'object',
+    required: ['version', 'templates', 'policies'],
+    additionalProperties: false,
+    properties: {
+      version: { type: 'string', pattern: '^[A-Za-z0-9._-]{1,64}$' },
+      templates: {
+        type: 'array',
+        maxItems: 500,
+        items: { type: 'object', additionalProperties: true, description: 'Template create body plus an optional provider' },
+      },
+      policies: { type: 'array', maxItems: 500, items: { $ref: '#/components/schemas/PolicyCreate' } },
+    },
+  },
   SendAccepted: {
     type: 'object',
     required: ['notification_event_id', 'correlation_id', 'status', 'mode', 'deliveries'],
@@ -368,6 +382,26 @@ const adminPaths = {
   },
 };
 
+const adminExportPath = {
+  '/v1/admin/export': {
+    get: adminOp(
+      'Export the active catalogue',
+      'Active templates (for the deployment\'s current vendors) and policies of NS_NETWORK, in the catalogue format that NS_SEED_FILE reads. Carries no ids, versions, actors or timestamps; output is sorted so two exports of one store are identical.',
+      {
+        responses: {
+          '200': {
+            description: 'Catalogue',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Catalogue' } } },
+          },
+          '401': adminErrors['401'],
+          '403': adminErrors['403'],
+          '503': adminErrors['503'],
+        },
+      }
+    ),
+  },
+};
+
 export function openApiDocument() {
   const providerExamples = Object.fromEntries(
     Object.values(providers).map((provider) => [
@@ -389,6 +423,7 @@ export function openApiDocument() {
     },
     paths: {
       ...adminPaths,
+      ...adminExportPath,
       '/v1/notify': {
         post: {
           summary: 'Send a notification (Send API v1)',

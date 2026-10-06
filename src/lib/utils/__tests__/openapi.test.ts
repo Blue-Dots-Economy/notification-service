@@ -13,6 +13,7 @@ describe('openApiDocument', () => {
       '/v1/admin/templates', '/v1/admin/templates/{id}', '/v1/admin/templates/{id}/publish',
       '/v1/admin/templates/{id}/retire', '/v1/admin/templates/{id}/preview',
       '/v1/admin/policies', '/v1/admin/policies/{id}', '/v1/admin/policies/{id}/publish', '/v1/admin/policies/{id}/retire',
+      '/v1/admin/export',
     ]) {
       expect(doc.paths[path], path).toBeDefined();
       for (const op of Object.values(doc.paths[path]!)) {
@@ -21,6 +22,13 @@ describe('openApiDocument', () => {
         expect(op.responses['403'], path).toBeDefined();
       }
     }
+  });
+
+  it('documents GET /v1/admin/export with admin security and 200/401/403/503', () => {
+    const doc = openApiDocument() as { paths: Record<string, Record<string, { security?: unknown[]; responses: Record<string, unknown> }>> };
+    const op = doc.paths['/v1/admin/export']!.get!;
+    expect(op.security).toEqual(ADMIN_SECURITY);
+    for (const code of ['200', '401', '403', '503']) expect(op.responses[code], code).toBeDefined();
   });
 
   it('declares the bearer and HMAC v2 security schemes, and no adminKey scheme', () => {

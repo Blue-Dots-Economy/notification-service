@@ -242,7 +242,7 @@ METHOD\npath\ntimestamp\nnonce\nsha256(body)
 | --- | --- |
 | `POST /v1/notify` | `notify:send` |
 | `POST /notify` (legacy; HMAC v1 or v2) | `notify:send` |
-| `/v1/admin/templates*`, `/v1/admin/policies*` | `templates:admin` |
+| `/v1/admin/templates*`, `/v1/admin/policies*`, `GET /v1/admin/export` | `templates:admin` |
 | `POST /failed/retry` | `templates:admin` |
 | `GET /providers`, `GET /providers/:name`, `GET /metrics/queue` | any authenticated principal |
 | `GET /metrics` | none |
@@ -459,6 +459,33 @@ edits, publishes or adds a row, it is `exists`. A publish failure logs `seeded_d
 current vendor's template is created and published, which retires the old vendor's active row. Replicas booting together
 serialise on a session advisory lock. Seeding is non-fatal (logged, never blocks listen) and is
 skipped when `NS_NETWORK` is unset; a template that fails publish validation is left as a draft and retried next boot.
+
+**Catalogue** (`src/lib/catalogue/`: `schema`, `seed`, `export`; route `src/routes/admin-export.ts`).
+A catalogue is one JSON file `{ version, templates: [...], policies: [...] }` (at most 1 MiB, 500
+templates, 500 policies). Its entries are exactly the admin create bodies, plus an optional
+`provider` on a template, so a catalogue holds only what the admin API accepts. `NS_SEED_FILE`
+names the file; unset, nothing is seeded. A missing, unreadable or invalid file is logged and
+skipped, and the boot always continues.
+- **Seed-if-absent (F1-1).** An entry is created only when no row of any status exists for its key:
+  a template by `(network, channel, template_key, locale, provider)`, a policy by `(network, domain,
+  event_type)`. Existing rows are never updated, retired or replaced, so admin edits survive every
+  restart; after seeding, changes go through the admin API.
+- **Boot only (F1-2).** Seeding runs once per boot, after `login_otp` env seeding, templates before
+  policies, under the `notification-service:seed` advisory lock. Replicas booting together
+  serialise, and the wait for the lock is bounded at about 2 minutes. A catalogue change reaches a
+  cluster at the next rollout.
+- **Providers.** A template entry naming a vendor other than the deployment's is skipped, so one
+  catalogue can carry msg91 and pinnacle variants of an SMS template. An entry without `provider`
+  is for the deployment's vendor.
+- **Drafts.** An entry that fails publish validation is left as a draft and logged by code, never
+  with values; a database error between create and publish logs `left as draft: db_error`. A draft
+  counts as existing on later boots, so an operator publishes it through the admin API (fix it with
+  `PATCH`, then `POST .../publish`).
+- **Export and round trip (F1-3).** `GET /v1/admin/export` (`templates:admin`) returns the active
+  templates (current vendors only) and active policies of `NS_NETWORK` as a catalogue with no ids,
+  versions, actors or timestamps. Output is sorted, so two exports of one store are byte-identical,
+  and `version` is the export timestamp. Seeding an empty network from an export reproduces the
+  export. Unset `NS_NETWORK` answers `503 network_not_configured`.
 
 ### Content resolver
 
@@ -766,7 +793,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 711 unit tests across 51 files, plus 121 integration tests across 15 files. The unit suite runs in about a second because Redis
+vitest 4, 735 unit tests across 55 files, plus 134 integration tests across 17 files. The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
