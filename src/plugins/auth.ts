@@ -9,8 +9,6 @@ import '../types/fastify-auth';
 export interface AuthOptions {
   /** Scope the route requires; 'any' accepts every authenticated principal. */
   scope: Scope | 'any';
-  /** Accept HMAC v1 (no body digest). Legacy POST /notify only, until the cutover release removes it. */
-  legacyHmacV1?: boolean;
 }
 
 const HMAC_HEADERS = ['x-ns-key', 'x-ns-timestamp', 'x-ns-nonce', 'x-ns-signature'] as const;
@@ -27,7 +25,7 @@ async function fromBearer(header: string): Promise<Outcome> {
   return res.ok ? { principal: res.principal } : { status: res.status, error: res.error };
 }
 
-async function fromHmac(req: FastifyRequest, opts: AuthOptions): Promise<Outcome> {
+async function fromHmac(req: FastifyRequest): Promise<Outcome> {
   const [keyId, ts, nonce, sig] = HMAC_HEADERS.map((h) => req.headers[h]);
   if (typeof keyId !== 'string' || typeof ts !== 'string' || typeof nonce !== 'string' || typeof sig !== 'string' || !keyId || !ts || !nonce || !sig) {
     return { status: 401, error: 'Missing auth headers' };
@@ -42,9 +40,8 @@ async function fromHmac(req: FastifyRequest, opts: AuthOptions): Promise<Outcome
 
   const parsed = parseSignature(sig);
   if (!parsed) return { status: 401, error: 'Invalid signature' };
-  if (parsed.version === 'v1' && !opts.legacyHmacV1) return { status: 401, error: 'Signature version not accepted' };
 
-  const canonical = canonicalString(parsed.version, req.method, req.url, ts, nonce, req.rawBody);
+  const canonical = canonicalString(req.method, req.url, ts, nonce, req.rawBody);
   if (!macMatches(key.secret, canonical, parsed.mac)) return { status: 401, error: 'Invalid signature' };
 
   // Nonce last: only a correctly signed request may claim one, so 'Replay
@@ -82,7 +79,7 @@ export function authenticate(opts: AuthOptions): preHandlerAsyncHookHandler {
       return reject(req, reply, 'both', 401, { error: 'Ambiguous credentials' });
     }
     const credential: Credential = authorization !== undefined ? 'bearer' : 'hmac';
-    const outcome = credential === 'bearer' ? await fromBearer(authorization!) : await fromHmac(req, opts);
+    const outcome = credential === 'bearer' ? await fromBearer(authorization!) : await fromHmac(req);
     if ('error' in outcome) return reject(req, reply, credential, outcome.status, { error: outcome.error });
 
     if (opts.scope !== 'any' && !outcome.principal.scopes.has(opts.scope)) {
