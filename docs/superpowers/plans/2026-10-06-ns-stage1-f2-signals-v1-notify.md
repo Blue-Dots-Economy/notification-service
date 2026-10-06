@@ -16,6 +16,8 @@
 - bluedots-schemas: JSON only.
 - Target API: notification-service `/v1/notify` (Plans C2, D, F1).
 
+**Tasks:** Task 0 is notification-service (F2-8); Tasks 1, 2, 4, 5, 6 are signals-dpg; Task 3 is bluedots-schemas.
+
 **Spec:** notification-service `docs/superpowers/specs/2026-06-26-event-platform-design.md` (rev 2026-10-04), §Stages item 9. Issue: Blue-Dots-Economy/signals-dpg#496.
 
 **Plan F context:**
@@ -300,11 +302,11 @@ Notes on the table:
 
   `escapeHtml('{{x}}')` returns `{{x}}` unchanged, so the generated HTML is the exact shell with NS tokens in place.
 - **The F2-2 replacements are done in the case inputs:**
-  - `otpBox` is the `renderOtpBox('{{otp}}')` output;
+  - `otpBox` is the `renderOtpBox('{{message}}')` output, and every `{{otp}}` token in guardian and `otp.generic` copy is renamed to `{{message}}` (F2-8);
   - `siteLink` is `renderSiteLink('{{siteUrl}}')`;
   - `orgList` is `{{orgList}}`;
   - `detailsTable` is a fixed-row table.
-- **Variable contract per template:** `text` tokens become `type: 'string'`; `ctaUrl` and `siteUrl` become `type: 'url'`; `otp` is `sensitive: true`. Every variable is `required: true`, except where the copy does not use it.
+- **Variable contract per template:** `text` tokens become `type: 'string'`; `ctaUrl` and `siteUrl` become `type: 'url'`; `message` (the OTP) is `sensitive: true`. The WhatsApp `welcome` template declares one string variable, `1`. Every variable is `required: true`, except where the copy does not use it.
 - **Subjects** keep `{{token}}` as they are. NS does not escape subjects, which matches today's `substitutePlain` followed by `oneLine`. The generator applies `oneLine` to the subject template.
 - **Policies** follow the event table:
   - one per (domain in `domains`, event);
@@ -424,14 +426,14 @@ Notes on the table:
 
 **Behaviour:**
 - **Guardian.**
-  - `send({ event_type: guardianEvent(kind), domain: null, to: contactType === 'phone' ? { phone } : { email }, variables: { otp, parentName, domain, org, teamName, …bulk: noun, orgList }, priority: 'urgent' })`.
+  - `send({ event_type: guardianEvent(kind), domain: null, to: contactType === 'phone' ? { phone } : { email }, variables: { message: otp, parentName, domain, org, teamName, …bulk: noun, orgList }, priority: 'urgent' })`.
   - `orgList` is the names joined as `A, B and C` (F2-2). `domain` stays the text variable it is today.
   - No idempotency key, as today.
   - `ok:false` or a transport error throws today's `GuardianOtpError('NO_OTP_PROVIDER')`, so the route still answers 503.
   - Test mode (`CREATE_TEST_OTP`) still skips the send.
   - The OTP is never logged.
 - **Welcome.**
-  - A single event: `send({ event_type: 'user.welcome', domain: signupDomain ?? null, to: { email?, phone? }, variables: { userName, appName, teamName, siteUrl, whatsappName: name }, priority: 'urgent' })`. Both contact points are included when present. The policy's `all` mode fans out to email and WhatsApp, replacing the two separate calls.
+  - A single event: `send({ event_type: 'user.welcome', domain: signupDomain ?? null, to: { email?, phone? }, variables: { userName, appName, teamName, siteUrl, '1': name }, priority: 'urgent' })`. Both contact points are included when present. The policy's `all` mode fans out to email and WhatsApp, replacing the two separate calls.
   - If `siteUrl` cannot be resolved (F2-2), skip the send when there is no phone. When there is a phone, drop `email` from `to` so WhatsApp still goes out.
   - Failures are logged and swallowed, as today.
 - **Support.**
@@ -442,7 +444,7 @@ Notes on the table:
 
 - [ ] **Step 1: Write the failing tests.** Rewrite `guardian_otp_dispatch`, `guardian_otp_send`, `welcome` and `submit_support` to assert:
   - the event payloads;
-  - "phone-only guardian contact → `to: {phone}`, urgent, OTP in variables only";
+  - "phone-only guardian contact → `to: {phone}`, urgent, OTP only in `variables.message`";
   - test mode skips the send;
   - `ok:false` → 503 `NO_OTP_PROVIDER`;
   - the welcome fan-out payload, and the no-siteUrl rule;
