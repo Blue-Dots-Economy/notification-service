@@ -34,7 +34,7 @@ Plan G (per-cluster OTP flip to `http`) is out of scope.
 - **Part A changes no NS source.** Legacy `/notify`, `legacyHmacV1`, the NS internal-secrets key `dpg-api-client` and the `signals_notification_secret` random password all stay through Part A.
 - **Part B is NS + automation only.** It merges after the Part B release gate (see Rollout runbook). It is never folded into Part A's PRs.
 - **Sender identity.** `EMAIL_FROM_ADDRESS` is the cluster's `smtp_user`, the value `NOTIFICATION_FROM_EMAIL` uses today. `EMAIL_FROM_NAME` is the cluster's `_smtp_from_display` anchor (F4-2).
-- **One catalogue per cluster.** The brand directory's `ns-catalogue.json` when one exists, else the network directory's. Read from bluedots-schemas at the ref `fetch-configs.sh` already uses for that cluster.
+- **One catalogue per cluster (ruling R3).** A cluster with a brand uses its brand directory's `ns-catalogue.json` only; a cluster without one uses the network directory's. There is no fallback: seeding keeps whichever copy reaches the first boot. Read from bluedots-schemas at the ref `fetch-configs.sh` already uses for that cluster.
 - **Seeding is absent-only.** A catalogue change seeds only missing rows. Edits to live copy go through the NS admin API (F1).
 - **`login_otp` precondition (F2 R15).** On every cluster, the SMS `login_otp` template is configured before the first NS boot with `NS_SEED_FILE`:
   - **msg91:** `SMS_LOGIN_OTP_TEMPLATE_ID`.
@@ -48,16 +48,16 @@ Plan G (per-cluster OTP flip to `http`) is out of scope.
   - Nothing is pushed without explicit approval, and every force-push needs its own approval.
 - **Branches.**
   - automation Part A: `feat/ns-cutover-wiring`, stacked on `feat/ns-content-resolver`.
-  - e2e Part A: `feat/ns-mailpit-journeys`, stacked on `feat/ns-service-auth`.
+  - e2e Part A: `feat/ns-mailpit-e2e`, stacked on `feat/ns-service-auth`.
   - NS Part B: `feat/ns-legacy-removal`, stacked on `feat/ns-event-variables`.
-  - automation Part B: `feat/ns-legacy-secrets-removal`, stacked on `feat/ns-cutover-wiring`.
+  - automation Part B: `feat/ns-legacy-key-removal`, stacked on `feat/ns-cutover-wiring`.
 
 ### Rulings made while writing this plan (review these)
 
 - **F4-1 — two releases.** This is the user's decision. Helm rolls pods one by one, so old Signals pods talk to new NS pods during an upgrade. Legacy `/notify` therefore lives one release longer, and the removal lands once every cluster runs new Signals.
 - **F4-2 — the From name is `_smtp_from_display`.** This is the user's decision. It is the name Keycloak's emails already show: "Blue Dots", "Purple Dots", "Orange Dots", and "Aggregator" on up-sdm. The From address is `smtp_user`.
 - **F4-3 — the catalogue rides `fetch-configs.sh`; the chart renders on file presence.**
-  - `fetch-configs.sh signals` fetches the brand catalogue, falling back to the network catalogue. It fails the deploy if neither exists.
+  - `fetch-configs.sh signals` fetches the brand catalogue for a branded cluster, or the network catalogue for an unbranded one (R3, no fallback). It fails the deploy if that file is missing or invalid, and it requires `jq`.
   - The chart's `.Files.Get` decides whether the ConfigMap, the mount and `NS_SEED_FILE` exist. That keeps CI's bare `helm template` rendering (it never fetches) while a real deploy cannot lose the catalogue silently.
 - **F4-4 — mount path `/app/seed`.** It is a directory mount, and `NS_SEED_FILE=/app/seed/ns-catalogue.json`. The path is distinct from `/app/config` (internal-secrets, read-only secret) and `/app/content` (content resolver).
 - **F4-5 — a checksum annotation rolls NS on a catalogue change.** Only absent rows are seeded. The `helm/CLAUDE.md` note says so, so nobody expects a catalogue edit to change live copy.
@@ -734,26 +734,35 @@ EMAIL_FROM_NAME: *smtp_from_display   # up-sdm: "UP SDM"
 | up-gzb-blue-dots-prod | `blue_dot/up-gzb/` | same |
 | up-sdm-blue-dots-prod | `blue_dot/upsdm/` | same; `EMAIL_FROM_NAME: "UP SDM"` as a literal (Keycloak keeps "Aggregator") |
 | Test-dev | `blue_dot/up-gzb/` | add `msg91_template_id` (or Pinnacle settings) and `sms_http_secret`; both are unset today. Its `notification-service` block also needs an email transport: `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_FROM` |
-| ALIMCO-TCS | `purple_dot/alimco/` | decrypt and confirm the vendor and `_brand: "alimco"` (a brand is required to fetch its catalogue); for Pinnacle, set `pinnacle_login_otp_template_id` and `sms_login_otp_body` |
+| ALIMCO-TCS | `purple_dot/alimco/` | decrypt and confirm the vendor and `_brand: "alimco"` (a brand is required to fetch its catalogue); for Pinnacle, set `pinnacle_login_otp_template_id` and `sms_login_otp_body`; confirm `keycloak.smsProvider` is not `http` (or pin `smsHttp.url` to the legacy path until the F3 jar ships) |
+
+**Every cluster, also:**
+- **Operator key.** The release generates an `ns-admin` HMAC key (scope `templates:admin`) per cluster (ruling R8). Note where its secret lands for the operators who run the verify and recovery steps below.
+- **Keycloak.** Confirm `keycloak.smsProvider` is not `http` and `otpEmailProvider` is unset or `smtp`. The chart's default NS URL is now `/v1/notify`, which only the F3 jar speaks.
+- **Test-dev From name.** Its `_smtp_from_display` is "blue Dots"; set `EMAIL_FROM_NAME: "Blue Dots"` as a literal.
 
 **Apply order:**
 1. Common-services / RDS bootstrap for NS Postgres (automation#260 checklist).
 2. The realm grant: `signals-api` gets the `notification-service` role `notify:send` (aggregator-dpg#834 realm, automation#262 reconcile). Confirm a `client_credentials` token for `signals-api` carries `aud: notification-service`.
-3. The signals umbrella release, with these image tags: NS Stage 1 (with #156) and Signals (with #792). Run `fetch-configs.sh signals` first; it now fetches the catalogue.
+3. The signals umbrella release, with these image tags: NS Stage 1 (with #156) and Signals (with #792). Preconditions:
+   - bluedots-schemas#47 is on `main` (or the fetch ref is pinned to a commit that has the catalogues);
+   - the deploy host has `jq`.
+
+   Run `fetch-configs.sh signals` first; it fetches and validates the catalogue. During the upgrade, Signals pods can start before the new NS pod is Ready; a few best-effort sends in that window are refused (Signals logs `ns_rejected` / `ns_unreachable`). Check the logs once the rollout completes.
 4. Verify:
    - NS logs `catalogue <version> seeded: {...}` with no `seeded_draft` for guardian policies;
-   - `GET /v1/admin/export` (`templates:admin`) lists the policies;
+   - `GET /v1/admin/export`, signed with the `ns-admin` key, lists the policies;
    - one action email, one welcome and one support email arrive, plus one guardian OTP to an email contact;
    - Signals logs show no `ns_rejected` or `ns_unreachable`.
 5. Keycloak stays on today's `smsProvider` and `otpEmailProvider: smtp`. The flip to `http` is Plan G.
 
-**Recovery: guardian policies seeded as drafts** (`login_otp` was configured after the first boot). Publish each draft through `POST /v1/admin/policies/:id/publish`.
+**Recovery: guardian policies seeded as drafts** (`login_otp` was configured after the first boot). Publish each draft through `POST /v1/admin/policies/:id/publish`, signed with the `ns-admin` key.
 
 **Part B release gate.** Merge Part B for the next release only when all of these hold:
 - every cluster above runs the Signals image with #792;
 - the F3 jar is in the automation Keycloak image (providers README sha256 updated), and no Keycloak on any cluster runs an older jar with `smsProvider: http` or `otpEmailProvider: http` (the older jar signs v1, which Part B rejects);
 - 24 h have passed since the last cluster upgraded, which is the recovery window;
-- each cluster's NS DLQ (`ns_queue_depth{queue="dlq"}`) shows no legacy job awaiting replay.
+- each cluster's NS DLQ holds no legacy job awaiting replay. `GET /metrics/queue` gives the depth; a legacy entry in `queue:dlq` is one with no `v1` field. Part B dead-letters any that remain as `legacy_job_shape`, so this check is about not losing a replayable send, not about safety.
 
 ---
 
@@ -869,28 +878,49 @@ EMAIL_FROM_NAME: *smtp_from_display   # up-sdm: "UP SDM"
   - `helm/signals/charts/api/values.yaml`: `NOTIFICATION_SERVICE_KEY_ID`/`NOTIFICATION_SERVICE_SECRET`;
   - `opentofu/aws/template/global-values.yaml`: `notificationKeyId` and `api.config.NOTIFICATION_FROM_EMAIL`;
   - tfpl: `notificationSecret` and `NOTIFICATION_SERVICE_SECRET`.
-- Runbook for this release: remove `notificationKeyId` and `NOTIFICATION_FROM_EMAIL` from each cluster's own `global-values.yaml`.
+- Runbook for this release, per cluster, once the release gate holds:
+  1. Remove from the cluster's own `global-values.yaml`: `api.secrets.notificationKeyId`, `api.config.NOTIFICATION_FROM_EMAIL`, and `global.signals_notification_secret_bytes` if set.
+  2. Regenerate secrets with `bash install.sh apply_tf_output_file`. A full `create_tf_resources` (or a `random_passwords` apply) also destroys `random_id.signals_notification_secret`; that is expected.
+  3. ALIMCO-TCS (hand-maintained, encrypted secrets): remove `api.secrets.notificationSecret`, `api.secrets.data.NOTIFICATION_SERVICE_SECRET` and the `dpg-api-client` entry in `notification-service.internalSecrets.json` by hand. Keep `keycloak` and `ns-admin`.
+  4. Deploy signals.
 
-- [ ] **Step 1:** Flip the A3 assertions (the "present until Part B" block and `dpg-api-client`) to "absent", then run them and confirm FAIL., then run it and confirm FAIL.
+- [ ] **Step 1:** Flip the A3 assertions (the "present until Part B" block and `dpg-api-client`) to "absent", then run them and confirm FAIL.
 - [ ] **Step 2:** Remove the entry, Signals' half listed above, the random password and its two references.
 - [ ] **Step 3:** Run `tofu validate` on a cluster module as the repo's CI does, then `render_test.sh`, `helm lint` and `helm template`. Expected: pass.
 - [ ] **Step 4: Commit.** Message: `chore(ns): retire the legacy Signals HMAC key`
 
 ---
 
+## Merge order
+
+**Part A (Stage 1 release):**
+1. bluedots-schemas#47 → `main` (the catalogue fetch and e2e CI read it).
+2. notification-service Stage 1 stack #147 … #156 into `feature`; #156 carries A8.
+3. signals-dpg#792 into `feature`.
+4. Realm grant: aggregator-dpg#834 and bluedots-automation#262.
+5. bluedots-automation #260 → #263, then `feat/ns-cutover-wiring`. Before this, sync automation `main` down into `feature` (main carries #268, which touches `helm/CLAUDE.md`).
+6. bluedots-e2e #40 → #41, then `feat/ns-mailpit-e2e`.
+7. Promote, cut the RC tag, pin images per cluster, run the runbook.
+
+Work→feature PRs squash-merge, so each stacked branch is rebased onto `origin/feature` once the branch below it lands (`git rebase --onto origin/feature <old-base>`).
+
+**Out of band, before Part B:** the F3 Keycloak plugin PR → `main`, then the A4 jar bump and a Keycloak image build.
+
+**Part B (next release, after the gate):** notification-service `feat/ns-legacy-removal` and bluedots-automation `feat/ns-legacy-key-removal`, each rebased onto `feature`. They do not depend on each other; ship both in the same release.
+
 ## Done when
 
 **Part A**
 - automation: `render_test.sh` (signals and keycloak), `helm lint`, the CI `helm template` step and the promtool tests are green. A real `fetch-configs.sh signals` run writes the right catalogue for a brand cluster and for a network cluster.
-- No Signals chart or template renders `NOTIFICATION_SERVICE_KEY_ID`/`SECRET`, `NOTIFICATION_FROM_EMAIL`, `SMS_TEMPLATE_ID` or `messages.properties`. NS internal-secrets still holds `dpg-api-client`.
+- No Signals chart or template renders `SMS_TEMPLATE_ID` or `messages.properties`. The Signals HMAC pair and `NOTIFICATION_FROM_EMAIL` still render, and NS internal-secrets still holds `dpg-api-client` (ruling R4: the previous Signals image needs them on rollout restarts and rollback). NS internal-secrets also holds `keycloak` and `ns-admin`.
 - NS renders `EMAIL_FROM_ADDRESS`, `EMAIL_FROM_NAME` and, when the catalogue was fetched, `NS_SEED_FILE`, and refuses to render without a From address.
 - The Keycloak chart defaults the NS URL to `/v1/notify` and can render `otpEmailProvider: http`. The jar bump is done once F3's jar exists.
-- e2e: `pnpm test` is green. `pnpm test:stack` runs J11–J13 and J21–J24 green on `purple_dot/alimco` and `blue_dot/ka-dhwd`, each asserting a delivered Mailpit message. Nothing reads NS Redis.
+- e2e: `pnpm test` is green. `pnpm test:stack` runs J11, J12, J14 and J21–J26 green on `purple_dot/alimco` and `blue_dot/ka-dhwd` (J21 and J26 on ka-dhwd, J25 on alimco), each asserting a delivered Mailpit message and the recorded NS event. Nothing reads NS Redis.
 - The runbook is attached to the automation PR body.
 
 **Part B**
 - notification-service: `pnpm build`, `pnpm test` and `pnpm test:integration` are green. `POST /notify` is 404. HMAC accepts only `v2=`. A legacy-shaped job is dead-lettered as `legacy_job_shape`. Providers expose `sendRendered` only. `login_otp` seeds from explicit env. The docs describe a v1-only service.
-- automation: the `dpg-api-client` key and `signals_notification_secret` are gone, and every render and validate check is green.
+- automation: the `dpg-api-client` key, `signals_notification_secret` and Signals' HMAC pair and `NOTIFICATION_FROM_EMAIL` are gone; `keycloak` and `ns-admin` stay; every render and validate check is green.
 - It is merged only after the Part B release gate holds.
 
 ## Follow-ups owned elsewhere
