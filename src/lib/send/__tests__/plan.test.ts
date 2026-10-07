@@ -41,12 +41,12 @@ function policy(mode: 'first_available' | 'all') {
 }
 
 describe('planSend', () => {
-  it('variables are checked against the union of planned contracts', async () => {
+  it('each planned template renders only its own variables', async () => {
     policy('first_available');
     const plan = await planSend(req({ event_type: 'apply', to: { phone: '+919999999999', email: 'a@b.co' }, variables: { name: 'A', link: 'https://x.org/' } }));
     expect(plan.deliveries.map((d) => d.channel)).toEqual(['sms', 'email']);
     expect(plan.deliveries[0]!.rendered).toMatchObject({ mode: 'provider', variables: { name: 'A' } });
-    expect(await codeOf(planSend(req({ event_type: 'apply', to: { phone: '+919999999999' }, variables: { name: 'A', bogus: 'x' } })))).toBe('unknown_variable');
+    expect(plan.deliveries[1]!.rendered).toMatchObject({ mode: 'ns' });
   });
 
   it('drops channels without a contact point', async () => {
@@ -174,6 +174,56 @@ describe('planSend', () => {
   });
 });
 
+describe('planSend — event variables span every policy template', () => {
+  const guardianEmail = tpl({ channel: 'email', templateKey: 'guardian.account', provider: 'smtp', providerTemplateId: null, subject: 'S', bodyHtml: '<p>{{message}} {{parentName}}</p>', variables: [v('message'), v('parentName')] });
+  const loginOtp = tpl({ channel: 'sms', templateKey: 'login_otp', variables: [v('message')] });
+  const phoneOnly = { phone: '+919999999999' };
+  const setup = (emailResolves = true) => {
+    policies.resolvePolicy.mockResolvedValue({ mode: 'first_available', channels: [{ channel: 'email', template_key: 'guardian.account' }, { channel: 'sms', template_key: 'login_otp' }] });
+    templates.resolveTemplate.mockImplementation(async (channel: string) => {
+      if (channel === 'email') {
+        if (!emailResolves) throw new TemplateError('not_found', 'no active email template');
+        return { template: guardianEmail, renders: 'ns' };
+      }
+      return { template: loginOtp, renders: 'provider' };
+    });
+  };
+
+  it('phone-only event accepts email-only variables', async () => {
+    setup();
+    const plan = await planSend(req({ event_type: 'guardian.otp.account', to: phoneOnly, variables: { message: '123456', parentName: 'P' } }));
+    expect(plan.deliveries).toHaveLength(1);
+    expect(plan.deliveries[0]!.channel).toBe('sms');
+    expect(plan.deliveries[0]!.rendered).toMatchObject({ mode: 'provider', variables: { message: '123456' } });
+    expect(Object.keys((plan.deliveries[0]!.rendered as { variables: object }).variables)).toEqual(['message']);
+  });
+
+  it('an event variable no template uses is ignored', async () => {
+    setup();
+    const plan = await planSend(req({ event_type: 'guardian.otp.account', to: phoneOnly, variables: { message: '1', bogus: 'x' } }));
+    expect(plan.deliveries[0]!.rendered).toMatchObject({ variables: { message: '1' } });
+    expect(Object.keys((plan.deliveries[0]!.rendered as { variables: object }).variables)).toEqual(['message']);
+  });
+
+  it('planning resolves only the delivered candidate', async () => {
+    setup();
+    await planSend(req({ event_type: 'guardian.otp.account', to: phoneOnly, variables: { message: '1', parentName: 'P' } }));
+    expect(templates.resolveTemplate).toHaveBeenCalledTimes(1);
+    expect(templates.resolveTemplate.mock.calls[0]![0]).toBe('sms');
+  });
+
+  it('template_key send with an unknown variable is still unknown_variable', async () => {
+    templates.resolveTemplate.mockResolvedValue({ template: loginOtp, renders: 'provider' });
+    const e = await planSend(req({ template_key: 'login_otp', channel: 'sms', to: phoneOnly, variables: { message: '1', bogus: 'x' } })).catch((x) => x);
+    expect(e).toMatchObject({ code: 'unknown_variable', kind: 'caller' });
+  });
+
+  it('event send missing a required variable of a planned template is missing_variable', async () => {
+    setup();
+    expect(await codeOf(planSend(req({ event_type: 'guardian.otp.account', to: phoneOnly, variables: { parentName: 'P' } })))).toBe('missing_variable');
+  });
+});
+
 describe('planSend — content_ref variables', () => {
   const tncV = v('tnc_url', { type: 'url', source: 'content_ref', contentKey: 'tnc.in_force.url', urlHosts: ['example.org'] });
   const tncSms = tpl({ channel: 'sms', templateKey: 'tnc_sms', variables: [v('name'), tncV] });
@@ -233,6 +283,28 @@ describe('planSend — content_ref variables', () => {
     const plan = await planSend(req({ event_type: 'tnc', to: { phone: '+919999999999', email: 'a@b.co' }, variables: { name: 'A' } }));
     expect(plan.deliveries.map((d) => d.channel)).toEqual(['email']);
     expect(plan.deliveries[0]!.contentRefs).toEqual([]);
+  });
+
+  it('an event send renders the resolved content value in every delivered template', async () => {
+    loadTnc();
+    const tncEmail = tpl({ channel: 'email', templateKey: 'tnc_email', provider: 'smtp', providerTemplateId: null, subject: 'Hi {{name}}', bodyText: 'Terms: {{tnc_url}}', variables: [v('name'), tncV] });
+    policies.resolvePolicy.mockResolvedValue({ mode: 'all', channels: [{ channel: 'sms', template_key: 'tnc_sms' }, { channel: 'email', template_key: 'tnc_email' }] });
+    templates.resolveTemplate.mockImplementation(async (channel: string) =>
+      channel === 'sms' ? { template: tncSms, renders: 'provider' } : { template: tncEmail, renders: 'ns' });
+    const plan = await planSend(req({ event_type: 'tnc', to: { phone: '+919999999999', email: 'a@b.co' }, variables: { name: 'A' } }));
+    expect(plan.deliveries.map((d) => d.channel)).toEqual(['sms', 'email']);
+    expect(plan.deliveries[0]!.rendered).toMatchObject({ mode: 'provider', variables: { name: 'A', tnc_url: 'https://example.org/tnc' } });
+    expect(plan.deliveries[1]!.rendered).toMatchObject({ mode: 'ns', channel: 'email', text: 'Terms: https://example.org/tnc' });
+    for (const d of plan.deliveries) expect(d.contentRefs).toEqual([{ key: 'tnc.in_force.url', version: 'v3', locale: 'en', fingerprint: fp12('https://example.org/tnc') }]);
+  });
+
+  it('an event send carrying a content variable name renders the content value, not the caller value', async () => {
+    loadTnc();
+    policies.resolvePolicy.mockResolvedValue({ mode: 'first_available', channels: [{ channel: 'sms', template_key: 'tnc_sms' }] });
+    templates.resolveTemplate.mockResolvedValue({ template: tncSms, renders: 'provider' });
+    const plan = await planSend(req({ event_type: 'tnc', to: { phone: '+919999999999' }, variables: { name: 'A', tnc_url: 'https://example.org/other' } }));
+    expect(plan.deliveries[0]!.rendered).toMatchObject({ mode: 'provider', variables: { name: 'A', tnc_url: 'https://example.org/tnc' } });
+    expect(plan.deliveries[0]!.contentRefs).toEqual([{ key: 'tnc.in_force.url', version: 'v3', locale: 'en', fingerprint: fp12('https://example.org/tnc') }]);
   });
 
   it('first_available: when every candidate fails on content, the first configuration error is thrown', async () => {

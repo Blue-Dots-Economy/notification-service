@@ -538,7 +538,7 @@ the locale chain), `invalid_content` (the value fails the variable's type or `ur
 Messages name the key and variable, never the value.
 
 **Callers cannot supply content.** A request variable under a content variable's name is
-`422 unknown_variable` (a caller error); content variables are not part of the caller contract.
+`422 unknown_variable` on a `template_key` send (an `event_type` send ignores it); content variables are not part of the caller contract.
 
 **Event record (E3).** The event payload carries `content_refs`, a per-channel map
 `{ "<channel>": [{ key, version, locale, fingerprint }] }`, de-duplicated per channel and built from each planned
@@ -588,8 +588,12 @@ identity are not accepted; the sender is server config (`EMAIL_FROM_ADDRESS`, `E
 Without `EMAIL_FROM_ADDRESS` an email delivery fails permanently with `email sender not configured`.
 
 **Planning** (`planSend`) renders and validates everything before the request is accepted. Request
-variables are checked against the union of the planned templates' contracts (a name declared by none
-is `unknown_variable`); each template renders with only its own declared variables. A failure is
+variables are checked by send type. With `template_key` a name the template does not declare is
+`unknown_variable`. With `event_type` the variables are data: each planned template picks the ones it
+declares and the rest are ignored (a phone-only guardian OTP can carry the email template's variables),
+while a missing required one is `missing_variable`; planning reads no template beyond the candidates it
+delivers, so the urgent path adds no Postgres dependency. Each template
+renders with only its own declared variables. A failure is
 `422 {error, kind, message, details?}` and counts `ns_send_rejected_total{kind,code}`:
 - `caller`: `missing_variable`, `unknown_variable`, `invalid_variable`, `no_reachable_channel`.
 - `configuration`: `not_found`, `vendor_mismatch`, `incomplete_template`, `body_too_long`,
@@ -663,6 +667,14 @@ a 5-second content guard answers a repeat with `409 duplicate-fallback`.
 
 **Correlation id.** The body's `correlation_id` (trimmed, at most 128, else `400`) wins over the
 `x-correlation-id` header; blank falls back to the header, then the event id.
+
+**Event row identity.** `notification_event.event_type` and `domain` are the request's `event_type`
+and recipient `domain` as sent, null when absent (never the policy's matched domain, so a send that
+fell back to a network-wide policy still records the caller's domain). They ride on `job.audit`, so
+every writer of the row records the same values: the accepted insert, a worker upsert that lands
+first (urgent), a fall-through, a DLQ replay and a recovered job. `template_key` is the request's
+`template_key` (legacy `/notify`: its `template_id`) and is **null for event sends**: their templates
+are per delivery and live on `delivery_attempt.template_id`.
 
 **Response:** `202 {notification_event_id, correlation_id, status: "accepted", mode, deliveries:
 [{channel}]}`. See README for examples.
@@ -799,7 +811,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 741 unit tests across 56 files, plus 135 integration tests across 17 files. The unit suite runs in about a second because Redis
+vitest 4, 755 unit tests across 56 files, plus 138 integration tests across 17 files. The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
