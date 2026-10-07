@@ -131,6 +131,16 @@ describe('emailProvider.send', () => {
     expect(sent.text).not.toContain('<script');
   });
 
+  it('ignores a caller `text` variable and derives the plain body from html', async () => {
+    await emailProvider.send({
+      to: 'support@example.com',
+      template_id: 'BASIC_EMAIL',
+      variables: { ...base, html: '<p>Hello</p>', text: 'something else' },
+    });
+    const sent = sendMailSpy.mock.calls[0][0] as { text: string };
+    expect(sent.text).toBe('Hello');
+  });
+
   it('decodes attachments into nodemailer buffers', async () => {
     const content = Buffer.from('a tiny png');
     await emailProvider.send({
@@ -160,5 +170,18 @@ describe('emailProvider.send', () => {
       variables: base,
     });
     expect(sendMailSpy.mock.calls[0][0]).not.toHaveProperty('attachments');
+  });
+
+  // Legacy /notify behaviour is unchanged by the v1 html-or-text work: an empty
+  // html still sends (an empty body), it is not turned into a thrown error.
+  it('legacy send with an empty html still sends, as before v1', async () => {
+    const res = await emailProvider.send({
+      to: 'support@example.com',
+      template_id: 'BASIC_EMAIL',
+      variables: { ...base, html: '' },
+    });
+    expect(res).toEqual({ ok: true });
+    expect(sendMailSpy).toHaveBeenCalledTimes(1);
+    expect(sendMailSpy.mock.calls[0][0]).toMatchObject({ html: '', text: '' });
   });
 });

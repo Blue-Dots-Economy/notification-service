@@ -15,6 +15,9 @@ export type AttemptStatus =
   | 'queued' | 'dispatching' | 'sent' | 'accepted_by_provider'
   | 'delivered' | 'bounced' | 'failed' | 'expired';
 
+/** How an event's status derives from its attempts: single/first_available mirror the current attempt; all rolls up. */
+export type DeliveryMode = 'single' | 'first_available' | 'all';
+
 export const notificationEvent = pgTable('notification_event', {
   id: uuid('id').notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -31,6 +34,7 @@ export const notificationEvent = pgTable('notification_event', {
   deadline: timestamp('deadline', { withTimezone: true }),
   status: text('status').$type<EventStatus>().notNull(),
   payload: jsonb('payload').notNull(),
+  deliveryMode: text('delivery_mode').$type<DeliveryMode>().notNull().default('single'),
 });
 
 export const deliveryAttempt = pgTable('delivery_attempt', {

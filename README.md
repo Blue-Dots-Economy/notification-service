@@ -35,7 +35,8 @@ src/
 │  │  └─ provider-docs.ts    # Provider payload/schema serialization
 │  └─ providers/             # Provider implementations
 └─ plugins/
-   └─ request-auth.ts        # HMAC request signing guard
+   ├─ auth.ts                # Bearer token / HMAC v2 guard and route scopes
+   └─ raw-body.ts            # JSON-only body parser that keeps the signed bytes
 ```
 
 ## Local Requirements
@@ -93,8 +94,33 @@ is for local runs only).
 | `DATABASE_QUERY_TIMEOUT_MS` | `5000` | Client and server-side query timeout |
 | `DATABASE_SSL` | `disable` | `disable` or `require`; `require` verifies the certificate, so supply the CA via `NODE_EXTRA_CA_CERTS` |
 | `NS_NETWORK` | `unknown` | Network recorded on each event |
+| `NS_SEED_FILE` | unset | Catalogue of templates and policies to create when absent, at boot only; see Catalogue below |
+| `NS_CONTENT_FILE` | unset | Content file for `content_ref` template variables; unset, they are unavailable. Deployments use `/app/content/content.json` |
+| `NS_CONTENT_PROVIDER` | `configmap` | Content source; `configmap` is the only value |
+| `NS_CONTENT_RELOAD_MS` | `30000` | How often the content file is re-read, 1 to 3600000 |
+| `INTERNAL_SECRETS_JSON` | required | Path to the HMAC signing keys file (see [Authentication](#authentication)) |
+| `NS_KEYCLOAK_ISSUER` | unset | Turns bearer-token auth on. Must equal the token `iss` exactly, an http(s) URL with no trailing slash |
+| `NS_KEYCLOAK_JWKS_URI` | `<issuer>/protocol/openid-connect/certs` | Key set location |
+| `NS_AUTH_AUDIENCE` | `notification-service` | Required token `aud` |
+| `NS_AUTH_ALLOWED_AZP` | required with the issuer | Comma-separated client ids whose tokens are accepted |
+| `NS_DOCS_ENABLED` | unset | `true` serves `GET /` and `GET /openapi.json`; leave unset in deployed environments |
 | `PARTITION_MAINTENANCE_INTERVAL_MS` | 6 hours | Partition pre-creation interval |
 | `RECOVERY_MAX_AGE_HOURS` | `24` | Open sends older than this are marked failed by recovery, not re-sent |
+| `WORKER_URGENT_CONCURRENCY` | `2` | Urgent loops, each on its own Redis connection; must be a positive integer |
+| `WORKER_NORMAL_CONCURRENCY` | `2` | Normal loops |
+| `WORKER_BULK_CONCURRENCY` | `1` | Bulk loops |
+| `RATE_<CHANNEL>_PER_SEC` | `sms` 100, `email` 100, `whatsapp` 100 | Vendor rate for `SMS`, `EMAIL`, `WHATSAPP`; may be fractional |
+| `RATE_<CHANNEL>_BURST` | `sms` 40, `email` 50, `whatsapp` 10 | Bucket size |
+| `RATE_URGENT_SHARE` | `0.2` | Share of the quota only urgent sends can use; `0 < share < 1` |
+| `RATE_LIMIT_DEFER_MS` | `250` | Wait before a rate-limited job is retried (plus up to 50% jitter); the attempt is not counted |
+| `PROVIDER_TIMEOUT_MS` | `10000` | Cap on every vendor call; a timeout is a retryable failure |
+| `URGENT_DEFAULT_DEADLINE_S` | `600` | An urgent job older than this is expired unsent, never dead-lettered |
+| `EMAIL_FROM_ADDRESS` | — | Sender address for `/v1/notify` email; unset, every v1 email delivery fails permanently with `email sender not configured` |
+| `EMAIL_FROM_NAME` | `EMAIL_FROM_ADDRESS` | Sender display name for `/v1/notify` email |
+| `NS_RESOLVE_CACHE_TTL_MS` | `60000` | Age after which a cached template/policy is refreshed in the background; positive integer |
+
+An invalid value in any of these exits the worker at boot rather than dropping jobs later. Urgent
+sends take the shared quota first, then the reserved share; normal and bulk use the shared quota only.
 
 A normal-priority `/notify` that cannot be recorded returns
 `503 {"error": "audit store unavailable", "enqueued": false}` and the dedupe
@@ -159,7 +185,8 @@ and what each suite covers.
 
 ## API Docs
 
-Open the Scalar reference:
+With `NS_DOCS_ENABLED=true` (set in `example.env` for local development; off by
+default), open the Scalar reference:
 
 ```text
 GET /
@@ -173,16 +200,162 @@ GET /openapi.json
 
 ## Endpoint Summary
 
-Every endpoint below requires signed auth headers.
+Every endpoint below except `GET /metrics`, `GET /` and `GET /openapi.json` requires
+authentication (a bearer token or HMAC v2 headers; see [Authentication](#authentication)).
 
 ```text
 GET  /                    # Scalar API reference HTML
 GET  /openapi.json        # OpenAPI document
-POST /notify              # Enqueue a notification
+POST /notify              # Enqueue a notification (legacy)
+POST /v1/notify           # Send API v1: policy-routed or template-key send
 GET  /providers           # List providers and complete payload examples
 GET  /providers/:name     # Find one provider by name
 GET  /metrics/queue       # Queue depths and retry/DLQ metrics
 POST /failed/retry        # Requeue jobs from the DLQ
+```
+
+The admin API under `/v1/admin/` is listed in [Admin API](#admin-api).
+
+## Admin API
+
+Templates and routing policies are managed over HTTP. Every route needs the
+`templates:admin` scope, held by an HMAC key whose `scopes` entry lists it or by a bearer
+token carrying that role (otherwise `403 Insufficient scope`).
+`NS_NETWORK` must be set (otherwise `503 network_not_configured`). A database failure answers
+`503 database_unavailable`; the query and its parameters are never logged or returned. Request bodies are strict:
+unknown keys return `400`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/v1/admin/templates` | List (`channel`, `template_key`, `status` filters) |
+| POST | `/v1/admin/templates` | Create a draft (`201`) |
+| GET | `/v1/admin/templates/:id` | Fetch one |
+| PATCH | `/v1/admin/templates/:id` | Edit a draft |
+| POST | `/v1/admin/templates/:id/publish` | Validate, activate, retire the previous active version |
+| POST | `/v1/admin/templates/:id/retire` | Retire (`409 template_in_use` while an active policy needs it) |
+| POST | `/v1/admin/templates/:id/preview` | Render with `{ "variables": {...} }`; any status, sends nothing |
+| GET | `/v1/admin/policies` | List (`domain`, `event_type`, `status` filters) |
+| POST | `/v1/admin/policies` | Create a draft (`201`) |
+| GET | `/v1/admin/policies/:id` | Fetch one |
+| PATCH | `/v1/admin/policies/:id` | Edit a draft |
+| POST | `/v1/admin/policies/:id/publish` | Activate (every channel must resolve to an active template for the current vendor, default locale) |
+| POST | `/v1/admin/policies/:id/retire` | Retire |
+
+Errors: `404 not_found`, `409 invalid_state` (active and retired rows are immutable; create a new
+draft), `409 template_in_use` (retiring a template an active policy still resolves to; publish a
+replacement or retire the policy first), `422` for any other rule violation (`error` holds the code, `message` names variables and
+never their values).
+
+Create, preview and publish an email template:
+
+```bash
+KEY_ID="admin-key"        # its internal-secrets.json entry lists "templates:admin"
+SECRET="ns_admin_secret"
+BASE=http://localhost:3000
+
+# Signs v2: METHOD, PATH, timestamp, nonce and the SHA-256 of the body, as in "Signed cURL Example".
+# The signed path is the full request URL as sent, including any query string
+# (matters for list endpoints, e.g. /v1/admin/templates?status=active).
+# The body is the last argument; bodyless POSTs (publish, retire) send '{}'.
+ns_curl() {
+  local METHOD="$1" REQ_PATH="$2" BODY="${3:-}"
+  local TS=$(date +%s) NONCE=$(openssl rand -hex 16)
+  local DIGEST=$(printf "%s" "$BODY" | openssl dgst -sha256 | sed 's/^.* //')
+  local SIG="v2=$(printf "%s\n%s\n%s\n%s\n%s" "$METHOD" "$REQ_PATH" "$TS" "$NONCE" "$DIGEST" | \
+    openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')"
+  curl -sS -X "$METHOD" "$BASE$REQ_PATH" -H "Content-Type: application/json" \
+    -H "X-NS-Key: $KEY_ID" -H "X-NS-Timestamp: $TS" -H "X-NS-Nonce: $NONCE" \
+    -H "X-NS-Signature: $SIG" ${BODY:+--data-binary "$BODY"}
+}
+
+ID=$(ns_curl POST /v1/admin/templates '{
+  "channel": "email",
+  "template_key": "welcome",
+  "subject": "Welcome, {{name}}",
+  "body_html": "<p>Hello {{name}}, <a href=\"{{link}}\">get started</a></p>",
+  "variables": [
+    { "name": "name" },
+    { "name": "link", "type": "url", "urlHosts": ["example.com"] }
+  ]
+}' | jq -r .id)
+
+ns_curl POST "/v1/admin/templates/$ID/preview" \
+  '{"variables": {"name": "Asha <b>", "link": "https://app.example.com/start"}}'
+
+ns_curl POST "/v1/admin/templates/$ID/publish" '{}'
+```
+
+Email variables are HTML-escaped unless declared `raw: true`. Variable `type` is `string`,
+`number` or `url`; a `url` must be `http(s)` and, with `urlHosts`, on an allowed host
+(subdomains match). A variable used inside an `href` or `src` attribute must be `type: "url"`,
+and publish rejects malformed tokens such as `{{ name }}`.
+
+### Shared content (`content_ref`)
+
+A variable can take its value from a shared content file, such as the current terms link, instead of
+from the caller. Declare `source: "content_ref"` and a `contentKey`:
+
+```json
+{ "name": "tnc_url", "type": "url", "source": "content_ref", "contentKey": "tnc.in_force.url", "urlHosts": ["example.com"] }
+```
+
+The file named by `NS_CONTENT_FILE`:
+
+```json
+{
+  "version": "2026-10-01",
+  "entries": {
+    "tnc.in_force.url": { "en": "https://example.com/terms/v3", "hi": "https://example.com/hi/terms/v3" }
+  }
+}
+```
+
+A body of `Read the terms: {{tnc_url}}` for an `hi-IN` template renders
+`Read the terms: https://example.com/hi/terms/v3` (the locale chain is `hi-IN`, `hi`, then
+`NS_DEFAULT_LOCALE`). Content resolves when the send is accepted, and the event records each channel's
+`content_refs` (`key`, `version`, `locale`, and `fingerprint`: the first 12 hex of the sha256 of the
+value, so a ref pins the exact text even if the file was edited without a version bump). A `content_ref` variable is always required, cannot be
+`sensitive`, and cannot be supplied by the caller (`422 unknown_variable`). A missing key or locale, an
+invalid value, or no loaded content refuses the send with a configuration `422`
+(`content_unavailable`, `unknown_content_key`, `content_unresolved`, `invalid_content`). The file is
+re-read every `NS_CONTENT_RELOAD_MS`; a bad file keeps the last good version and increments
+`ns_content_load_failures_total`, and `ns_content_loaded{version,fingerprint}` holds the time of the
+latest successful load.
+
+
+### Catalogue
+
+`NS_SEED_FILE` names a JSON file of templates and policies. At boot, each entry whose key has no
+row of any status is created and published; existing rows are never changed, so admin edits survive
+restarts. Entries use the admin create bodies plus `provider` on a template. SMS and WhatsApp entries
+must name their `provider`; only email entries may omit it, and those seed for the deployment's email
+vendor. An entry for a vendor this deployment does not use is skipped. An entry that fails publish
+validation stays a draft and is logged by code; publish it through the admin API. A template with a
+`content_ref` variable publishes only if content is loaded at its first boot; otherwise it, and any
+policy that lists it, stays a draft, so publish them through the admin API once content loads.
+Seeding never blocks the boot, and the file is read only at boot.
+
+```json
+{
+  "version": "2026-10-06",
+  "templates": [
+    { "channel": "email", "template_key": "item.paused", "subject": "Paused",
+      "body_html": "<p>Hi {{name}}</p>", "variables": [{ "name": "name" }] }
+  ],
+  "policies": [
+    { "domain": "seeker", "event_type": "item.paused", "mode": "first_available",
+      "channels": [{ "channel": "email", "template_key": "item.paused" }] }
+  ]
+}
+```
+
+`GET /v1/admin/export` returns the active templates and policies of the network in this format,
+without ids or timestamps, so it can seed another environment. Output is sorted, so two exports of
+one store are identical apart from `version`, the export timestamp. A store that does not fit the
+format (for example more than 500 active templates) answers `422 export_invalid`, naming paths only:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" https://ns.example.com/v1/admin/export > catalogue.json
 ```
 
 ## Queue Model
@@ -212,42 +385,165 @@ count, the job is written to `queue:dlq`.
 
 ## Authentication
 
-All API routes are protected by request signing. The request must include:
+A request carries **one** of two credential types. An `Authorization` header together
+with any of the four HMAC headers is `401 Ambiguous credentials`.
+
+### HMAC v2 signing
+
+Headers: `X-NS-Key` (key id), `X-NS-Timestamp` (unix seconds, within 30 s of the
+server), `X-NS-Nonce` (unique per request) and `X-NS-Signature: v2=<64 lowercase hex>`.
+
+The signature is HMAC-SHA256 with the key's secret over:
 
 ```text
-X-NS-Key
-X-NS-Timestamp
-X-NS-Nonce
-X-NS-Signature
+METHOD\npath\ntimestamp\nnonce\nsha256(body)
 ```
 
-The signature format is:
+- `path` is the request URL exactly as sent, including the query string.
+- `sha256(body)` is lowercase hex over the exact body bytes, or over the empty string when
+  there is no body.
+- JSON (`application/json`) is the only accepted body type; any other content type is `415`.
+  Every accepted body is covered by the signature.
+- A nonce is accepted once; a correctly signed repeat is `401 Replay detected`.
+- A bodyless POST (publish, retire, `POST /failed/retry`) sends no `Content-Type` header, or
+  sends the body `{}` with `Content-Type: application/json`. An empty body declared as JSON is `400`.
 
-```text
-v1=<hmac_sha256>
+Node example (a JSON body; `fetch` sends the same bytes that were signed, and no
+`Content-Type` when there is no payload):
+
+```js
+import crypto from 'node:crypto';
+
+const BASE = 'http://localhost:3000';
+const KEY_ID = 'jobstack';
+const SECRET = process.env.NS_SECRET;
+
+async function signedRequest(method, path, payload) {
+  const body = payload === undefined ? '' : JSON.stringify(payload);
+  const ts = String(Math.floor(Date.now() / 1000));
+  const nonce = crypto.randomBytes(16).toString('hex');
+  const digest = crypto.createHash('sha256').update(body).digest('hex');
+  const canonical = [method, path, ts, nonce, digest].join('\n');
+  const mac = crypto.createHmac('sha256', SECRET).update(canonical).digest('hex');
+  return fetch(BASE + path, {
+    method,
+    headers: {
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+      'X-NS-Key': KEY_ID,
+      'X-NS-Timestamp': ts,
+      'X-NS-Nonce': nonce,
+      'X-NS-Signature': `v2=${mac}`,
+    },
+    body: body || undefined,
+  });
+}
 ```
 
-The signed base string is:
+The legacy `POST /notify` also accepts `v1=` signatures (`METHOD\npath\ntimestamp\nnonce`,
+no body digest) until the cutover release removes that route. Every other route needs `v2=`.
 
-```text
-METHOD
-PATH
-TIMESTAMP
-NONCE
-```
+### Keys and scopes
 
-`PATH` must match the request URL path exactly as sent to Fastify. Include the
-query string if the request has one.
-
-Example secret configuration:
+`INTERNAL_SECRETS_JSON` names a JSON file of signing keys:
 
 ```json
 {
-  "jobstack": {
-    "secret": "ns_jobstack_secret-key"
-  }
+  "jobstack": { "secret": "ns_jobstack_secret-key" },
+  "ops": { "secret": "ns_ops_secret-key", "scopes": ["notify:send", "templates:admin"] }
 }
 ```
+
+`scopes` is optional and defaults to `["notify:send"]`. An entry whose `secret` is the empty
+string is skipped with a boot warning naming its key id; any other malformed entry fails the boot.
+
+| Scope | Routes |
+|---|---|
+| `notify:send` | `POST /v1/notify`, `POST /notify` |
+| `templates:admin` | `/v1/admin/templates*`, `/v1/admin/policies*`, `GET /v1/admin/export`, `POST /failed/retry` |
+| any authenticated | `GET /providers`, `GET /providers/:name`, `GET /metrics/queue` |
+
+A missing scope is `403 {"error":"Insufficient scope","required":"<scope>"}`. `GET /metrics`
+needs no credentials.
+
+### Bearer tokens
+
+Set `NS_KEYCLOAK_ISSUER` (exactly the token `iss`, no trailing slash) and
+`NS_AUTH_ALLOWED_AZP` to accept Keycloak access tokens. The token must carry
+`aud` = `NS_AUTH_AUDIENCE` (default `notification-service`) and an `azp` on the allowlist.
+Grant the `notification-service` client roles `notify:send` and `templates:admin` to the
+caller; the role grant adds the audience, so no client definition changes. A bad token is
+`401`; a Keycloak key set that cannot be reached is `503`.
+
+### Upgrade notes
+
+- `POST /failed/retry` now needs `templates:admin`. A key with only `notify:send` gets `403`;
+  add `"templates:admin"` to the operator key's `scopes`.
+- The admin key-id environment list is removed. Grant admin access through `scopes` in the secrets file instead.
+- Audit `source` and admin `created_by`/`published_by` are now `hmac:<keyId>` or
+  `bearer:<id>`. Rows written earlier keep the bare key id.
+- Admin and v1 routes require `v2=` signatures with the body digest.
+
+## Send API v1
+
+```text
+POST /v1/notify
+```
+
+Send by `event_type` (a published policy picks the channels) or by `template_key` plus `channel`.
+Content is rendered and validated before the request is accepted. The network and the email sender
+(`EMAIL_FROM_ADDRESS`, `EMAIL_FROM_NAME`) are server configuration, never request fields; unknown
+keys return `400`.
+
+```json
+{
+  "event_type": "login_otp",
+  "to": { "phone": "+918888888888" },
+  "variables": { "message": "987654" },
+  "priority": "urgent",
+  "idempotency_key": "login-8f3a"
+}
+```
+
+```json
+{
+  "notification_event_id": "7b0e5c1e-...",
+  "correlation_id": "7b0e5c1e-...",
+  "status": "accepted",
+  "mode": "first_available",
+  "deliveries": [{ "channel": "sms" }]
+}
+```
+
+| Field | Rule |
+|---|---|
+| `event_type` / `template_key` | Exactly one. `template_key` needs `channel`; `event_type` forbids it |
+| `to` | `email` and/or E.164 `phone`; at least one |
+| `variables` | Checked against the planned templates' contracts |
+| `priority` | `urgent`, `normal` (default) or `bulk` |
+| `idempotency_key` | 1-128 chars. A repeat returns `200` with the original response |
+| `deadline` | ISO-8601 with offset, in the future, at most 24 h ahead |
+| `cc`, `reply_to`, `attachments` | Email only. `attachments` items are `{filename, contentType, data}` (base64), with the `/notify` limits |
+| `correlation_id` | Optional, trimmed, at most 128 chars. Wins over the `x-correlation-id` header; blank falls back to the header, then the event id |
+
+| Status | Meaning |
+|---|---|
+| `200` | Repeat of an `idempotency_key`: the original response |
+| `202` | Accepted; delivery is asynchronous |
+| `400` | Invalid request or `invalid_deadline` |
+| `401` | Missing, malformed or invalid credentials |
+| `403` | The credential lacks `notify:send` |
+| `409` | `idempotency_in_progress`; `idempotency_key_priority_mismatch` (the key was used at another priority in the last 15 minutes); or `duplicate-fallback` (same content within 5 s and no key) |
+| `422` | `{ error, kind, message, details? }`; `kind` is `caller` or `configuration` |
+| `503` | `network_not_configured`; `template store unavailable` (a template or policy not yet cached could not be read); `audit store unavailable` (normal/bulk); `idempotency_store_unavailable` (the idempotency claim or the duplicate guard could not be checked; nothing was sent); or the Keycloak key set could not be reached for a bearer token |
+
+`422` codes. `caller`: `missing_variable`, `unknown_variable`, `invalid_variable`,
+`no_reachable_channel`. `configuration`: `not_found`, `vendor_mismatch`, `incomplete_template`,
+`body_too_long`, `unknown_channel`, `no_policy`, `content_unavailable`, `unknown_content_key`,
+`content_unresolved`, `invalid_content`. Messages name variables, never their values.
+
+Urgent sends and sends using a template with a `sensitive` variable are redacted: only variable names
+are stored, and they are never dead-lettered. See `CLAUDE.md` (Send API v1) for planning, fallthrough,
+deadline and idempotency rules.
 
 ## Queue A Notification
 
@@ -372,7 +668,7 @@ List all providers:
 GET /providers
 ```
 
-This route requires signed auth headers.
+This route requires authentication (any scope).
 
 Find one provider by name:
 
@@ -382,7 +678,7 @@ GET /providers/sms
 GET /providers/whatsapp
 ```
 
-These routes require signed auth headers.
+These routes require authentication (any scope).
 
 Provider responses include:
 
@@ -498,7 +794,8 @@ template ids** (#86/#532/#535). Two ways to pass `template_id`:
 
 - **Named template** — `login_otp` is the one key in the SMS provider metadata. Its
   MSG91 flow id comes from `SMS_LOGIN_OTP_TEMPLATE_ID` (a built-in default applies
-  if unset), so it is deployment-specific per MSG91 account.
+  if unset), so it is deployment-specific per MSG91 account. The template registry's boot
+  seed only uses an explicitly set `SMS_LOGIN_OTP_TEMPLATE_ID`, never the built-in default.
 - **Raw DLT flow id** — any other `template_id` is passed through verbatim to MSG91
   (the SMS provider sets `allowRawTemplateId`). Signalstack sends its per-event
   DLT-approved flow ids directly this way; they need no entry in the templates map.
@@ -532,7 +829,7 @@ WhatsApp:
 GET /metrics/queue
 ```
 
-This route requires signed auth headers.
+This route requires authentication (any scope).
 
 Example response:
 
@@ -559,7 +856,8 @@ Failed jobs in `queue:dlq` can be requeued manually:
 POST /failed/retry
 ```
 
-This route requires signed auth headers.
+This route requires the `templates:admin` scope, because replaying the dead-letter queue
+re-sends other callers' messages. A sending-only credential gets `403`.
 
 Retry one failed job by `job_id`:
 
@@ -615,53 +913,35 @@ KEY_ID="jobstack"
 SECRET="ns_jobstack_secret-key"
 
 METHOD="POST"
-PATH="/notify"
+REQ_PATH="/v1/notify"
 TIMESTAMP=$(date +%s)
 NONCE=$(openssl rand -hex 16)
+BODY='{"template_key":"welcome","channel":"email","to":{"email":"test@example.com"},"variables":{"name":"Asha"}}'
 
-BASE_STRING="$METHOD
-$PATH
-$TIMESTAMP
-$NONCE"
-
-SIGNATURE="v1=$(printf "%s" "$BASE_STRING" | \
+DIGEST=$(printf "%s" "$BODY" | openssl dgst -sha256 | sed 's/^.* //')
+SIGNATURE="v2=$(printf "%s\n%s\n%s\n%s\n%s" "$METHOD" "$REQ_PATH" "$TIMESTAMP" "$NONCE" "$DIGEST" | \
   openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')"
 
-curl -X POST http://localhost:3000/notify \
+curl -X POST "http://localhost:3000$REQ_PATH" \
   -H "Content-Type: application/json" \
   -H "X-NS-Key: $KEY_ID" \
   -H "X-NS-Timestamp: $TIMESTAMP" \
   -H "X-NS-Nonce: $NONCE" \
   -H "X-NS-Signature: $SIGNATURE" \
-  -d '{
-    "channel": "email",
-    "to": "test@example.com",
-    "template_id": "basic_email",
-    "priority": "realtime",
-    "variables": {
-      "fromName": "Notification Service",
-      "fromEmail": "no-reply@example.com",
-      "subject": "Hello",
-      "html": "<h1>Hello World</h1>"
-    }
-  }'
+  --data-binary "$BODY"
 ```
 
-For signed GET requests, use the same signing process with the target method and
-path. Example for provider discovery:
+For a request without a body (a `GET`), sign the digest of the empty string and send
+no body. Example for provider discovery:
 
 ```bash
 METHOD="GET"
-PATH="/providers"
+REQ_PATH="/providers"
 TIMESTAMP=$(date +%s)
 NONCE=$(openssl rand -hex 16)
 
-BASE_STRING="$METHOD
-$PATH
-$TIMESTAMP
-$NONCE"
-
-SIGNATURE="v1=$(printf "%s" "$BASE_STRING" | \
+DIGEST=$(printf "" | openssl dgst -sha256 | sed 's/^.* //')
+SIGNATURE="v2=$(printf "%s\n%s\n%s\n%s\n%s" "$METHOD" "$REQ_PATH" "$TIMESTAMP" "$NONCE" "$DIGEST" | \
   openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')"
 
 curl http://localhost:3000/providers \
@@ -693,6 +973,11 @@ import { ProviderDefinition } from '../../../types/provider';
 
 export const pushProvider: ProviderDefinition = {
   name: 'push',
+
+  // The vendor behind this channel, and who renders templates: 'ns' renders the
+  // stored body here, 'provider' sends a template id plus variables.
+  vendor: 'fcm',
+  renders: 'provider',
 
   templates: {
     welcome: 'PUSH_TEMPLATE_1',

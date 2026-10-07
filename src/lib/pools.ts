@@ -1,0 +1,149 @@
+import type Redis from 'ioredis';
+import redis from './redis';
+import { moveDueRetries, popFrom, RETRY_BATCH } from './queue';
+import type { Job, Priority } from 'src/types';
+
+export interface PoolConfig {
+  realtime: number;
+  other: number;
+  bulk: number;
+}
+
+const ENV: Record<Priority, string> = {
+  realtime: 'WORKER_URGENT_CONCURRENCY',
+  other: 'WORKER_NORMAL_CONCURRENCY',
+  bulk: 'WORKER_BULK_CONCURRENCY',
+};
+const ERROR_LOG_INTERVAL_MS = 60_000;
+const DEFAULTS: PoolConfig = { realtime: 2, other: 2, bulk: 1 };
+
+export function poolConfig(env: NodeJS.ProcessEnv = process.env): PoolConfig {
+  const out = { ...DEFAULTS };
+  for (const p of Object.keys(ENV) as Priority[]) {
+    const raw = env[ENV[p]];
+    if (raw === undefined || raw === '') continue;
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n <= 0) {
+      throw new Error(`${ENV[p]} must be a positive integer, got '${raw}'`);
+    }
+    out[p] = n;
+  }
+  return out;
+}
+
+/** What processJob returns when it deferred a job instead of attempting it. */
+export interface Deferred {
+  deferredMs: number;
+}
+
+function deferredMs(result: unknown): number | undefined {
+  if (typeof result !== 'object' || result === null) return undefined;
+  const ms = (result as Partial<Deferred>).deferredMs;
+  return typeof ms === 'number' && Number.isFinite(ms) && ms > 0 ? ms : undefined;
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * One pop + handle. A handler throw is contained: one bad job never ends its
+ * loop. A deferred job (rate limit) makes the loop wait out the deferral before
+ * its next pop, rather than spinning on the same denial.
+ */
+export async function runPoolIteration(
+  conn: Redis,
+  priority: Priority,
+  handle: (job: Job) => Promise<unknown>,
+  wait: (ms: number) => Promise<void> = sleep,
+): Promise<boolean> {
+  const job = await popFrom(conn, priority, 1);
+  if (!job) return false;
+  let result: unknown;
+  try {
+    result = await handle(job);
+  } catch (err) {
+    console.error(
+      `pool ${priority}: job ${job.job_id} failed outside processJob:`,
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+  const backoff = deferredMs(result);
+  if (backoff !== undefined) await wait(backoff);
+  return true;
+}
+
+/**
+ * Separate loops per priority, each on its own blocking connection, plus one
+ * scheduler that moves due retries back into their own priority's queue. Bulk
+ * work can therefore never occupy an urgent loop, and a long bulk send blocks
+ * only its own loop.
+ */
+export function startPools(
+  config: PoolConfig,
+  deps: { connect?: () => Redis; handle?: (job: Job) => Promise<unknown> } = {},
+): { stop(): Promise<void> } {
+  const connect = deps.connect ?? (() => redis.duplicate());
+  const handle = deps.handle ?? (async (job: Job) =>
+      // Lazy require: worker.ts imports this module, so a top-level import would be a load-time cycle.
+      (require('./worker') as typeof import('./worker')).processJob(job));
+  let running = true;
+  const lastLogged = new Map<Redis, Map<string, number>>();
+  // A down Redis emits an error per reconnect attempt; log each distinct
+  // message at most once a minute per connection so it stays readable.
+  const logRedisError = (conn: Redis, priority: Priority, err: Error) => {
+    const seen = lastLogged.get(conn) ?? new Map<string, number>();
+    lastLogged.set(conn, seen);
+    const now = Date.now();
+    const last = seen.get(err.message);
+    if (last !== undefined && now - last < ERROR_LOG_INTERVAL_MS) return;
+    seen.set(err.message, now);
+    console.error(`pool ${priority} redis error: ${err.message}`);
+  };
+  const conns: Redis[] = [];
+  const loops: Promise<void>[] = [];
+
+  for (const priority of Object.keys(config) as Priority[]) {
+    for (let i = 0; i < config[priority]; i++) {
+      const conn = connect();
+      conn.on('error', (err: Error) => logRedisError(conn, priority, err));
+      conns.push(conn);
+      loops.push(
+        (async () => {
+          while (running) {
+            try {
+              await runPoolIteration(conn, priority, handle);
+            } catch (err) {
+              if (!running) break;
+              console.error(
+                `pool ${priority}: pop failed:`,
+                err instanceof Error ? err.message : String(err),
+              );
+              await new Promise((r) => setTimeout(r, 500));
+            }
+          }
+        })(),
+      );
+    }
+  }
+
+  loops.push(
+    (async () => {
+      while (running) {
+        try {
+          // A full batch means more may be due: go again before sleeping.
+          if ((await moveDueRetries()) >= RETRY_BATCH) continue;
+        } catch (err) {
+          console.error('retry scheduler failed:', err instanceof Error ? err.message : String(err));
+        }
+        await new Promise((r) => setTimeout(r, 250));
+      }
+    })(),
+  );
+
+  return {
+    async stop() {
+      running = false;
+      for (const c of conns) c.disconnect();
+      await Promise.allSettled(loops);
+    },
+  };
+}
