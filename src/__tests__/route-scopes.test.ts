@@ -48,7 +48,7 @@ function expected(method: string, url: string): unknown {
 describe('route scope table', () => {
   it('registers the routes the table lists', () => {
     const keys = seen.map((r) => `${r.method} ${r.url}`);
-    for (const k of ['POST /notify', 'POST /v1/notify', 'POST /failed/retry', 'GET /providers', 'GET /providers/:name', 'GET /metrics/queue', 'GET /metrics', 'GET /v1/admin/templates', 'GET /v1/admin/policies']) {
+    for (const k of ['POST /notify', 'POST /v1/notify', 'POST /failed/retry', 'GET /providers', 'GET /providers/:name', 'GET /metrics/queue', 'GET /metrics', 'GET /v1/admin/templates', 'GET /v1/admin/policies', 'GET /v1/admin/export']) {
       expect(keys).toContain(k);
     }
   });

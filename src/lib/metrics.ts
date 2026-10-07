@@ -121,6 +121,14 @@ const HELP: Record<string, [type: string, help: string]> = {
     'counter',
     'Balance polls that failed, by provider and reason.',
   ],
+  ns_content_load_failures_total: [
+    'counter',
+    'Content loads (boot or reload) that failed, by provider. The last good content keeps being served.',
+  ],
+  ns_content_loaded: [
+    'gauge',
+    'Unix time of the latest successful load of this content (version, fingerprint = first 12 hex of the file sha256), by provider. Alert on staleness.',
+  ],
   ns_queue_depth: ['gauge', 'Jobs currently in each queue.'],
   ns_retry_eta_seconds: ['gauge', 'Seconds until the oldest scheduled retry is due.'],
 };

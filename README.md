@@ -94,6 +94,10 @@ is for local runs only).
 | `DATABASE_QUERY_TIMEOUT_MS` | `5000` | Client and server-side query timeout |
 | `DATABASE_SSL` | `disable` | `disable` or `require`; `require` verifies the certificate, so supply the CA via `NODE_EXTRA_CA_CERTS` |
 | `NS_NETWORK` | `unknown` | Network recorded on each event |
+| `NS_SEED_FILE` | unset | Catalogue of templates and policies to create when absent, at boot only; see Catalogue below |
+| `NS_CONTENT_FILE` | unset | Content file for `content_ref` template variables; unset, they are unavailable. Deployments use `/app/content/content.json` |
+| `NS_CONTENT_PROVIDER` | `configmap` | Content source; `configmap` is the only value |
+| `NS_CONTENT_RELOAD_MS` | `30000` | How often the content file is re-read, 1 to 3600000 |
 | `INTERNAL_SECRETS_JSON` | required | Path to the HMAC signing keys file (see [Authentication](#authentication)) |
 | `NS_KEYCLOAK_ISSUER` | unset | Turns bearer-token auth on. Must equal the token `iss` exactly, an http(s) URL with no trailing slash |
 | `NS_KEYCLOAK_JWKS_URI` | `<issuer>/protocol/openid-connect/certs` | Key set location |
@@ -286,6 +290,73 @@ Email variables are HTML-escaped unless declared `raw: true`. Variable `type` is
 (subdomains match). A variable used inside an `href` or `src` attribute must be `type: "url"`,
 and publish rejects malformed tokens such as `{{ name }}`.
 
+### Shared content (`content_ref`)
+
+A variable can take its value from a shared content file, such as the current terms link, instead of
+from the caller. Declare `source: "content_ref"` and a `contentKey`:
+
+```json
+{ "name": "tnc_url", "type": "url", "source": "content_ref", "contentKey": "tnc.in_force.url", "urlHosts": ["example.com"] }
+```
+
+The file named by `NS_CONTENT_FILE`:
+
+```json
+{
+  "version": "2026-10-01",
+  "entries": {
+    "tnc.in_force.url": { "en": "https://example.com/terms/v3", "hi": "https://example.com/hi/terms/v3" }
+  }
+}
+```
+
+A body of `Read the terms: {{tnc_url}}` for an `hi-IN` template renders
+`Read the terms: https://example.com/hi/terms/v3` (the locale chain is `hi-IN`, `hi`, then
+`NS_DEFAULT_LOCALE`). Content resolves when the send is accepted, and the event records each channel's
+`content_refs` (`key`, `version`, `locale`, and `fingerprint`: the first 12 hex of the sha256 of the
+value, so a ref pins the exact text even if the file was edited without a version bump). A `content_ref` variable is always required, cannot be
+`sensitive`, and cannot be supplied by the caller (`422 unknown_variable`). A missing key or locale, an
+invalid value, or no loaded content refuses the send with a configuration `422`
+(`content_unavailable`, `unknown_content_key`, `content_unresolved`, `invalid_content`). The file is
+re-read every `NS_CONTENT_RELOAD_MS`; a bad file keeps the last good version and increments
+`ns_content_load_failures_total`, and `ns_content_loaded{version,fingerprint}` holds the time of the
+latest successful load.
+
+
+### Catalogue
+
+`NS_SEED_FILE` names a JSON file of templates and policies. At boot, each entry whose key has no
+row of any status is created and published; existing rows are never changed, so admin edits survive
+restarts. Entries use the admin create bodies plus `provider` on a template. SMS and WhatsApp entries
+must name their `provider`; only email entries may omit it, and those seed for the deployment's email
+vendor. An entry for a vendor this deployment does not use is skipped. An entry that fails publish
+validation stays a draft and is logged by code; publish it through the admin API. A template with a
+`content_ref` variable publishes only if content is loaded at its first boot; otherwise it, and any
+policy that lists it, stays a draft, so publish them through the admin API once content loads.
+Seeding never blocks the boot, and the file is read only at boot.
+
+```json
+{
+  "version": "2026-10-06",
+  "templates": [
+    { "channel": "email", "template_key": "item.paused", "subject": "Paused",
+      "body_html": "<p>Hi {{name}}</p>", "variables": [{ "name": "name" }] }
+  ],
+  "policies": [
+    { "domain": "seeker", "event_type": "item.paused", "mode": "first_available",
+      "channels": [{ "channel": "email", "template_key": "item.paused" }] }
+  ]
+}
+```
+
+`GET /v1/admin/export` returns the active templates and policies of the network in this format,
+without ids or timestamps, so it can seed another environment. Output is sorted, so two exports of
+one store are identical apart from `version`, the export timestamp. A store that does not fit the
+format (for example more than 500 active templates) answers `422 export_invalid`, naming paths only:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" https://ns.example.com/v1/admin/export > catalogue.json
+```
 
 ## Queue Model
 
@@ -388,7 +459,7 @@ string is skipped with a boot warning naming its key id; any other malformed ent
 | Scope | Routes |
 |---|---|
 | `notify:send` | `POST /v1/notify`, `POST /notify` |
-| `templates:admin` | `/v1/admin/templates*`, `/v1/admin/policies*`, `POST /failed/retry` |
+| `templates:admin` | `/v1/admin/templates*`, `/v1/admin/policies*`, `GET /v1/admin/export`, `POST /failed/retry` |
 | any authenticated | `GET /providers`, `GET /providers/:name`, `GET /metrics/queue` |
 
 A missing scope is `403 {"error":"Insufficient scope","required":"<scope>"}`. `GET /metrics`
@@ -467,7 +538,8 @@ keys return `400`.
 
 `422` codes. `caller`: `missing_variable`, `unknown_variable`, `invalid_variable`,
 `no_reachable_channel`. `configuration`: `not_found`, `vendor_mismatch`, `incomplete_template`,
-`body_too_long`, `unknown_channel`, `no_policy`. Messages name variables, never their values.
+`body_too_long`, `unknown_channel`, `no_policy`, `content_unavailable`, `unknown_content_key`,
+`content_unresolved`, `invalid_content`. Messages name variables, never their values.
 
 Urgent sends and sends using a template with a `sensitive` variable are redacted: only variable names
 are stored, and they are never dead-lettered. See `CLAUDE.md` (Send API v1) for planning, fallthrough,

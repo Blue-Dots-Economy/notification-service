@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const policies = vi.hoisted(() => ({ resolvePolicy: vi.fn() }));
 const templates = vi.hoisted(() => ({ resolveTemplate: vi.fn() }));
 vi.mock('../../policies/repo', () => policies);
@@ -6,9 +7,12 @@ vi.mock('../../templates/repo', () => templates);
 
 import { planSend } from '../plan';
 import { clearResolveCache } from '../resolver-cache';
-import { SendError } from '../errors';
+import { SendError, classify } from '../errors';
 import { TemplateError } from '../../templates/errors';
 import { V1NotifySchema } from '../request';
+import { parseContentDocument } from '../../content/configmap';
+import { setContentForTests } from '../../content/resolver';
+import { contentRefsFor } from '../../content/refs';
 
 const v = (name: string, extra = {}) => ({ name, required: true, type: 'string', sensitive: false, raw: false, ...extra });
 const tpl = (over: Record<string, unknown>) => ({
@@ -37,12 +41,12 @@ function policy(mode: 'first_available' | 'all') {
 }
 
 describe('planSend', () => {
-  it('variables are checked against the union of planned contracts', async () => {
+  it('each planned template renders only its own variables', async () => {
     policy('first_available');
     const plan = await planSend(req({ event_type: 'apply', to: { phone: '+919999999999', email: 'a@b.co' }, variables: { name: 'A', link: 'https://x.org/' } }));
     expect(plan.deliveries.map((d) => d.channel)).toEqual(['sms', 'email']);
     expect(plan.deliveries[0]!.rendered).toMatchObject({ mode: 'provider', variables: { name: 'A' } });
-    expect(await codeOf(planSend(req({ event_type: 'apply', to: { phone: '+919999999999' }, variables: { name: 'A', bogus: 'x' } })))).toBe('unknown_variable');
+    expect(plan.deliveries[1]!.rendered).toMatchObject({ mode: 'ns' });
   });
 
   it('drops channels without a contact point', async () => {
@@ -163,5 +167,153 @@ describe('planSend', () => {
     templates.resolveTemplate.mockResolvedValue({ template: emailT, renders: 'ns' });
     const plan = await planSend(req({ template_key: 'apply_email', channel: 'email', to: { email: 'a@b.co' }, variables: { name: 'A', link: 'https://X.org' } }));
     expect(plan.variables).toEqual({ name: 'A', link: 'https://x.org/' });
+  });
+
+  it.each(['unknown_content_key', 'content_unavailable', 'content_unresolved', 'invalid_content'])('content error %s classifies as configuration', (code) => {
+    expect(classify(code)).toBe('configuration');
+  });
+});
+
+describe('planSend — event variables span every policy template', () => {
+  const guardianEmail = tpl({ channel: 'email', templateKey: 'guardian.account', provider: 'smtp', providerTemplateId: null, subject: 'S', bodyHtml: '<p>{{message}} {{parentName}}</p>', variables: [v('message'), v('parentName')] });
+  const loginOtp = tpl({ channel: 'sms', templateKey: 'login_otp', variables: [v('message')] });
+  const phoneOnly = { phone: '+919999999999' };
+  const setup = (emailResolves = true) => {
+    policies.resolvePolicy.mockResolvedValue({ mode: 'first_available', channels: [{ channel: 'email', template_key: 'guardian.account' }, { channel: 'sms', template_key: 'login_otp' }] });
+    templates.resolveTemplate.mockImplementation(async (channel: string) => {
+      if (channel === 'email') {
+        if (!emailResolves) throw new TemplateError('not_found', 'no active email template');
+        return { template: guardianEmail, renders: 'ns' };
+      }
+      return { template: loginOtp, renders: 'provider' };
+    });
+  };
+
+  it('phone-only event accepts email-only variables', async () => {
+    setup();
+    const plan = await planSend(req({ event_type: 'guardian.otp.account', to: phoneOnly, variables: { message: '123456', parentName: 'P' } }));
+    expect(plan.deliveries).toHaveLength(1);
+    expect(plan.deliveries[0]!.channel).toBe('sms');
+    expect(plan.deliveries[0]!.rendered).toMatchObject({ mode: 'provider', variables: { message: '123456' } });
+    expect(Object.keys((plan.deliveries[0]!.rendered as { variables: object }).variables)).toEqual(['message']);
+  });
+
+  it('an event variable no template uses is ignored', async () => {
+    setup();
+    const plan = await planSend(req({ event_type: 'guardian.otp.account', to: phoneOnly, variables: { message: '1', bogus: 'x' } }));
+    expect(plan.deliveries[0]!.rendered).toMatchObject({ variables: { message: '1' } });
+    expect(Object.keys((plan.deliveries[0]!.rendered as { variables: object }).variables)).toEqual(['message']);
+  });
+
+  it('planning resolves only the delivered candidate', async () => {
+    setup();
+    await planSend(req({ event_type: 'guardian.otp.account', to: phoneOnly, variables: { message: '1', parentName: 'P' } }));
+    expect(templates.resolveTemplate).toHaveBeenCalledTimes(1);
+    expect(templates.resolveTemplate.mock.calls[0]![0]).toBe('sms');
+  });
+
+  it('template_key send with an unknown variable is still unknown_variable', async () => {
+    templates.resolveTemplate.mockResolvedValue({ template: loginOtp, renders: 'provider' });
+    const e = await planSend(req({ template_key: 'login_otp', channel: 'sms', to: phoneOnly, variables: { message: '1', bogus: 'x' } })).catch((x) => x);
+    expect(e).toMatchObject({ code: 'unknown_variable', kind: 'caller' });
+  });
+
+  it('event send missing a required variable of a planned template is missing_variable', async () => {
+    setup();
+    expect(await codeOf(planSend(req({ event_type: 'guardian.otp.account', to: phoneOnly, variables: { parentName: 'P' } })))).toBe('missing_variable');
+  });
+});
+
+describe('planSend — content_ref variables', () => {
+  const tncV = v('tnc_url', { type: 'url', source: 'content_ref', contentKey: 'tnc.in_force.url', urlHosts: ['example.org'] });
+  const tncSms = tpl({ channel: 'sms', templateKey: 'tnc_sms', variables: [v('name'), tncV] });
+  const plainEmail = tpl({ channel: 'email', templateKey: 'tnc_email', provider: 'smtp', providerTemplateId: null, subject: 'Hi {{name}}', bodyText: 'Hi {{name}}', variables: [v('name')] });
+  const fp12 = (text: string) => createHash('sha256').update(text).digest('hex').slice(0, 12);
+  const loadTnc = () => setContentForTests(parseContentDocument({ version: 'v3', entries: { 'tnc.in_force.url': { en: 'https://example.org/tnc' } } }));
+  afterEach(() => setContentForTests(null));
+
+  it('unresolved content refuses the send', async () => {
+    templates.resolveTemplate.mockResolvedValue({ template: tncSms, renders: 'provider' });
+    const e = await planSend(req({ template_key: 'tnc_sms', channel: 'sms', to: { phone: '+919999999999' }, variables: { name: 'A' } })).catch((x) => x);
+    expect(e).toBeInstanceOf(SendError);
+    expect(e).toMatchObject({ code: 'content_unavailable', kind: 'configuration' });
+  });
+
+  it('a caller naming a content variable is unknown_variable', async () => {
+    loadTnc();
+    templates.resolveTemplate.mockResolvedValue({ template: tncSms, renders: 'provider' });
+    const e = await planSend(req({ template_key: 'tnc_sms', channel: 'sms', to: { phone: '+919999999999' }, variables: { name: 'A', tnc_url: 'https://example.org/other' } })).catch((x) => x);
+    expect(e).toMatchObject({ code: 'unknown_variable', kind: 'caller', details: { variables: ['tnc_url'] } });
+  });
+
+  it('content renders into the delivery and contentRefs is set', async () => {
+    loadTnc();
+    templates.resolveTemplate.mockResolvedValue({ template: tncSms, renders: 'provider' });
+    const plan = await planSend(req({ template_key: 'tnc_sms', channel: 'sms', to: { phone: '+919999999999' }, variables: { name: 'A' } }));
+    expect(plan.deliveries[0]!.rendered).toMatchObject({ mode: 'provider', variables: { name: 'A', tnc_url: 'https://example.org/tnc' } });
+    expect(plan.deliveries[0]!.contentRefs).toEqual([{ key: 'tnc.in_force.url', version: 'v3', locale: 'en', fingerprint: fp12('https://example.org/tnc') }]);
+  });
+
+  it('two content variables on one key: the per-channel map records the ref once', async () => {
+    loadTnc();
+    const tncV2 = v('tnc_link', { type: 'url', source: 'content_ref', contentKey: 'tnc.in_force.url' });
+    const twice = tpl({ channel: 'sms', templateKey: 'tnc_sms', variables: [v('name'), tncV, tncV2] });
+    templates.resolveTemplate.mockResolvedValue({ template: twice, renders: 'provider' });
+    const plan = await planSend(req({ template_key: 'tnc_sms', channel: 'sms', to: { phone: '+919999999999' }, variables: { name: 'A' } }));
+    expect(plan.deliveries[0]!.rendered).toMatchObject({ variables: { tnc_url: 'https://example.org/tnc', tnc_link: 'https://example.org/tnc' } });
+    expect(contentRefsFor(plan.deliveries)).toEqual({ contentRefs: { sms: [{ key: 'tnc.in_force.url', version: 'v3', locale: 'en', fingerprint: fp12('https://example.org/tnc') }] } });
+  });
+
+  it('contentRefsFor keeps two refs that differ only by fingerprint', () => {
+    const a = { key: 'k.a', version: 'v1', locale: 'en', fingerprint: 'aaaaaaaaaaaa' };
+    const b = { ...a, fingerprint: 'bbbbbbbbbbbb' };
+    expect(contentRefsFor([{ channel: 'sms', contentRefs: [a, a, b] }])).toEqual({ contentRefs: { sms: [a, b] } });
+  });
+
+  it('a delivery with no content variables has empty contentRefs', async () => {
+    policy('first_available');
+    const plan = await planSend(req({ event_type: 'apply', to: { phone: '+919999999999' }, variables: { name: 'A' } }));
+    expect(plan.deliveries[0]!.contentRefs).toEqual([]);
+  });
+
+  it('first_available skips a candidate whose content is unresolved and uses the next', async () => {
+    policies.resolvePolicy.mockResolvedValue({ mode: 'first_available', channels: [{ channel: 'sms', template_key: 'tnc_sms' }, { channel: 'email', template_key: 'tnc_email' }] });
+    templates.resolveTemplate.mockImplementation(async (channel: string) =>
+      channel === 'sms' ? { template: tncSms, renders: 'provider' } : { template: plainEmail, renders: 'ns' });
+    const plan = await planSend(req({ event_type: 'tnc', to: { phone: '+919999999999', email: 'a@b.co' }, variables: { name: 'A' } }));
+    expect(plan.deliveries.map((d) => d.channel)).toEqual(['email']);
+    expect(plan.deliveries[0]!.contentRefs).toEqual([]);
+  });
+
+  it('an event send renders the resolved content value in every delivered template', async () => {
+    loadTnc();
+    const tncEmail = tpl({ channel: 'email', templateKey: 'tnc_email', provider: 'smtp', providerTemplateId: null, subject: 'Hi {{name}}', bodyText: 'Terms: {{tnc_url}}', variables: [v('name'), tncV] });
+    policies.resolvePolicy.mockResolvedValue({ mode: 'all', channels: [{ channel: 'sms', template_key: 'tnc_sms' }, { channel: 'email', template_key: 'tnc_email' }] });
+    templates.resolveTemplate.mockImplementation(async (channel: string) =>
+      channel === 'sms' ? { template: tncSms, renders: 'provider' } : { template: tncEmail, renders: 'ns' });
+    const plan = await planSend(req({ event_type: 'tnc', to: { phone: '+919999999999', email: 'a@b.co' }, variables: { name: 'A' } }));
+    expect(plan.deliveries.map((d) => d.channel)).toEqual(['sms', 'email']);
+    expect(plan.deliveries[0]!.rendered).toMatchObject({ mode: 'provider', variables: { name: 'A', tnc_url: 'https://example.org/tnc' } });
+    expect(plan.deliveries[1]!.rendered).toMatchObject({ mode: 'ns', channel: 'email', text: 'Terms: https://example.org/tnc' });
+    for (const d of plan.deliveries) expect(d.contentRefs).toEqual([{ key: 'tnc.in_force.url', version: 'v3', locale: 'en', fingerprint: fp12('https://example.org/tnc') }]);
+  });
+
+  it('an event send carrying a content variable name renders the content value, not the caller value', async () => {
+    loadTnc();
+    policies.resolvePolicy.mockResolvedValue({ mode: 'first_available', channels: [{ channel: 'sms', template_key: 'tnc_sms' }] });
+    templates.resolveTemplate.mockResolvedValue({ template: tncSms, renders: 'provider' });
+    const plan = await planSend(req({ event_type: 'tnc', to: { phone: '+919999999999' }, variables: { name: 'A', tnc_url: 'https://example.org/other' } }));
+    expect(plan.deliveries[0]!.rendered).toMatchObject({ mode: 'provider', variables: { name: 'A', tnc_url: 'https://example.org/tnc' } });
+    expect(plan.deliveries[0]!.contentRefs).toEqual([{ key: 'tnc.in_force.url', version: 'v3', locale: 'en', fingerprint: fp12('https://example.org/tnc') }]);
+  });
+
+  it('first_available: when every candidate fails on content, the first configuration error is thrown', async () => {
+    const tncEmail = tpl({ channel: 'email', templateKey: 'tnc_email', provider: 'smtp', providerTemplateId: null, subject: 'Hi {{name}}', bodyText: '{{tnc_url}}', variables: [v('name'), tncV] });
+    policies.resolvePolicy.mockResolvedValue({ mode: 'first_available', channels: [{ channel: 'sms', template_key: 'tnc_sms' }, { channel: 'email', template_key: 'tnc_email' }] });
+    templates.resolveTemplate.mockImplementation(async (channel: string) =>
+      channel === 'sms' ? { template: tncSms, renders: 'provider' } : { template: tncEmail, renders: 'ns' });
+    const e = await planSend(req({ event_type: 'tnc', to: { phone: '+919999999999', email: 'a@b.co' }, variables: { name: 'A' } })).catch((x) => x);
+    expect(e).toBeInstanceOf(SendError);
+    expect(e).toMatchObject({ code: 'content_unavailable', kind: 'configuration' });
   });
 });

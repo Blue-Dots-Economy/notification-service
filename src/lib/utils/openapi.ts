@@ -1,4 +1,5 @@
 import { providers } from '../providers';
+import { CONTENT_KEY } from '../templates/contract';
 import { serializeProvider } from './provider-docs';
 
 // Either credential type authenticates a request (alternatives, not both at once).
@@ -43,7 +44,7 @@ const adminErrors = {
   '404': errorBody('not_found: no such template or policy'),
   '409': errorBody('invalid_state: the row is not in a state that allows this change'),
   '422': errorBody(
-    'A template or policy rule was violated (vendor_mismatch, incomplete_template, undeclared_token, unused_variable, body_too_long, invalid_contract, unknown_channel, missing_variable, unknown_variable, invalid_variable)'
+    'A template or policy rule was violated (vendor_mismatch, incomplete_template, undeclared_token, unused_variable, body_too_long, invalid_contract, unknown_channel, missing_variable, unknown_variable, invalid_variable, content_unavailable, unknown_content_key, content_unresolved, invalid_content)'
   ),
   '503': errorBody(
     `network_not_configured: NS_NETWORK is not set; database_unavailable: the template/policy store could not be reached; ${AUTH_UNAVAILABLE}`,
@@ -98,6 +99,20 @@ const policyChannels = {
 };
 
 const adminSchemas = {
+  Catalogue: {
+    type: 'object',
+    required: ['version', 'templates', 'policies'],
+    additionalProperties: false,
+    properties: {
+      version: { type: 'string', pattern: '^[A-Za-z0-9._-]{1,64}$' },
+      templates: {
+        type: 'array',
+        maxItems: 500,
+        items: { $ref: '#/components/schemas/TemplateEntry' },
+      },
+      policies: { type: 'array', maxItems: 500, items: { $ref: '#/components/schemas/PolicyCreate' } },
+    },
+  },
   SendAccepted: {
     type: 'object',
     required: ['notification_event_id', 'correlation_id', 'status', 'mode', 'deliveries'],
@@ -127,6 +142,19 @@ const adminSchemas = {
         minItems: 1,
         items: { type: 'string' },
         description: 'Allowed hosts for url variables; subdomains match. Valid only when type is url.',
+      },
+      source: {
+        type: 'string',
+        enum: ['request', 'content_ref'],
+        default: 'request',
+        description:
+          'request: the caller supplies the value. content_ref: the value comes from the shared content file by `contentKey`; callers cannot supply it. content_ref variables are always required and cannot be sensitive.',
+      },
+      contentKey: {
+        type: 'string',
+        maxLength: 128,
+        pattern: CONTENT_KEY.source,
+        description: 'The content key, e.g. tnc.in_force.url. Required when source is content_ref, and valid only then.',
       },
     },
   },
@@ -181,6 +209,19 @@ const adminSchemas = {
     },
   },
   TemplatePatch: { type: 'object', additionalProperties: false, properties: templatePatchProperties },
+  TemplateEntry: {
+    type: 'object',
+    description: 'A catalogue template: the template create body plus `provider`. Only email entries may omit `provider`; SMS and WhatsApp entries name the vendor they are for.',
+    required: ['channel', 'template_key'],
+    additionalProperties: false,
+    properties: {
+      channel: { type: 'string', minLength: 1, maxLength: 32, example: 'sms' },
+      template_key: { type: 'string', pattern: '^[a-z0-9_.-]+$', maxLength: 128, example: 'welcome' },
+      locale: { type: 'string', pattern: '^[a-z]{2,3}(-[A-Z]{2})?$', description: 'Defaults to NS_DEFAULT_LOCALE.' },
+      provider: { type: 'string', minLength: 1, maxLength: 32, example: 'msg91', description: 'Required unless channel is email.' },
+      ...templatePatchProperties,
+    },
+  },
   Policy: {
     type: 'object',
     properties: {
@@ -354,6 +395,27 @@ const adminPaths = {
   },
 };
 
+const adminExportPath = {
+  '/v1/admin/export': {
+    get: adminOp(
+      'Export the active catalogue',
+      'Active templates (for the deployment\'s current vendors) and policies of NS_NETWORK, in the catalogue format that NS_SEED_FILE reads. Carries no ids, versions, actors or timestamps; output is sorted so two exports of one store are identical apart from `version` (the export timestamp).',
+      {
+        responses: {
+          '200': {
+            description: 'Catalogue',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Catalogue' } } },
+          },
+          '401': adminErrors['401'],
+          '403': adminErrors['403'],
+          '422': errorBody('export_invalid: the active rows do not fit the catalogue format (e.g. more than 500 templates); the message names paths only'),
+          '503': adminErrors['503'],
+        },
+      }
+    ),
+  },
+};
+
 export function openApiDocument() {
   const providerExamples = Object.fromEntries(
     Object.values(providers).map((provider) => [
@@ -375,6 +437,7 @@ export function openApiDocument() {
     },
     paths: {
       ...adminPaths,
+      ...adminExportPath,
       '/v1/notify': {
         post: {
           summary: 'Send a notification (Send API v1)',
@@ -402,7 +465,13 @@ export function openApiDocument() {
                 },
               },
               locale: { type: 'string', pattern: '^[a-z]{2,3}(-[A-Z]{2})?$' },
-              variables: { type: 'object', additionalProperties: true, default: {} },
+              variables: {
+                type: 'object',
+                additionalProperties: true,
+                default: {},
+                description:
+                  'With `event_type`, variables are data: each planned template takes the ones it declares and the rest are ignored; a required one that is missing is `missing_variable`. With `template_key`, a name the template does not declare is `422 unknown_variable`.',
+              },
               priority: { type: 'string', enum: ['urgent', 'normal', 'bulk'], default: 'normal' },
               idempotency_key: { type: 'string', minLength: 1, maxLength: 128 },
               deadline: {
@@ -447,7 +516,7 @@ export function openApiDocument() {
             '409': errorBody('idempotency_in_progress, or duplicate-fallback (a repeat without an idempotency_key within 5 seconds)'),
             '422': {
               description:
-                'The send was refused. `kind` is `caller` (missing_variable, unknown_variable, invalid_variable, no_reachable_channel) or `configuration` (not_found, vendor_mismatch, incomplete_template, body_too_long, unknown_channel, no_policy).',
+                'The send was refused. `kind` is `caller` (missing_variable, unknown_variable, invalid_variable, no_reachable_channel) or `configuration` (not_found, vendor_mismatch, incomplete_template, body_too_long, unknown_channel, no_policy, content_unavailable, unknown_content_key, content_unresolved, invalid_content).',
               content: {
                 'application/json': {
                   schema: {

@@ -50,6 +50,36 @@ describe('audit partitions', () => {
     await getPool().query(`DELETE FROM notification_event_default`);
   });
 
+  it.each(['notification_event', 'delivery_attempt'])(
+    '%s keeps 90 days: maintenance drops a partition whose whole month is older',
+    async (table) => {
+      const { rows: cfg } = await getPool().query(
+        `SELECT retention, retention_keep_table FROM partman.part_config WHERE parent_table = $1`,
+        [`public.${table}`],
+      );
+      expect(cfg[0]).toEqual({ retention: '90 days', retention_keep_table: false });
+
+      // A month that ended well over 90 days ago, and last month (inside the window).
+      const now = new Date();
+      const old = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 6, 1));
+      const recent = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+      await getPool().query(`SELECT partman.create_partition_time($1, ARRAY[$2::timestamptz, $3::timestamptz])`, [
+        `public.${table}`,
+        old.toISOString(),
+        recent.toISOString(),
+      ]);
+      const tag = (d: Date) => `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+      expect((await childPartitions(table)).some((p) => p.includes(tag(old)))).toBe(true);
+
+      await expect(runPartitionMaintenance()).resolves.toBe(true);
+
+      const after = await childPartitions(table);
+      expect(after.some((p) => p.includes(tag(old)))).toBe(false);
+      expect(after.some((p) => p.includes(tag(recent)))).toBe(true);
+      expect(after.some((p) => p.includes(tag(now)))).toBe(true);
+    },
+  );
+
   it('maintenance runs, and a concurrent run yields instead of blocking', async () => {
     const holder = await getPool().connect();
     try {

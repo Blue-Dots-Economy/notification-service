@@ -5,6 +5,7 @@ import type { Job } from 'src/types';
 import { recordAcceptedMany } from '../lib/audit/store';
 import { toAcceptedRecord } from '../lib/audit/redact';
 import { stamp } from '../lib/audit/stamp';
+import { contentRefsFor } from '../lib/content/refs';
 import { correlationIdFrom } from '../lib/correlation';
 import { describeDbError } from '../lib/db/errors';
 import { dedupe, releaseDedupe } from '../lib/dedupe';
@@ -34,6 +35,10 @@ function buildJobs(req: V1Request, plan: SendPlan, correlationHeader: unknown): 
       : undefined;
   const recipients: Record<string, string> = {};
   for (const [k, v] of Object.entries(req.to)) if (typeof v === 'string') recipients[k] = v;
+  // Plan-wide, like recipients: in `all` mode the event row is written from
+  // the first job, so every job carries every channel's refs and the
+  // delivering attempt's channel picks its entry.
+  const contentRefs = contentRefsFor(plan.deliveries);
   const make = (deliveries: SendPlan['deliveries']): Job => ({
     job_id: randomUUID(),
     channel: deliveries[0]!.channel,
@@ -59,6 +64,9 @@ function buildJobs(req: V1Request, plan: SendPlan, correlationHeader: unknown): 
       deliveryMode: plan.mode,
       recipients,
       ...(plan.redact ? { variableNames: Object.keys(plan.variables) } : {}),
+      ...contentRefs,
+      ...(req.event_type ? { eventType: req.event_type } : {}),
+      ...(req.domain ? { domain: req.domain } : {}),
     },
   });
   return plan.mode === 'all' ? plan.deliveries.map((d) => make([d])) : [make(plan.deliveries)];

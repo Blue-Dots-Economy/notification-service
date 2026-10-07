@@ -207,7 +207,15 @@ move rows out of a default partition, and a row in the default for a future rang
 `run_maintenance` skip that partition set. Each tick therefore runs
 `partman.check_default(p_exact_count := false)`, logs a warning and sets
 `ns_partition_default_rows{parent}` (1 = non-empty); move the rows with
-`partman.partition_data_proc`. There is no retention until #65, so nothing is dropped today.
+`partman.partition_data_proc`.
+
+**Retention: 90 days** (`drizzle/0005_audit_retention_90d.sql`). `notification_event` and
+`delivery_attempt` are set to `retention = '90 days'` in `partman.part_config`, so the same
+maintenance run drops a monthly partition once its whole month is older than 90 days. A row lives
+at least 90 days and at most about 121 (the month it was written in, plus 90 days). Partitions are
+dropped, not detached, so the data is gone. Rows in a default partition are not covered (see
+`check_default` above). The `idempotency_key` table is pruned separately after 90 days. Tier-2
+rollups and erasure tooling remain #65.
 
 ### Authentication
 
@@ -234,7 +242,7 @@ METHOD\npath\ntimestamp\nnonce\nsha256(body)
 | --- | --- |
 | `POST /v1/notify` | `notify:send` |
 | `POST /notify` (legacy; HMAC v1 or v2) | `notify:send` |
-| `/v1/admin/templates*`, `/v1/admin/policies*` | `templates:admin` |
+| `/v1/admin/templates*`, `/v1/admin/policies*`, `GET /v1/admin/export` | `templates:admin` |
 | `POST /failed/retry` | `templates:admin` |
 | `GET /providers`, `GET /providers/:name`, `GET /metrics/queue` | any authenticated principal |
 | `GET /metrics` | none |
@@ -452,6 +460,116 @@ current vendor's template is created and published, which retires the old vendor
 serialise on a session advisory lock. Seeding is non-fatal (logged, never blocks listen) and is
 skipped when `NS_NETWORK` is unset; a template that fails publish validation is left as a draft and retried next boot.
 
+**Catalogue** (`src/lib/catalogue/`: `schema`, `seed`, `export`; route `src/routes/admin-export.ts`).
+A catalogue is one JSON file `{ version, templates: [...], policies: [...] }` (at most 1 MiB, 500
+templates, 500 policies). Its entries are exactly the admin create bodies, plus an optional
+`provider` on a template, so a catalogue holds only what the admin API accepts. `NS_SEED_FILE`
+names the file; unset, nothing is seeded. A missing, unreadable or invalid file is logged and
+skipped, and the boot always continues.
+- **Seed-if-absent (F1-1).** An entry is created only when no row of any status exists for its key:
+  a template by `(network, channel, template_key, locale, provider)`, a policy by `(network, domain,
+  event_type)`. Existing rows are never updated, retired or replaced, so admin edits survive every
+  restart; after seeding, changes go through the admin API.
+- **Boot only (F1-2).** Seeding runs once per boot, after `login_otp` env seeding, templates before
+  policies, under the `notification-service:seed` advisory lock. Replicas booting together
+  serialise, and the wait for the lock is bounded at about 2 minutes. A catalogue change reaches a
+  cluster at the next rollout.
+- **Providers.** A template entry naming a vendor other than the deployment's is skipped, so one
+  catalogue can carry msg91 and pinnacle variants of an SMS template. Only email entries may omit
+  `provider` (they seed for the deployment's email vendor); SMS and WhatsApp entries must name it
+  (`TemplateEntrySchema` refine). A provider-less SMS entry would otherwise seed the old vendor's
+  ids under the new vendor after a vendor switch, and its publish would retire the old row.
+- **Drafts.** An entry that fails publish validation is left as a draft and logged by code, never
+  with values; a database error between create and publish logs `left as draft: db_error`. A draft
+  counts as existing on later boots, so an operator publishes it through the admin API (fix it with
+  `PATCH`, then `POST .../publish`). A template with a `content_ref` variable needs content loaded
+  at its first boot: without it the template, and every policy that lists it, is created as a
+  draft and stays one on later boots. Publish them through the admin API once content loads.
+- **Export and round trip (F1-3).** `GET /v1/admin/export` (`templates:admin`) returns the active
+  templates (current vendors only) and active policies of `NS_NETWORK` as a catalogue with no ids,
+  versions, actors or timestamps. Output is sorted by code point, so two exports of one store are
+  identical apart from `version`, which is the export timestamp. A store that does not fit the
+  catalogue format (e.g. more than 500 active templates) answers `422 export_invalid`, naming paths
+  only. Seeding an empty network from an export reproduces the
+  export. Unset `NS_NETWORK` answers `503 network_not_configured`.
+
+### Content resolver
+
+Code: `src/lib/content/` (`types`, `configmap`, `resolver`, `inject`). A template variable can take its
+value from shared content, such as a terms-and-conditions link, instead of from the caller.
+
+**Variable fields.** `source: "request"` (default) or `"content_ref"`, plus `contentKey` for
+`content_ref`. The key is dotted lowercase segments matching `CONTENT_KEY`
+(`^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){1,7}$`), e.g. `tnc.in_force.url` or `tnc.on_offer.text`; NS does
+not interpret the segments, and `in_force` versus `on_offer` is part of the key (an acceptance receipt
+carries the in-force text, a re-consent broadcast the offered one). A `content_ref` variable is always
+required, is never `sensitive` (shared public content has nothing to redact), and may be `raw` under
+the same email-only rule as other variables.
+
+**File format.** One JSON document, at most 1 MiB:
+`{ "version": "2026-10-01", "entries": { "<key>": { "<locale>": "<value>" } } }`. `version` matches
+`^[A-Za-z0-9._-]{1,64}$`; locales look like `en` or `en-IN`; at most 500 keys; each value is a
+non-blank string of at most 2000 characters. Unknown top-level fields are rejected. A `url` variable's
+value passes the same checks as a caller URL (http(s), no userinfo, `urlHosts` when declared).
+
+**Configuration.** `NS_CONTENT_PROVIDER` (`configmap`), `NS_CONTENT_FILE` (the path), and
+`NS_CONTENT_RELOAD_MS` (1 to 3600000, default 30000). Deployments set
+`NS_CONTENT_FILE=/app/content/content.json`. The provider reads only that file, never environment
+variables, secrets or other config. The provider interface leaves room for `db` and `http` providers
+as a configuration change.
+
+**Allowlist (E1).** The keys of the loaded file are the allowlist. A template may reference a key only
+if the current file defines it; there is no second list of permitted prefixes. Keys come from template
+contracts, which only `templates:admin` can write, never from requests.
+
+**Resolution at accept (E2).** Content resolves where the send is planned, so a failure is a
+synchronous `422` and a queued message carries the version current when it was accepted. The worker
+never consults content. Values are memoised per `(key, locale, version)`. Preview and publish resolve
+content too: publish checks that the key exists, that the template's locale chain resolves
+(`content_unresolved`), and that the value passes the variable's type and `urlHosts` checks
+(`invalid_content`). A template cannot be published before its content exists for its locale.
+
+**Locale chain.** The resolved template's locale, then its language, then `NS_DEFAULT_LOCALE`.
+
+**Errors.** All four are configuration errors (`422`, `kind: configuration` on `/v1/notify`), and a
+send is refused rather than rendered with an empty value:
+`content_unavailable` (no content loaded), `unknown_content_key`, `content_unresolved` (no value for
+the locale chain), `invalid_content` (the value fails the variable's type or `urlHosts` check).
+Messages name the key and variable, never the value.
+
+**Callers cannot supply content.** A request variable under a content variable's name is
+`422 unknown_variable` on a `template_key` send (an `event_type` send ignores it); content variables are not part of the caller contract.
+
+**Event record (E3).** The event payload carries `content_refs`, a per-channel map
+`{ "<channel>": [{ key, version, locale, fingerprint }] }`, de-duplicated per channel and built from each planned
+delivery's own references (`src/lib/content/refs.ts`). Every job of a send carries the whole map, so
+the event row holds every channel's entry in any mode, and the delivering attempt's channel selects
+the entry that applied. These are references, never values, and are recorded for redacted sends
+too, so an audit can answer which terms version a message carried. `fingerprint` is the first 12 hex
+of the sha256 of the resolved value: it pins the exact text, so an edit that keeps `version` still
+yields a different ref.
+
+**Reload and boot (E4).** The first load happens at boot and the file is re-read every
+`NS_CONTENT_RELOAD_MS`; a slow load never overlaps the next. Every successful reload takes effect
+and clears the memo. A same-version reload that has different content still takes effect and logs a
+warning (bump the version on edits). A bad or unreadable file keeps the last good snapshot, logs
+the problem without values and increments `ns_content_load_failures_total`; every successful load
+sets `ns_content_loaded{version,fingerprint}` (fingerprint = first 12 hex of the file's sha256) to
+the load time. An invalid `NS_CONTENT_PROVIDER` or `NS_CONTENT_RELOAD_MS` fails boot
+like other config (`validateBootConfig`); a missing or broken content file never does: until a valid
+file loads, `content_ref` sends answer `422 content_unavailable`.
+
+**Rollout.** Publish templates with `content_ref` variables only after every pod runs a build with
+the content resolver: an older pod treats the variable as a caller variable and answers
+`missing_variable`.
+
+**Isolation.** A template with no content variables never consults the resolver, so OTP and every
+other send are unaffected by content being off, missing or broken.
+
+**Mounting.** Mount the ConfigMap as a directory, not with `subPath`: Kubernetes updates directory
+mounts in place and never updates `subPath` mounts, so only a directory mount receives edits
+without a restart.
+
 ## Send API v1
 
 Code: `src/routes/v1-notify.ts`, `src/lib/send/` (`request`, `plan`, `errors`, `idempotency`,
@@ -470,8 +588,12 @@ identity are not accepted; the sender is server config (`EMAIL_FROM_ADDRESS`, `E
 Without `EMAIL_FROM_ADDRESS` an email delivery fails permanently with `email sender not configured`.
 
 **Planning** (`planSend`) renders and validates everything before the request is accepted. Request
-variables are checked against the union of the planned templates' contracts (a name declared by none
-is `unknown_variable`); each template renders with only its own declared variables. A failure is
+variables are checked by send type. With `template_key` a name the template does not declare is
+`unknown_variable`. With `event_type` the variables are data: each planned template picks the ones it
+declares and the rest are ignored (a phone-only guardian OTP can carry the email template's variables),
+while a missing required one is `missing_variable`; planning reads no template beyond the candidates it
+delivers, so the urgent path adds no Postgres dependency. Each template
+renders with only its own declared variables. A failure is
 `422 {error, kind, message, details?}` and counts `ns_send_rejected_total{kind,code}`:
 - `caller`: `missing_variable`, `unknown_variable`, `invalid_variable`, `no_reachable_channel`.
 - `configuration`: `not_found`, `vendor_mismatch`, `incomplete_template`, `body_too_long`,
@@ -546,6 +668,14 @@ a 5-second content guard answers a repeat with `409 duplicate-fallback`.
 **Correlation id.** The body's `correlation_id` (trimmed, at most 128, else `400`) wins over the
 `x-correlation-id` header; blank falls back to the header, then the event id.
 
+**Event row identity.** `notification_event.event_type` and `domain` are the request's `event_type`
+and recipient `domain` as sent, null when absent (never the policy's matched domain, so a send that
+fell back to a network-wide policy still records the caller's domain). They ride on `job.audit`, so
+every writer of the row records the same values: the accepted insert, a worker upsert that lands
+first (urgent), a fall-through, a DLQ replay and a recovered job. `template_key` is the request's
+`template_key` (legacy `/notify`: its `template_id`) and is **null for event sends**: their templates
+are per delivery and live on `delivery_attempt.template_id`.
+
 **Response:** `202 {notification_event_id, correlation_id, status: "accepted", mode, deliveries:
 [{channel}]}`. See README for examples.
 
@@ -615,6 +745,11 @@ Required for persistence and Redis:
 - `NS_DEFAULT_LOCALE` — optional, default `en`; the last step of the template locale chain.
 - `NS_KEYCLOAK_ISSUER`, `NS_KEYCLOAK_JWKS_URI`, `NS_AUTH_AUDIENCE`, `NS_AUTH_ALLOWED_AZP` — bearer-token
   auth; see Authentication. `NS_DOCS_ENABLED` — serves `/` and `/openapi.json` when `true`.
+- `NS_CONTENT_FILE` — optional; the content file for `content_ref` variables. Unset, content is off.
+  Deployments set `/app/content/content.json`. `NS_CONTENT_PROVIDER` (default and only value
+  `configmap`) and `NS_CONTENT_RELOAD_MS` (integer 1 to 3600000, default 30000) are validated
+  whether or not a file is set: an invalid value fails boot like other config. A missing or broken
+  content file never fails boot. See Content resolver.
 - `NS_RESOLVE_CACHE_TTL_MS` — optional, default 60000, positive integer (invalid fails boot). See
   Resolver cache.
 - `PARTITION_MAINTENANCE_INTERVAL_MS` — optional, default 6h.
@@ -676,7 +811,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 619 unit tests across 48 files, plus 119 integration tests across 15 files. The unit suite runs in about a second because Redis
+vitest 4, 755 unit tests across 56 files, plus 138 integration tests across 17 files. The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
@@ -799,6 +934,8 @@ live at scrape time rather than counted, so they cannot drift.
 | `ns_job_dropped_total` | counter | `channel`, `reason` |
 | `ns_send_rejected_total` | counter | `kind` (`caller`/`configuration`), `code` |
 | `ns_send_fallthrough_total` | counter | `from`, `to` (channels) |
+| `ns_content_load_failures_total` | counter | `provider` (boot or reload failures; last good content keeps serving) |
+| `ns_content_loaded` | gauge | `provider`, `version`, `fingerprint` (value = unix time of the latest successful load of that content; alert on staleness) |
 | `ns_queue_depth` | gauge | `queue` (`realtime`/`other`/`bulk`/`retry_count`/`dlq`) |
 | `ns_retry_eta_seconds` | gauge | — |
 
