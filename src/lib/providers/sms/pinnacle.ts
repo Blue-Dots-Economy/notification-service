@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { ProviderDefinition, ProviderSendResult } from '../../../types/provider';
 import * as metrics from '../../metrics';
 import { isRetryableHttpStatus } from './http_status';
+import { isTimeoutError, providerTimeoutMs } from '../http';
 import { MAX_LENGTH, messageType, renderBody, UnresolvedTemplateVariables } from './render';
 
 /**
@@ -142,6 +143,39 @@ export async function sendSmsWithPinnacle(
     };
   }
 
+  return sendPinnacleText(to, template_id, text, {}, job_id, env);
+}
+
+export interface PinnacleDltOverrides {
+  senderId?: string | null;
+  dltEntityId?: string | null;
+  dltHeaderId?: string | null;
+  dltTagId?: string | null;
+}
+
+/** The post-render half of a Pinnacle send: `text` goes out verbatim. */
+export async function sendPinnacleText(
+  to: string,
+  dltTemplateId: string,
+  text: string,
+  overrides: PinnacleDltOverrides,
+  job_id: string | undefined,
+  env = process.env
+): Promise<ProviderSendResult> {
+  const config = loadPinnacleConfig(env);
+  if ('error' in config) {
+    await metrics.incr('ns_sms_send_total', { provider: 'pinnacle', result: 'failed' });
+    return { ok: false, error: config.error, retryable: false };
+  }
+
+  // Blank or whitespace-only overrides count as absent: only a real value wins.
+  const pick = (v: string | null | undefined, fallback: string | undefined) =>
+    v && v.trim() ? v.trim() : fallback;
+  const sender = pick(overrides.senderId, config.sender)!;
+  const dltEntityId = pick(overrides.dltEntityId, config.dltEntityId)!;
+  const dltHeaderId = pick(overrides.dltHeaderId, config.dltHeaderId);
+  const dltTagId = pick(overrides.dltTagId, config.dltTagId);
+
   const messagetype = messageType(text);
   if (text.length > MAX_LENGTH[messagetype]) {
     await metrics.incr('ns_sms_send_total', { provider: 'pinnacle', result: 'failed' });
@@ -153,12 +187,12 @@ export async function sendSmsWithPinnacle(
   }
 
   const payload = {
-    sender: config.sender,
+    sender,
     messagetype,
-    dltentityid: config.dltEntityId,
-    dlttempid: template_id,
-    ...(config.dltHeaderId ? { dltheaderid: config.dltHeaderId } : {}),
-    ...(config.dltTagId ? { dlttagid: config.dltTagId } : {}),
+    dltentityid: dltEntityId,
+    dlttempid: dltTemplateId,
+    ...(dltHeaderId ? { dltheaderid: dltHeaderId } : {}),
+    ...(dltTagId ? { dlttagid: dltTagId } : {}),
     ...(config.tmid ? { tmid: config.tmid } : {}),
     message: [
       {
@@ -175,6 +209,7 @@ export async function sendSmsWithPinnacle(
       method: 'POST',
       headers: { 'Content-Type': 'application/json', apikey: config.apiKey },
       body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(providerTimeoutMs(env)),
     });
 
     if (!resp.ok) {
@@ -208,7 +243,7 @@ export async function sendSmsWithPinnacle(
     await metrics.incr('ns_sms_send_total', { provider: 'pinnacle', result: 'failed' });
     return {
       ok: false,
-      error: err instanceof Error ? err.message : 'pinnacle request failed',
+      error: isTimeoutError(err) ? 'provider timeout' : err instanceof Error ? err.message : 'pinnacle request failed',
       retryable: true,
     };
   }
@@ -243,6 +278,7 @@ export async function pollPinnacleBalance(env = process.env): Promise<number | n
   try {
     const resp = await fetch(`${config.baseUrl}/index.php/checkbalance`, {
       headers: { apikey: config.apiKey },
+      signal: AbortSignal.timeout(providerTimeoutMs(env)),
     });
     if (!resp.ok) return await failPoll('http_error', `HTTP ${resp.status}`);
 
@@ -301,5 +337,12 @@ export const pinnacleSmsProvider: ProviderDefinition = {
 
   async send({ to, template_id, variables, body, job_id }) {
     return await sendSmsWithPinnacle(to, template_id, variables, body, job_id);
+  },
+
+  async sendRendered({ to, rendered, providerTemplateId, dlt, job_id }) {
+    if (rendered.mode !== 'ns' || rendered.channel !== 'sms' || !providerTemplateId) {
+      return { ok: false, retryable: false, error: 'rendered mode not supported by pinnacle' };
+    }
+    return sendPinnacleText(to, providerTemplateId, rendered.text, dlt ?? {}, job_id);
   },
 };

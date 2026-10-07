@@ -1,38 +1,16 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { TemplateRow } from '../lib/db/schema';
-import { VariableContractSchema } from '../lib/templates/contract';
+import { TemplatePatchSchema as PatchSchema, TemplateCreateSchema as CreateSchema } from '../lib/catalogue/schema';
+import { withContent } from '../lib/content/inject';
 import { renderTemplate } from '../lib/templates/render';
 import * as repo from '../lib/templates/repo';
 import { channelVendor } from '../lib/templates/vendors';
 import { TemplateError } from '../lib/templates/errors';
-import { requestAuth } from '../plugins/request-auth';
-import { requireAdmin } from '../plugins/require-admin';
+import { principalLabel } from '../lib/auth/principal';
+import { authenticate } from '../plugins/auth';
 import { sendAdminError } from './admin-errors';
-
-const nullableText = (max: number) => z.string().max(max).nullable().optional();
-
-const PatchSchema = z
-  .object({
-    subject: nullableText(998),
-    body_html: nullableText(200_000),
-    body_text: nullableText(10_000),
-    variables: VariableContractSchema.optional(),
-    provider_template_id: nullableText(255),
-    sender_id: nullableText(64),
-    dlt_entity_id: nullableText(64),
-    dlt_header_id: nullableText(64),
-    dlt_tag_id: nullableText(64),
-    approval_ref: nullableText(255),
-    default_deadline_s: z.number().int().positive().max(86_400).nullable().optional(),
-  })
-  .strict();
-
-const CreateSchema = PatchSchema.extend({
-  channel: z.string().min(1).max(32),
-  template_key: z.string().regex(/^[a-z0-9_.-]+$/).max(128),
-  locale: z.string().regex(/^[a-z]{2,3}(-[A-Z]{2})?$/).optional(),
-}).strict();
+import { clearResolveCache } from '../lib/send/resolver-cache';
 
 const ListQuery = z.object({
   channel: z.string().optional(),
@@ -69,10 +47,8 @@ export function serializeTemplate(t: TemplateRow) {
   };
 }
 
-const actorOf = (headers: Record<string, unknown>) => String(headers['x-ns-key']);
-
 export async function adminTemplateRoutes(app: FastifyInstance) {
-  const preHandler = [requestAuth, requireAdmin];
+  const preHandler = authenticate({ scope: 'templates:admin' });
 
   app.get('/v1/admin/templates', { preHandler }, async (req, reply) => {
     const q = ListQuery.safeParse(req.query);
@@ -97,7 +73,7 @@ export async function adminTemplateRoutes(app: FastifyInstance) {
     try {
       const row = await repo.createTemplateDraft(
         { channel, templateKey: template_key, locale, ...toPatch(rest) },
-        actorOf(req.headers),
+        principalLabel(req.principal),
       );
       return reply.code(201).send(serializeTemplate(row));
     } catch (err) { return sendAdminError(reply, err); }
@@ -115,15 +91,21 @@ export async function adminTemplateRoutes(app: FastifyInstance) {
   app.post('/v1/admin/templates/:id/publish', { preHandler }, async (req, reply) => {
     const p = IdParams.safeParse(req.params);
     if (!p.success) return reply.code(400).send(z.formatError(p.error));
-    try { return serializeTemplate(await repo.publishTemplate(p.data.id, actorOf(req.headers))); }
-    catch (err) { return sendAdminError(reply, err); }
+    try {
+      const row = await repo.publishTemplate(p.data.id, principalLabel(req.principal));
+      clearResolveCache(); // this pod sees the change now; others within the cache TTL
+      return serializeTemplate(row);
+    } catch (err) { return sendAdminError(reply, err); }
   });
 
   app.post('/v1/admin/templates/:id/retire', { preHandler }, async (req, reply) => {
     const p = IdParams.safeParse(req.params);
     if (!p.success) return reply.code(400).send(z.formatError(p.error));
-    try { return serializeTemplate(await repo.retireTemplate(p.data.id)); }
-    catch (err) { return sendAdminError(reply, err); }
+    try {
+      const row = await repo.retireTemplate(p.data.id);
+      clearResolveCache(); // this pod sees the change now; others within the cache TTL
+      return serializeTemplate(row);
+    } catch (err) { return sendAdminError(reply, err); }
   });
 
   app.post('/v1/admin/templates/:id/preview', { preHandler }, async (req, reply) => {
@@ -135,7 +117,7 @@ export async function adminTemplateRoutes(app: FastifyInstance) {
       const t = await repo.getTemplate(p.data.id);
       const vendor = channelVendor(t.channel);
       if (!vendor) throw new TemplateError('unknown_channel', `no provider for channel ${t.channel}`);
-      return { rendered: renderTemplate(t, vendor.renders, b.data.variables) };
+      return { rendered: renderTemplate(t, vendor.renders, withContent(t, b.data.variables).input) };
     } catch (err) { return sendAdminError(reply, err); }
   });
 }

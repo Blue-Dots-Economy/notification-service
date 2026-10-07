@@ -2,7 +2,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Auth, dedupe and Redis each have their own tests; this file is about what the
 // /notify route accepts and — crucially — what it refuses to enqueue.
-vi.mock('../../plugins/request-auth', () => ({ requestAuth: async () => {} }));
+const auth = vi.hoisted(() => ({
+  authenticate: vi.fn((_opts: unknown) => async (req: any) => {
+    req.principal = { kind: 'hmac', id: 'test-key', scopes: new Set(['notify:send', 'templates:admin']) };
+  }),
+}));
+vi.mock('../../plugins/auth', () => auth);
 // Only the Redis SET NX is doubled. `buildDedupeKey` lives in its own
 // dependency-free module and is used for real, so these tests exercise the key
 // the route actually derives.
@@ -184,6 +189,8 @@ describe('/notify audit', () => {
     const res = await signedNotify(body());
     expect(res.statusCode).toBe(200);
     expect(recordAccepted).toHaveBeenCalledTimes(1);
+    expect(recordAccepted.mock.calls[0]![0]).toMatchObject({ source: 'hmac:test-key' });
+    expect(auth.authenticate).toHaveBeenCalledWith({ scope: 'notify:send', legacyHmacV1: true });
     const queued = (pushOther.mock.calls[0] as unknown as [{ audit: unknown }])[0];
     expect(queued.audit).toMatchObject({ eventId: expect.any(String), attemptId: expect.any(String) });
     expect(recordAccepted.mock.invocationCallOrder[0]).toBeLessThan(
@@ -217,6 +224,16 @@ describe('/notify audit', () => {
     expect(JSON.stringify(rec)).not.toContain('482913');
     expect(rec.job).toBeUndefined();
     expect(rec.recoverable).toBe(false);
+  });
+
+  it('gives a realtime job a deadline about 600s out, and an other job none', async () => {
+    const before = Date.now();
+    await signedNotify({ ...body(), priority: 'realtime' });
+    await signedNotify(body({ subject: 'other two' }));
+    const rt = (pushRealtime.mock.calls[0] as unknown as [{ deadline?: number }])[0];
+    const ot = (pushOther.mock.calls[0] as unknown as [{ deadline?: number }])[0];
+    expect(Math.abs(rt.deadline! - (before + 600_000))).toBeLessThan(5000);
+    expect(ot.deadline).toBeUndefined();
   });
 
   it('realtime still enqueues when the audit insert fails', async () => {

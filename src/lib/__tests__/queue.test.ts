@@ -161,6 +161,18 @@ describe('getQueueMetrics', () => {
     expect(m.other).toBe(2);
     expect(m.dlq).toBe(1);
     expect(m.retry_count).toBe(1);
+    expect(m.bulk).toBe(0);
+  });
+
+  it('counts the bulk queue separately', async () => {
+    await queue.pushToPriority(job({ job_id: 'b1', priority: 'bulk' }));
+    await queue.pushToPriority(job({ job_id: 'b2', priority: 'bulk' }));
+    await queue.pushOther(job({ job_id: 'o1' }));
+
+    const m = await queue.getQueueMetrics();
+
+    expect(m.bulk).toBe(2);
+    expect(m.other).toBe(1);
   });
 
   it('reports the oldest retry as an epoch-milliseconds timestamp', async () => {
@@ -244,15 +256,64 @@ describe('scheduleRetryWithMarker', () => {
   });
 });
 
-describe('pushOtherMany', () => {
-  it('pushes every job to the other queue in order', async () => {
-    await queue.pushOtherMany([job({ job_id: 'm1' }), job({ job_id: 'm2' })]);
+describe('pushToPriorityWithMarker', () => {
+  const marker = { key: 'ns:attempt:a1', value: 'failed:1', ttlSeconds: 604800 };
+
+  it('pushes the job and writes the marker in one MULTI', async () => {
+    const multi = vi.spyOn(redis, 'multi');
+    try {
+      await queue.pushToPriorityWithMarker(job({ job_id: 'f1', priority: 'realtime' }), marker);
+      expect(multi).toHaveBeenCalledTimes(1);
+    } finally {
+      multi.mockRestore();
+    }
+    expect(await redis.llen('queue:realtime')).toBe(1);
+    expect(await redis.get('ns:attempt:a1')).toBe('failed:1');
+  });
+
+  it('leaves neither the job nor the marker when the MULTI fails', async () => {
+    const multi = vi.spyOn(redis, 'multi').mockImplementationOnce(() => {
+      const chain = {
+        lpush: () => chain,
+        set: () => chain,
+        exec: async () => { throw new Error('connection lost'); },
+      };
+      return chain as never;
+    });
+    try {
+      await expect(queue.pushToPriorityWithMarker(job({ job_id: 'f2' }), marker)).rejects.toThrow('connection lost');
+    } finally {
+      multi.mockRestore();
+    }
+    expect(await redis.get('ns:attempt:a1')).toBeNull();
+    expect(await redis.llen('queue:other')).toBe(0);
+  });
+});
+
+describe('pushManyToPriority', () => {
+  it('pushes each job to its own priority queue, in order', async () => {
+    await queue.pushManyToPriority([
+      job({ job_id: 'm1', priority: 'other' }),
+      job({ job_id: 'b1', priority: 'bulk' }),
+      job({ job_id: 'r1', priority: 'realtime' }),
+      job({ job_id: 'm2', priority: 'other' }),
+    ]);
     const popped = [await queue.popOther(), await queue.popOther()].map((p) => JSON.parse(p![1]).job_id);
     expect(popped).toEqual(['m1', 'm2']);
+    expect(JSON.parse((await redis.rpop('queue:bulk'))!).job_id).toBe('b1');
+    expect(JSON.parse((await redis.rpop('queue:realtime'))!).job_id).toBe('r1');
+  });
+
+  it('sends an unknown or inherited priority name to other', async () => {
+    await queue.pushManyToPriority([
+      job({ job_id: 'u1', priority: 'nope' as never }),
+      job({ job_id: 'u2', priority: 'toString' as never }),
+    ]);
+    expect(await redis.llen('queue:other')).toBe(2);
   });
 
   it('is a no-op for an empty batch', async () => {
-    await queue.pushOtherMany([]);
+    await queue.pushManyToPriority([]);
     expect(await redis.llen('queue:other')).toBe(0);
   });
 });
@@ -322,6 +383,17 @@ describe('retryFailedJobs replay accounting', () => {
     expect(replayed.audit.correlationId).toBe('corr-1');
   });
 
+  it('clears the deadline on a replayed job (operator action), in both drain modes', async () => {
+    const past = Date.now() - 60_000;
+    await queue.pushDLQ(job({ job_id: 'late-1', deadline: past }));
+    await queue.retryFailedJobs({ jobId: 'late-1' });
+    await queue.pushDLQ(job({ job_id: 'late-2', deadline: past }));
+    await queue.retryFailedJobs({ limit: 1 });
+    const replayed = (await redis.lrange('queue:other', 0, -1)).map((r) => JSON.parse(r) as Job);
+    expect(replayed.map((j) => j.job_id).sort()).toEqual(['late-1', 'late-2']);
+    for (const j of replayed) expect(j).not.toHaveProperty('deadline');
+  });
+
   it('replays a job without audit without adding one', async () => {
     await queue.pushDLQ(job({ job_id: 'n' }));
     await queue.retryFailedJobs({ jobId: 'n' });
@@ -347,5 +419,44 @@ describe('retryFailedJobs replay accounting', () => {
     expect(JSON.stringify(rec)).not.toContain('739104');
     expect(rec.job).toBeUndefined();
     expect(rec.recoverable).toBe(false);
+  });
+});
+
+describe('serializeJob (well-formed payloads)', () => {
+  it('replaces lone surrogates in values and keys with U+FFFD', () => {
+    const out = queue.serializeJob(
+      job({ variables: { name: 'Asha \ud83d', ['k\udc00']: 'ok', nested: ['\ud800x'] } as never }),
+    );
+    expect(out).not.toMatch(/\\ud[89a-f][0-9a-f]{2}/i);
+    const parsed = JSON.parse(out);
+    expect(parsed.variables.name).toBe('Asha �');
+    expect(parsed.variables['k�']).toBe('ok');
+    expect(parsed.variables.nested).toEqual(['�x']);
+  });
+
+  it('keeps valid surrogate pairs and everything else unchanged', () => {
+    const j = job({ variables: { name: 'Asha 😀', n: 3, b: true, z: null } as never, attempt: 2 });
+    expect(JSON.parse(queue.serializeJob(j))).toEqual(JSON.parse(JSON.stringify(j)));
+  });
+
+  it('drops undefined fields like JSON.stringify', () => {
+    expect(JSON.parse(queue.serializeJob(job({ next_attempt_at: undefined })))).not.toHaveProperty('next_attempt_at');
+  });
+
+  it('every push path writes the sanitized form', async () => {
+    const j = job({ variables: { name: 'x\ud83d' } as never });
+    await queue.pushToPriority(j);
+    await queue.deferJob(j, 0);
+    await queue.scheduleRetry({ ...j, job_id: 'job-3' }, 0);
+    await queue.scheduleRetryWithMarker({ ...j, job_id: 'job-2' }, 0);
+    await queue.pushManyToPriority([j]);
+    await queue.pushDLQ(j);
+    const all = [
+      ...(redis.lists.get('queue:other') ?? []),
+      ...(redis.lists.get('queue:dlq') ?? []),
+      ...(redis.zsets.get('queue:retry') ?? []).map((e) => e.member),
+    ];
+    expect(all).toHaveLength(6);
+    for (const raw of all) expect(raw).not.toMatch(/\\ud83d/i);
   });
 });

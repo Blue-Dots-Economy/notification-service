@@ -101,6 +101,40 @@ describe('seedBuiltinTemplates', () => {
     expect(await listTemplates({ templateKey: 'login_otp' })).toHaveLength(1);
   });
 
+  it('waits past the pool statement timeout for a replica still holding the seed lock, then seeds', async () => {
+    // A replica still seeding holds the lock on its own connection for ~6 s,
+    // longer than the pool's 5 s statement timeout.
+    const holder = await getPool().connect();
+    await holder.query(`SELECT pg_advisory_lock(hashtext('notification-service:seed'))`);
+    const released = new Promise<void>((resolve, reject) => {
+      setTimeout(() => {
+        holder.query(`SELECT pg_advisory_unlock(hashtext('notification-service:seed'))`)
+          .then(() => { holder.release(); resolve(); }, (e) => { holder.release(e); reject(e); });
+      }, 6000);
+    });
+    const started = Date.now();
+    const outcome = await seedBuiltinTemplates();
+    await released;
+    expect(Date.now() - started).toBeGreaterThanOrEqual(5500);
+    expect(outcome).toBe('seeded_active');
+    expect(await listTemplates({ templateKey: 'login_otp' })).toHaveLength(1);
+    // The seeding connection went back to the pool at the normal bound: check out
+    // every idle connection at once (the seeding one is among them unless it was
+    // destroyed) and read each one's own setting.
+    const pool = getPool();
+    const idle = pool.idleCount;
+    expect(idle).toBeGreaterThan(0);
+    const clients = await Promise.all(Array.from({ length: idle }, () => pool.connect()));
+    try {
+      for (const c of clients) {
+        const r = await c.query<{ statement_timeout: string }>('SHOW statement_timeout');
+        expect(r.rows[0]!.statement_timeout).toBe('5s');
+      }
+    } finally {
+      for (const c of clients) c.release();
+    }
+  }, 30_000);
+
   it('skips without a network or an id', async () => {
     delete process.env.NS_NETWORK;
     expect(await seedBuiltinTemplates()).toBe('skipped_no_network');

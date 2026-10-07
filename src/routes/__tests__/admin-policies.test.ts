@@ -1,11 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../../plugins/request-auth', () => ({ requestAuth: async () => {} }));
+// Route scopes are pinned in src/__tests__/route-scopes.test.ts.
+vi.mock('../../plugins/auth', () => ({
+  authenticate: () => async (req: any) => {
+    req.principal = { kind: 'hmac', id: 'test-key', scopes: new Set(['notify:send', 'templates:admin']) };
+  },
+}));
 const repo = vi.hoisted(() => ({
   createPolicyDraft: vi.fn(), updatePolicyDraft: vi.fn(), publishPolicy: vi.fn(),
   retirePolicy: vi.fn(), getPolicy: vi.fn(), listPolicies: vi.fn(),
 }));
 vi.mock('../../lib/policies/repo', () => repo);
+const cache = vi.hoisted(() => ({ clearResolveCache: vi.fn() }));
+vi.mock('../../lib/send/resolver-cache', () => cache);
 
 const Fastify = (await import('fastify')).default;
 const { adminPolicyRoutes } = await import('../admin-policies');
@@ -17,7 +24,7 @@ const row = {
   channels: [{ channel: 'sms', template_key: 'apply_sms' }], createdBy: 'ns-admin', publishedBy: null,
   createdAt: new Date(), updatedAt: new Date(), publishedAt: null, retiredAt: null,
 };
-const admin = { 'x-ns-key': 'ns-admin' };
+const admin = {};
 async function build() {
   const app = Fastify({ logger: false });
   await app.register(adminPolicyRoutes);
@@ -26,16 +33,11 @@ async function build() {
 }
 
 beforeEach(() => {
-  process.env.NS_ADMIN_KEY_IDS = 'ns-admin';
   Object.values(repo).forEach((f) => f.mockReset());
+  cache.clearResolveCache.mockClear();
 });
 
 describe('admin policy routes', () => {
-  it('403s a non-admin key', async () => {
-    const res = await (await build()).inject({ method: 'GET', url: '/v1/admin/policies', headers: { 'x-ns-key': 'x' } });
-    expect(res.statusCode).toBe(403);
-  });
-
   it('creates a draft', async () => {
     repo.createPolicyDraft.mockResolvedValue(row);
     const res = await (await build()).inject({
@@ -45,7 +47,7 @@ describe('admin policy routes', () => {
     expect(res.statusCode).toBe(201);
     expect(repo.createPolicyDraft).toHaveBeenCalledWith(
       { domain: undefined, eventType: 'apply', mode: 'first_available', channels: [{ channel: 'sms', template_key: 'apply_sms' }] },
-      'ns-admin',
+      'hmac:test-key',
     );
     expect(res.json()).toMatchObject({ id: ID, event_type: 'apply', domain: null });
   });
@@ -74,5 +76,19 @@ describe('admin policy routes', () => {
     const res = await (await build()).inject({ method: 'POST', url: `/v1/admin/policies/${ID}/publish`, headers: admin });
     expect(res.statusCode).toBe(422);
     expect(res.json()).toMatchObject({ error: 'incomplete_template', details: { channel: 'sms' } });
+  });
+
+  it('publish and retire clear the send-path resolver cache; a failed publish does not', async () => {
+    const app = await build();
+    repo.publishPolicy.mockRejectedValueOnce(new TemplateError('invalid_state', 'x'));
+    await app.inject({ method: 'POST', url: `/v1/admin/policies/${ID}/publish`, headers: admin });
+    expect(cache.clearResolveCache).not.toHaveBeenCalled();
+    repo.publishPolicy.mockResolvedValue({ ...row, status: 'active' });
+    expect((await app.inject({ method: 'POST', url: `/v1/admin/policies/${ID}/publish`, headers: admin })).statusCode).toBe(200);
+    expect(cache.clearResolveCache).toHaveBeenCalledTimes(1);
+    expect(repo.publishPolicy).toHaveBeenLastCalledWith(ID, 'hmac:test-key');
+    repo.retirePolicy.mockResolvedValue({ ...row, status: 'retired' });
+    expect((await app.inject({ method: 'POST', url: `/v1/admin/policies/${ID}/retire`, headers: admin })).statusCode).toBe(200);
+    expect(cache.clearResolveCache).toHaveBeenCalledTimes(2);
   });
 });

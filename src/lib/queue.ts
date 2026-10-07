@@ -1,13 +1,22 @@
 import { randomUUID } from 'crypto';
-import { Job } from 'src/types';
+import type Redis from 'ioredis';
+import type { Job, Priority } from 'src/types';
 import redis from './redis';
 
 // Queue Keys
 
-const REALTIME_QUEUE = 'queue:realtime';
-const OTHER_QUEUE = 'queue:other';
+export const QUEUE_KEYS: Record<Priority, string> = {
+  realtime: 'queue:realtime',
+  other: 'queue:other',
+  bulk: 'queue:bulk',
+};
+const REALTIME_QUEUE = QUEUE_KEYS.realtime;
+const OTHER_QUEUE = QUEUE_KEYS.other;
 const RETRY_ZSET = 'queue:retry';
 const DLQ_QUEUE = 'queue:dlq';
+
+/** Most due retries one moveDueRetries call claims; a full batch means more may be due. */
+export const RETRY_BATCH = 1000;
 
 /**
  * DLQ replays allowed per job. Attempts reset on replay (a replay is an
@@ -20,24 +29,165 @@ export const MAX_REPLAYS = 3;
 
 /** Enqueue realtime job (high priority). */
 export async function pushRealtime(job: Job) {
-  return redis.lpush(REALTIME_QUEUE, JSON.stringify(job));
+  return pushToPriority({ ...job, priority: 'realtime' });
 }
 
 /** Enqueue fallback job. */
 export async function pushOther(job: Job) {
-  return redis.lpush(OTHER_QUEUE, JSON.stringify(job));
+  return pushToPriority({ ...job, priority: 'other' });
+}
+
+/** The job's own priority queue; anything unrecognised goes to other (own-property lookup only). */
+function queueKeyFor(priority: unknown): string {
+  return typeof priority === 'string' && Object.prototype.hasOwnProperty.call(QUEUE_KEYS, priority)
+    ? QUEUE_KEYS[priority as Priority]
+    : QUEUE_KEYS.other;
+}
+
+// String.prototype.toWellFormed is ES2024 (Node >= 20); tsconfig's lib is ES2020.
+const toWellFormed = (s: string): string =>
+  (s as string & { toWellFormed(): string }).toWellFormed();
+
+function wellFormed(value: unknown): unknown {
+  if (typeof value === 'string') return toWellFormed(value);
+  if (Array.isArray(value)) return value.map(wellFormed);
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) out[toWellFormed(k)] = wellFormed(v);
+    return out;
+  }
+  return value;
 }
 
 /**
- * Enqueue many fallback jobs in one MULTI round trip (recovery). Throws if
- * any push failed, so the caller can roll back what it recorded.
+ * The ONE way a job becomes a Redis queue/retry/DLQ entry. Every string key and
+ * value is made well-formed (a lone UTF-16 surrogate, e.g. a truncated emoji in a
+ * name, becomes U+FFFD) first: JSON.stringify emits a lone surrogate as a
+ * `\udXXX` escape, which Redis's cjson rejects, so MOVE_DUE_RETRIES could not
+ * read the job's priority.
  */
-export async function pushOtherMany(jobs: Job[]): Promise<void> {
+export function serializeJob(job: Job): string {
+  return JSON.stringify(wellFormed(job));
+}
+
+export async function pushToPriority(job: Job): Promise<void> {
+  await redis.lpush(queueKeyFor(job.priority), serializeJob(job));
+}
+
+/**
+ * Push `job` onto its priority queue and write `marker` in the same MULTI, so
+ * the marker exists if and only if the job was queued (the fall-through
+ * counterpart of scheduleRetryWithMarker). Throws if any command failed.
+ */
+export async function pushToPriorityWithMarker(
+  job: Job,
+  marker?: { key: string; value: string; ttlSeconds: number },
+): Promise<void> {
+  const tx = redis.multi().lpush(queueKeyFor(job.priority), JSON.stringify(job));
+  if (marker) tx.set(marker.key, marker.value, 'EX', marker.ttlSeconds);
+  const results = await tx.exec();
+  if (!results) throw new Error('Redis MULTI aborted while queueing a job');
+  const failed = results.find(([err]) => err);
+  if (failed) throw failed[0];
+}
+
+/**
+ * Blocking pop for one priority on the caller's own connection. BRPOP holds its
+ * connection until it returns, so every pool loop owns a dedicated connection —
+ * sharing one would let a bulk pop hold up an urgent one.
+ */
+export async function popFrom(
+  conn: Redis,
+  priority: Priority,
+  timeoutSeconds = 1,
+): Promise<Job | null> {
+  const res = await conn.brpop(QUEUE_KEYS[priority], timeoutSeconds);
+  if (!res) return null;
+  const raw = res[1];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    parsed = undefined;
+  }
+  if (
+    typeof parsed !== 'object' ||
+    parsed === null ||
+    typeof (parsed as { job_id?: unknown }).job_id !== 'string'
+  ) {
+    // Never throw on a bad entry (it would be lost and crash-loop the pool) and
+    // never log its content: keep it raw in the DLQ for an operator.
+    await redis.lpush(DLQ_QUEUE, raw);
+    console.error(`popFrom: malformed ${priority} queue entry moved to DLQ`);
+    return null;
+  }
+  return parsed as Job;
+}
+
+/** Schedule a job without counting an attempt (rate-limit deferral). */
+export async function deferJob(job: Job, delayMs: number): Promise<void> {
+  await redis.zadd(RETRY_ZSET, String(Date.now() + delayMs), serializeJob(job));
+}
+
+// Claim every due retry and push it onto its own priority's queue in one atomic
+// step, so concurrent schedulers never move a member twice and a retry never
+// changes pool. A member that is not a JSON object with a string job_id goes to
+// the DLQ untouched rather than vanishing. Each call claims at most RETRY_BATCH members (ARGV[2])
+// so one EVAL never blocks Redis for long; the caller simply calls again. Fixed script; keys and cutoff are passed as KEYS/ARGV.
+//
+// cjson rejects lone UTF-16 surrogate escapes ("invalid unicode escape code").
+// serializeJob never writes one, but members written by older pods can hold them,
+// so a failed decode is retried on a copy with every \udXXX escape replaced by
+// \ufffd. That copy is only read for routing; the member is pushed unchanged
+// (JSON.parse in popFrom accepts it).
+const MOVE_DUE_RETRIES = `
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'LIMIT', 0, ARGV[2])
+local moved = 0
+for _, raw in ipairs(due) do
+  redis.call('ZREM', KEYS[1], raw)
+  local ok, job = pcall(cjson.decode, raw)
+  if not ok then
+    ok, job = pcall(cjson.decode, (string.gsub(raw, [[\\u[dD][89a-fA-F]%x%x]], [[\\ufffd]])))
+  end
+  if ok and type(job) == 'table' and type(job['job_id']) == 'string' then
+    local p = job['priority']
+    local target = KEYS[3]
+    if p == 'realtime' then target = KEYS[2] elseif p == 'bulk' then target = KEYS[4] end
+    redis.call('LPUSH', target, raw)
+    moved = moved + 1
+  else
+    redis.call('LPUSH', KEYS[5], raw)
+  end
+end
+return moved
+`;
+
+/** Moves up to RETRY_BATCH due retries per call; returns how many were routed to a priority queue. */
+export async function moveDueRetries(now = Date.now()): Promise<number> {
+  return (await redis.eval(
+    MOVE_DUE_RETRIES,
+    5,
+    RETRY_ZSET,
+    QUEUE_KEYS.realtime,
+    QUEUE_KEYS.other,
+    QUEUE_KEYS.bulk,
+    DLQ_QUEUE,
+    String(now),
+    String(RETRY_BATCH),
+  )) as number;
+}
+
+/**
+ * Enqueue many jobs, each on its own priority's queue, in one MULTI round trip
+ * (recovery, v1 send). Throws if any push failed, so the caller can roll back what it
+ * recorded.
+ */
+export async function pushManyToPriority(jobs: Job[]): Promise<void> {
   if (jobs.length === 0) return;
   const tx = redis.multi();
-  for (const job of jobs) tx.lpush(OTHER_QUEUE, JSON.stringify(job));
+  for (const job of jobs) tx.lpush(queueKeyFor(job.priority), serializeJob(job));
   const results = await tx.exec();
-  if (!results) throw new Error('Redis MULTI aborted while re-queueing');
+  if (!results) throw new Error('Redis MULTI aborted while enqueueing');
   const failed = results.find(([err]) => err);
   if (failed) throw failed[0];
 }
@@ -55,13 +205,13 @@ export async function popOther(timeoutSeconds = 1) {
 // Dead Letter Queue
 export async function pushDLQ(job: Job) {
   console.log('DLQ →', job.job_id);
-  return redis.lpush(DLQ_QUEUE, JSON.stringify(job));
+  return redis.lpush(DLQ_QUEUE, serializeJob(job));
 }
 
 type RetryFailedJobsOptions = {
   jobId?: string;
   limit?: number;
-  priority?: 'realtime' | 'other';
+  priority?: Priority;
 };
 
 function parseJob(raw: string): Job | null {
@@ -72,7 +222,7 @@ function parseJob(raw: string): Job | null {
   }
 }
 
-async function requeueFailedJob(raw: string, priority: 'realtime' | 'other') {
+async function requeueFailedJob(raw: string, priority: Priority) {
   const job = parseJob(raw);
   if (!job) return null;
 
@@ -81,14 +231,17 @@ async function requeueFailedJob(raw: string, priority: 'realtime' | 'other') {
     priority,
     attempt: 0,
     next_attempt_at: undefined,
+    // A replay is an explicit operator action: the original deadline (if any)
+    // no longer applies, or a replayed job would only expire. Redacted (OTP)
+    // jobs never reach the DLQ, so this cannot revive a stale code.
+    deadline: undefined,
     replays: (job.replays ?? 0) + 1,
     // A replay is a new delivery attempt: it gets its own attempt id so its
     // status writes are not rejected as older than the stored failed attempt.
     ...(job.audit ? { audit: { ...job.audit, attemptId: randomUUID() } } : {}),
   };
 
-  if (priority === 'realtime') await pushRealtime(retryJob);
-  else await pushOther(retryJob);
+  await pushToPriority(retryJob);
 
   return retryJob;
 }
@@ -161,7 +314,7 @@ export async function retryFailedJobs({
 export async function scheduleRetry(job: Job, delaySeconds: number) {
   const timestamp = Date.now() + delaySeconds * 1000;
 
-  return redis.zadd(RETRY_ZSET, timestamp.toString(), JSON.stringify(job));
+  return redis.zadd(RETRY_ZSET, timestamp.toString(), serializeJob(job));
 }
 
 /**
@@ -177,7 +330,7 @@ export async function scheduleRetryWithMarker(
   marker?: { key: string; value: string; ttlSeconds: number },
 ): Promise<void> {
   const timestamp = Date.now() + delaySeconds * 1000;
-  const tx = redis.multi().zadd(RETRY_ZSET, timestamp.toString(), JSON.stringify(job));
+  const tx = redis.multi().zadd(RETRY_ZSET, timestamp.toString(), serializeJob(job));
   if (marker) tx.set(marker.key, marker.value, 'EX', marker.ttlSeconds);
   const results = await tx.exec();
   if (!results) throw new Error('Redis MULTI aborted while scheduling a retry');
@@ -239,6 +392,7 @@ export async function getQueueMetrics() {
     .zcard(RETRY_ZSET)
     .zrange(RETRY_ZSET, '0', '0', 'WITHSCORES') // oldest retry entry (string indices: ioredis 6 types zrange stop as string|Buffer)
     .llen(DLQ_QUEUE)
+    .llen(QUEUE_KEYS.bulk)
     .exec();
 
   if (!execResult) {
@@ -249,6 +403,7 @@ export async function getQueueMetrics() {
       retry_oldest: null,
       retry_eta_seconds: null,
       dlq: 0,
+      bulk: 0,
     };
   }
 
@@ -258,6 +413,7 @@ export async function getQueueMetrics() {
     [, retry_count],
     [, oldestRetryRaw],
     [, dlq],
+    [, bulk],
   ] = execResult;
 
   // Handle empty retry zset
@@ -283,5 +439,6 @@ export async function getQueueMetrics() {
     retry_oldest,
     retry_eta_seconds,
     dlq,
+    bulk,
   };
 }

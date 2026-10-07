@@ -45,8 +45,20 @@ export function renderTemplate(
   renders: 'ns' | 'provider',
   input: Record<string, unknown>,
 ): Rendered {
-  const values = validateVariables(t.variables, input);
+  return renderWithValues(t, renders, input).rendered;
+}
 
+/** renderTemplate, plus the validated (normalised) values it rendered with. */
+export function renderWithValues(
+  t: TemplateRow,
+  renders: 'ns' | 'provider',
+  input: Record<string, unknown>,
+): { rendered: Rendered; values: Record<string, string> } {
+  const values = validateVariables(t.variables, input);
+  return { rendered: renderValidated(t, renders, values), values };
+}
+
+function renderValidated(t: TemplateRow, renders: 'ns' | 'provider', values: Record<string, string>): Rendered {
   if (renders === 'provider') {
     if (!t.providerTemplateId) {
       throw new TemplateError('incomplete_template', 'provider template id is missing');
