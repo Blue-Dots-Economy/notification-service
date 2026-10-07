@@ -173,9 +173,10 @@ can read `accepted` again when a retry is queued. A DLQ replay is a **new** atte
 - A `FLUSHALL` without a Redis restart is **not** fully recovered (only stale `dispatching` rows).
 - **Known gap: lost `queued` rows are recovered only on epoch loss.** The periodic sweep picks up
   stale `dispatching` rows only, so a `queued` row whose job left Redis without ever being stamped
-  `dispatching` stays open until Redis restarts: (a) the worker dies between the pop (`BRPOP`, or
-  `popScheduledRetries`, which claims **every** due retry at once, so the rest of that batch is
-  lost too) and the `dispatching` stamp; (b) the API dies between the `/notify` record insert and
+  `dispatching` stays open until Redis restarts: (a) the worker dies between the `BRPOP` from a
+  priority queue and the `dispatching` stamp (due retries are moved back onto those queues by the
+  `moveDueRetries` Lua script, which claims and re-pushes atomically, so a crash loses only the one
+  job that was popped, never a batch); (b) the API dies between the `/notify` record insert and
   the `LPUSH`. It is not swept by age because a `queued` row can legitimately wait in a queue or the
   retry set for a long time, so age is no proof of loss and re-queueing would double-send. Closing
   it needs a claim written atomically with the pop (e.g. `BLMOVE` into a processing list, or a
