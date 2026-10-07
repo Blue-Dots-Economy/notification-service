@@ -393,7 +393,7 @@ keys return `400`.
 | `401` | Missing or invalid request signature |
 | `409` | `idempotency_in_progress`; `idempotency_key_priority_mismatch` (the key was used at another priority in the last 15 minutes); or `duplicate-fallback` (same content within 5 s and no key) |
 | `422` | `{ error, kind, message, details? }`; `kind` is `caller` or `configuration` |
-| `503` | `network_not_configured`; `template store unavailable` (a template or policy not yet cached could not be read); or `audit store unavailable` (normal/bulk) |
+| `503` | `network_not_configured`; `template store unavailable` (a template or policy not yet cached could not be read); `audit store unavailable` (normal/bulk); or `idempotency_store_unavailable` (the idempotency claim or the duplicate guard could not be checked; nothing was sent) |
 
 `422` codes. `caller`: `missing_variable`, `unknown_variable`, `invalid_variable`,
 `no_reachable_channel`. `configuration`: `not_found`, `vendor_mismatch`, `incomplete_template`,

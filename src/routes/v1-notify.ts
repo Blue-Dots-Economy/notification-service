@@ -86,7 +86,14 @@ export async function v1NotifyRoutes(app: FastifyInstance) {
       // Claim first, so a repeat never plans or sends twice.
       let releaseOnce: () => Promise<void>;
       if (body.idempotency_key) {
-        const claim = await claimIdempotency(network, body.idempotency_key, priority);
+        let claim: Awaited<ReturnType<typeof claimIdempotency>>;
+        try {
+          claim = await claimIdempotency(network, body.idempotency_key, priority);
+        } catch (err) {
+          // Nothing was claimed (or the claim is unknown), so there is nothing to release.
+          req.log.error({ err: describeDbError(err) }, 'idempotency claim failed; refusing send');
+          return reply.code(503).send({ error: 'idempotency_store_unavailable' });
+        }
         if (claim.status === 'replay') return reply.code(200).send(claim.response);
         if (claim.status === 'in_progress') return reply.code(409).send({ error: 'idempotency_in_progress' });
         if (claim.status === 'priority_mismatch')
@@ -94,7 +101,14 @@ export async function v1NotifyRoutes(app: FastifyInstance) {
         releaseOnce = () => releaseIdempotency(network, body.idempotency_key!, priority);
       } else {
         const key = fallbackKey(body);
-        if (!(await dedupe(key, FALLBACK_TTL_S))) return reply.code(409).send({ error: 'duplicate-fallback' });
+        let fresh: boolean;
+        try {
+          fresh = await dedupe(key, FALLBACK_TTL_S);
+        } catch (err) {
+          req.log.error({ err: describeDbError(err) }, 'duplicate guard failed; refusing send');
+          return reply.code(503).send({ error: 'idempotency_store_unavailable' });
+        }
+        if (!fresh) return reply.code(409).send({ error: 'duplicate-fallback' });
         releaseOnce = () =>
           releaseDedupe(key).catch((e) => req.log.error({ err: (e as Error)?.message ?? String(e) }, 'dedupe release failed'));
       }

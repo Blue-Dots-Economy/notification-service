@@ -107,6 +107,27 @@ describe('POST /v1/notify', () => {
     expect(idem.releaseIdempotency).not.toHaveBeenCalled();
   });
 
+  it('an idempotency store outage is a stable 503 that leaks no connection detail', async () => {
+    const raw = 'connect ECONNREFUSED postgres://ns:secret@db:5432/notification';
+    idem.claimIdempotency.mockRejectedValueOnce(new Error(raw));
+    const res = await post({ ...body, idempotency_key: 'k' });
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toEqual({ error: 'idempotency_store_unavailable' });
+    expect(res.body).not.toContain('secret');
+    expect(plan.planSend).not.toHaveBeenCalled();
+    expect(idem.releaseIdempotency).not.toHaveBeenCalled();
+  });
+
+  it('a duplicate-guard outage (no key) is a stable 503 that leaks no connection detail', async () => {
+    dd.dedupe.mockRejectedValueOnce(new Error('connect ECONNREFUSED redis://:secret@redis:6379'));
+    const res = await post(body);
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toEqual({ error: 'idempotency_store_unavailable' });
+    expect(res.body).not.toContain('secret');
+    expect(plan.planSend).not.toHaveBeenCalled();
+    expect(dd.releaseDedupe).not.toHaveBeenCalled();
+  });
+
   it('a content repeat without a key is a 409 duplicate-fallback', async () => {
     dd.dedupe.mockResolvedValueOnce(false);
     const res = await post(body);

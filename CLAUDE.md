@@ -504,7 +504,8 @@ priorities claim in different stores, every claim also pins the key's priority i
 repeat at a different priority inside the window is `409 idempotency_key_priority_mismatch`, never a
 second send. Releasing a claim drops the pin. **Residual:** past the window the pin has expired with the
 urgent claim, so a repeat that switches between `urgent` and `normal`/`bulk` is a new send (`normal`
-and `bulk` share Postgres and still replay). Without a key,
+and `bulk` share Postgres and still replay). If the claim (or, without a key, the duplicate guard) cannot
+reach its store the send is refused with `503 idempotency_store_unavailable`, logged via `describeDbError`. Without a key,
 a 5-second content guard answers a repeat with `409 duplicate-fallback`.
 
 **Correlation id.** The body's `correlation_id` (trimmed, at most 128, else `400`) wins over the
