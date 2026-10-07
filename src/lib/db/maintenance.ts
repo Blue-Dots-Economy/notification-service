@@ -12,8 +12,12 @@ import { pruneIdempotencyKeys } from '../send/idempotency';
  * range that a new partition would cover makes run_maintenance skip that
  * partition set, so each tick also runs partman.check_default() and reports
  * non-empty defaults (warning log + ns_partition_default_rows{parent}).
- * Moving them is a manual partman.partition_data_proc(). Retention (dropping
- * old partitions) is not configured until #65, so this never drops anything.
+ * Moving them is a manual partman.partition_data_proc().
+ *
+ * run_maintenance also applies the 90-day retention that migration 0005 sets
+ * on notification_event and delivery_attempt: it DROPS (not detaches) every
+ * monthly partition whose whole month is older than 90 days, so that audit
+ * data is gone. Rows in a default partition are not covered.
  *
  * Every replica runs the loop; a try-lock makes all but one skip each round.
  */

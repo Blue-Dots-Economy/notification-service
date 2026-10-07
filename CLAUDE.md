@@ -207,7 +207,15 @@ move rows out of a default partition, and a row in the default for a future rang
 `run_maintenance` skip that partition set. Each tick therefore runs
 `partman.check_default(p_exact_count := false)`, logs a warning and sets
 `ns_partition_default_rows{parent}` (1 = non-empty); move the rows with
-`partman.partition_data_proc`. There is no retention until #65, so nothing is dropped today.
+`partman.partition_data_proc`.
+
+**Retention: 90 days** (`drizzle/0005_audit_retention_90d.sql`). `notification_event` and
+`delivery_attempt` are set to `retention = '90 days'` in `partman.part_config`, so the same
+maintenance run drops a monthly partition once its whole month is older than 90 days. A row lives
+at least 90 days and at most about 121 (the month it was written in, plus 90 days). Partitions are
+dropped, not detached, so the data is gone. Rows in a default partition are not covered (see
+`check_default` above). The `idempotency_key` table is pruned separately after 90 days. Tier-2
+rollups and erasure tooling remain #65.
 
 ### Authentication
 
@@ -234,7 +242,7 @@ METHOD\npath\ntimestamp\nnonce\nsha256(body)
 | --- | --- |
 | `POST /v1/notify` | `notify:send` |
 | `POST /notify` (legacy; HMAC v1 or v2) | `notify:send` |
-| `/v1/admin/templates*`, `/v1/admin/policies*` | `templates:admin` |
+| `/v1/admin/templates*`, `/v1/admin/policies*`, `GET /v1/admin/export` | `templates:admin` |
 | `POST /failed/retry` | `templates:admin` |
 | `GET /providers`, `GET /providers/:name`, `GET /metrics/queue` | any authenticated principal |
 | `GET /metrics` | none |
@@ -452,6 +460,39 @@ current vendor's template is created and published, which retires the old vendor
 serialise on a session advisory lock. Seeding is non-fatal (logged, never blocks listen) and is
 skipped when `NS_NETWORK` is unset; a template that fails publish validation is left as a draft and retried next boot.
 
+**Catalogue** (`src/lib/catalogue/`: `schema`, `seed`, `export`; route `src/routes/admin-export.ts`).
+A catalogue is one JSON file `{ version, templates: [...], policies: [...] }` (at most 1 MiB, 500
+templates, 500 policies). Its entries are exactly the admin create bodies, plus an optional
+`provider` on a template, so a catalogue holds only what the admin API accepts. `NS_SEED_FILE`
+names the file; unset, nothing is seeded. A missing, unreadable or invalid file is logged and
+skipped, and the boot always continues.
+- **Seed-if-absent (F1-1).** An entry is created only when no row of any status exists for its key:
+  a template by `(network, channel, template_key, locale, provider)`, a policy by `(network, domain,
+  event_type)`. Existing rows are never updated, retired or replaced, so admin edits survive every
+  restart; after seeding, changes go through the admin API.
+- **Boot only (F1-2).** Seeding runs once per boot, after `login_otp` env seeding, templates before
+  policies, under the `notification-service:seed` advisory lock. Replicas booting together
+  serialise, and the wait for the lock is bounded at about 2 minutes. A catalogue change reaches a
+  cluster at the next rollout.
+- **Providers.** A template entry naming a vendor other than the deployment's is skipped, so one
+  catalogue can carry msg91 and pinnacle variants of an SMS template. Only email entries may omit
+  `provider` (they seed for the deployment's email vendor); SMS and WhatsApp entries must name it
+  (`TemplateEntrySchema` refine). A provider-less SMS entry would otherwise seed the old vendor's
+  ids under the new vendor after a vendor switch, and its publish would retire the old row.
+- **Drafts.** An entry that fails publish validation is left as a draft and logged by code, never
+  with values; a database error between create and publish logs `left as draft: db_error`. A draft
+  counts as existing on later boots, so an operator publishes it through the admin API (fix it with
+  `PATCH`, then `POST .../publish`). A template with a `content_ref` variable needs content loaded
+  at its first boot: without it the template, and every policy that lists it, is created as a
+  draft and stays one on later boots. Publish them through the admin API once content loads.
+- **Export and round trip (F1-3).** `GET /v1/admin/export` (`templates:admin`) returns the active
+  templates (current vendors only) and active policies of `NS_NETWORK` as a catalogue with no ids,
+  versions, actors or timestamps. Output is sorted by code point, so two exports of one store are
+  identical apart from `version`, which is the export timestamp. A store that does not fit the
+  catalogue format (e.g. more than 500 active templates) answers `422 export_invalid`, naming paths
+  only. Seeding an empty network from an export reproduces the
+  export. Unset `NS_NETWORK` answers `503 network_not_configured`.
+
 ### Content resolver
 
 Code: `src/lib/content/` (`types`, `configmap`, `resolver`, `inject`). A template variable can take its
@@ -497,7 +538,7 @@ the locale chain), `invalid_content` (the value fails the variable's type or `ur
 Messages name the key and variable, never the value.
 
 **Callers cannot supply content.** A request variable under a content variable's name is
-`422 unknown_variable` (a caller error); content variables are not part of the caller contract.
+`422 unknown_variable` on a `template_key` send (an `event_type` send ignores it); content variables are not part of the caller contract.
 
 **Event record (E3).** The event payload carries `content_refs`, a per-channel map
 `{ "<channel>": [{ key, version, locale, fingerprint }] }`, de-duplicated per channel and built from each planned
@@ -547,8 +588,12 @@ identity are not accepted; the sender is server config (`EMAIL_FROM_ADDRESS`, `E
 Without `EMAIL_FROM_ADDRESS` an email delivery fails permanently with `email sender not configured`.
 
 **Planning** (`planSend`) renders and validates everything before the request is accepted. Request
-variables are checked against the union of the planned templates' contracts (a name declared by none
-is `unknown_variable`); each template renders with only its own declared variables. A failure is
+variables are checked by send type. With `template_key` a name the template does not declare is
+`unknown_variable`. With `event_type` the variables are data: each planned template picks the ones it
+declares and the rest are ignored (a phone-only guardian OTP can carry the email template's variables),
+while a missing required one is `missing_variable`; planning reads no template beyond the candidates it
+delivers, so the urgent path adds no Postgres dependency. Each template
+renders with only its own declared variables. A failure is
 `422 {error, kind, message, details?}` and counts `ns_send_rejected_total{kind,code}`:
 - `caller`: `missing_variable`, `unknown_variable`, `invalid_variable`, `no_reachable_channel`.
 - `configuration`: `not_found`, `vendor_mismatch`, `incomplete_template`, `body_too_long`,
@@ -622,6 +667,14 @@ a 5-second content guard answers a repeat with `409 duplicate-fallback`.
 
 **Correlation id.** The body's `correlation_id` (trimmed, at most 128, else `400`) wins over the
 `x-correlation-id` header; blank falls back to the header, then the event id.
+
+**Event row identity.** `notification_event.event_type` and `domain` are the request's `event_type`
+and recipient `domain` as sent, null when absent (never the policy's matched domain, so a send that
+fell back to a network-wide policy still records the caller's domain). They ride on `job.audit`, so
+every writer of the row records the same values: the accepted insert, a worker upsert that lands
+first (urgent), a fall-through, a DLQ replay and a recovered job. `template_key` is the request's
+`template_key` (legacy `/notify`: its `template_id`) and is **null for event sends**: their templates
+are per delivery and live on `delivery_attempt.template_id`.
 
 **Response:** `202 {notification_event_id, correlation_id, status: "accepted", mode, deliveries:
 [{channel}]}`. See README for examples.
@@ -758,7 +811,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 711 unit tests across 51 files, plus 119 integration tests across 15 files. The unit suite runs in about a second because Redis
+vitest 4, 755 unit tests across 56 files, plus 138 integration tests across 17 files. The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real

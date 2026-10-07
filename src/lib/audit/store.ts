@@ -33,6 +33,15 @@ export interface AuditIds {
    * version, locale) references, never values. Absent when there is none.
    */
   contentRefs?: Record<string, ContentRef[]>;
+  /**
+   * Send API v1 event sends: the request's `event_type`. Absent for
+   * `template_key` sends and legacy /notify. Carried on the job so every
+   * writer of the event row (the accepted insert, the worker's upsert that may
+   * land first, a recovered job) records the same identity.
+   */
+  eventType?: string;
+  /** The request's recipient `domain` as sent (not the policy's matched domain). Absent when not sent. */
+  domain?: string;
 }
 
 export interface AcceptedRecord {
@@ -41,7 +50,18 @@ export interface AcceptedRecord {
   source: string;
   priority: Priority;
   channel: string;
+  /** The attempt's template (delivery_attempt.template_id). */
   templateId: string;
+  /**
+   * notification_event.template_key: the template the request named. Null for
+   * event sends, whose templates are the policy's (one per attempt, on
+   * delivery_attempt.template_id) and need not be one.
+   */
+  templateKey: string | null;
+  /** notification_event.event_type: null for template_key and legacy sends. */
+  eventType: string | null;
+  /** notification_event.domain: the recipient domain as sent; null when absent. */
+  domain: string | null;
   traceId?: string;
   /** Redacted request payload. Realtime: variable NAMES only, never values. */
   payload: Record<string, unknown>;
@@ -68,10 +88,10 @@ export function capError(error: string | undefined): string | null {
 function insertEvent(rec: AcceptedRecord, status: string) {
   return sql`
     INSERT INTO notification_event
-      (id, created_at, correlation_id, trace_id, template_key, network, source, priority, status, payload, delivery_mode)
+      (id, created_at, correlation_id, trace_id, event_type, template_key, network, domain, source, priority, status, payload, delivery_mode)
     VALUES
       (${rec.ids.eventId}, ${rec.ids.createdAt}, ${rec.ids.correlationId}, ${rec.traceId ?? null},
-       ${rec.templateId}, ${rec.network}, ${rec.source}, ${rec.priority}, ${status},
+       ${rec.eventType}, ${rec.templateKey}, ${rec.network}, ${rec.domain}, ${rec.source}, ${rec.priority}, ${status},
        ${JSON.stringify(rec.payload)}::jsonb, ${rec.ids.deliveryMode ?? 'single'})
     ON CONFLICT (id, created_at) DO NOTHING`;
 }
