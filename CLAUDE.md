@@ -110,9 +110,12 @@ turns a delivered message into a retry; it is counted in `ns_audit_write_failure
 
 **Attempt markers.** The worker writes `ns:attempt:<attemptId>` = `<sent|retry|failed>:<attemptNo>`
 (TTL 7 days). `sent`/`failed` are written right after the fate is decided and **before** the stamp
-(best-effort). `retry` is written **after** the `queued` stamp, in the **same MULTI** as the
-retry-set ZADD (`queue.scheduleRetryWithMarker`), so the marker exists iff the retry is scheduled:
-a crash before the MULTI leaves no marker and recovery re-queues the job. The number
+(best-effort). `retry` is written in the **same MULTI** as the retry-set ZADD
+(`queue.scheduleRetryWithMarker`), so the marker exists iff the retry is scheduled, and the
+`queued` stamp comes **after** that MULTI: the row stays `dispatching` until the retry is in Redis,
+so a crash before (or a failed) MULTI leaves a `dispatching` row with no marker, which the
+stale-dispatch sweep re-queues; a crash after it leaves the `retry` marker, and the sweep leaves
+the row to the retry set. The number
 is the attempt the matching stamp would write (`retry` → the next attempt), so a marker left by an
 earlier attempt never hides a later attempt's crash. A failed `sent` stamp therefore no longer
 leads to a re-send. A double failure (stamp fails **and** Redis loses the marker) can still
@@ -141,6 +144,15 @@ can read `accepted` again when a retry is queued. A DLQ replay is a **new** atte
   `SET LOCAL statement_timeout = '60s'` and one Redis `MULTI` push; a failed push rolls back that
   batch only. A connection whose `ROLLBACK` fails is destroyed (`release(err)`).
 - A `FLUSHALL` without a Redis restart is **not** fully recovered (only stale `dispatching` rows).
+- **Known gap: lost `queued` rows are recovered only on epoch loss.** The periodic sweep picks up
+  stale `dispatching` rows only, so a `queued` row whose job left Redis without ever being stamped
+  `dispatching` stays open until Redis restarts: (a) the worker dies between the pop (`BRPOP`, or
+  `popScheduledRetries`, which claims **every** due retry at once, so the rest of that batch is
+  lost too) and the `dispatching` stamp; (b) the API dies between the `/notify` record insert and
+  the `LPUSH`. It is not swept by age because a `queued` row can legitimately wait in a queue or the
+  retry set for a long time, so age is no proof of loss and re-queueing would double-send. Closing
+  it needs a claim written atomically with the pop (e.g. `BLMOVE` into a processing list, or a
+  claim marker set in the pop script) for the sweep to check.
 - **Never delete `ns:epoch` by hand.** It triggers a full re-queue of open recoverable attempts,
   which sends them again.
 - Redis must run with `maxmemory-policy noeviction` so the epoch key is never evicted (the compose

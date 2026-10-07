@@ -124,12 +124,17 @@ export async function processJob(job: Job) {
     const delay = 5 * Math.pow(2, job.attempt - 1);
     console.log(`Retry scheduled in ${delay}s:`, job.job_id);
 
-    // Stamp, then the retry ZADD and the `retry` marker in one MULTI: the
-    // marker exists iff the retry is scheduled, so if the stamp failed and the
-    // row stays `dispatching`, recovery leaves it to the retry set — and if the
-    // process dies before the MULTI, there is no marker and recovery re-queues.
+    // The retry ZADD and the `retry` marker in one MULTI, THEN the `queued`
+    // stamp. The marker exists iff the retry is scheduled, and the row stays
+    // `dispatching` until it is, so the stale-dispatch sweep covers every crash
+    // here: before (or a failed) MULTI → no marker → re-queued; after it → the
+    // marker says the job is in the retry set → left alone, whether or not the
+    // `queued` stamp landed. Stamping `queued` first would strand the row: the
+    // sweep only re-queues stale `dispatching` rows. A late `queued` stamp can
+    // never overwrite the retry's own stamps (monotonic on attempt_no, rank).
+    await scheduleRetryWithMarker(job, delay, attemptMarker(job, 'retry', job.attempt + 1));
     await stamp(job, { status: 'queued', attemptNo: job.attempt + 1, error: res.error });
-    return scheduleRetryWithMarker(job, delay, attemptMarker(job, 'retry', job.attempt + 1));
+    return;
   }
 
   // Marker before stamp: a failed `sent` stamp must not let recovery re-send.

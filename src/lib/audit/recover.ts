@@ -14,7 +14,8 @@ import { describeDbError } from '../db/errors';
  * without its data loses queued work silently. NS detects that with an epoch
  * key it writes once and never expires: absent epoch = Redis lost its data.
  * Recovery keys off Redis uptime, so it covers a restart; a FLUSHALL without a
- * restart is only partly recovered (stale `dispatching` rows). Redis must run
+ * restart is only partly recovered (stale `dispatching` rows; see
+ * recoverLostJobs for the `queued` gap). Redis must run
  * with `noeviction` so the epoch key is never dropped.
  */
 export const REDIS_EPOCH_KEY = 'ns:epoch';
@@ -104,7 +105,14 @@ export interface RecoveryResult {
  * - Epoch lost (no `ns:epoch`): queued/dispatching attempts last touched
  *   BEFORE this Redis started; anything newer reached the live Redis.
  * - Always: attempts stuck in `dispatching` past `staleDispatchMs` (a worker
- *   that died mid-send; at-least-once by design).
+ *   that died mid-send, or before its retry was scheduled; at-least-once by
+ *   design).
+ *
+ * Not covered without an epoch loss: a `queued` row whose job left Redis
+ * before the worker's `dispatching` stamp (crash between pop and stamp, or
+ * between the /notify insert and its push). Age alone is no proof of loss, as a
+ * `queued` job may wait in a queue or the retry set for long, so sweeping
+ * `queued` rows would double-send; closing it needs a claim written at pop.
  *
  * Each candidate is resolved in this order:
  * 1. An attempt marker (see marker.ts) for this attempt → `sent`/`failed` is

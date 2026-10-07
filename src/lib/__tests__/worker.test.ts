@@ -376,7 +376,11 @@ describe('processJob attempt markers', () => {
     expect(markAttempt.mock.invocationCallOrder[0]).toBeLessThan(stamp.mock.invocationCallOrder[sentStamp]!);
   });
 
-  it('stamps queued, then schedules the retry and its marker together (no separate marker write)', async () => {
+  // The row must stay `dispatching` until the retry and its marker are in
+  // Redis: the stale-dispatch sweep then re-queues a crash before the MULTI (no
+  // marker) and leaves a crash after it alone (marker). Stamped `queued` first,
+  // a crash in between was a lost `queued` row the sweep never picks up.
+  it('schedules the retry and its marker together, then stamps queued (no separate marker write)', async () => {
     send.mockResolvedValueOnce({ ok: false, error: 'timeout' });
     const audit = { eventId: 'e', attemptId: 'att-1', createdAt: '2026-10-04T00:00:00.000Z', correlationId: 'c' };
     await processJob(job({ audit }));
@@ -384,9 +388,18 @@ describe('processJob attempt markers', () => {
     expect(queue.scheduleRetryWithMarker).toHaveBeenCalledWith(expect.anything(), 5, {
       key: 'ns:attempt:att-1', value: 'retry:2', ttlSeconds: 604800,
     });
-    expect(stamp.mock.invocationCallOrder.at(-1)!).toBeLessThan(
-      vi.mocked(queue.scheduleRetryWithMarker).mock.invocationCallOrder[0]!,
+    expect(stamp.mock.calls.at(-1)?.[1]).toMatchObject({ status: 'queued', attemptNo: 2 });
+    expect(vi.mocked(queue.scheduleRetryWithMarker).mock.invocationCallOrder[0]!).toBeLessThan(
+      stamp.mock.invocationCallOrder.at(-1)!,
     );
+  });
+
+  it('leaves the row dispatching when scheduling the retry fails, so the stale sweep recovers it', async () => {
+    send.mockResolvedValueOnce({ ok: false, error: 'timeout' });
+    stamp.mockClear();
+    vi.mocked(queue.scheduleRetryWithMarker).mockRejectedValueOnce(new Error('redis down'));
+    await expect(processJob(job())).rejects.toThrow('redis down');
+    expect(stamp.mock.calls.map((c) => (c[1] as { status: string }).status)).toEqual(['dispatching']);
   });
 
   it('marks failed on every dead-letter path', async () => {
