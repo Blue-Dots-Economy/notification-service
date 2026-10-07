@@ -94,6 +94,7 @@ is for local runs only).
 | `DATABASE_QUERY_TIMEOUT_MS` | `5000` | Client and server-side query timeout |
 | `DATABASE_SSL` | `disable` | `disable` or `require`; `require` verifies the certificate, so supply the CA via `NODE_EXTRA_CA_CERTS` |
 | `NS_NETWORK` | `unknown` | Network recorded on each event |
+| `NS_SEED_FILE` | unset | Catalogue of templates and policies to create when absent, at boot only; see Catalogue below |
 | `NS_CONTENT_FILE` | unset | Content file for `content_ref` template variables; unset, they are unavailable. Deployments use `/app/content/content.json` |
 | `NS_CONTENT_PROVIDER` | `configmap` | Content source; `configmap` is the only value |
 | `NS_CONTENT_RELOAD_MS` | `30000` | How often the content file is re-read, 1 to 3600000 |
@@ -322,6 +323,41 @@ re-read every `NS_CONTENT_RELOAD_MS`; a bad file keeps the last good version and
 latest successful load.
 
 
+### Catalogue
+
+`NS_SEED_FILE` names a JSON file of templates and policies. At boot, each entry whose key has no
+row of any status is created and published; existing rows are never changed, so admin edits survive
+restarts. Entries use the admin create bodies plus `provider` on a template. SMS and WhatsApp entries
+must name their `provider`; only email entries may omit it, and those seed for the deployment's email
+vendor. An entry for a vendor this deployment does not use is skipped. An entry that fails publish
+validation stays a draft and is logged by code; publish it through the admin API. A template with a
+`content_ref` variable publishes only if content is loaded at its first boot; otherwise it, and any
+policy that lists it, stays a draft, so publish them through the admin API once content loads.
+Seeding never blocks the boot, and the file is read only at boot.
+
+```json
+{
+  "version": "2026-10-06",
+  "templates": [
+    { "channel": "email", "template_key": "item.paused", "subject": "Paused",
+      "body_html": "<p>Hi {{name}}</p>", "variables": [{ "name": "name" }] }
+  ],
+  "policies": [
+    { "domain": "seeker", "event_type": "item.paused", "mode": "first_available",
+      "channels": [{ "channel": "email", "template_key": "item.paused" }] }
+  ]
+}
+```
+
+`GET /v1/admin/export` returns the active templates and policies of the network in this format,
+without ids or timestamps, so it can seed another environment. Output is sorted, so two exports of
+one store are identical apart from `version`, the export timestamp. A store that does not fit the
+format (for example more than 500 active templates) answers `422 export_invalid`, naming paths only:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" https://ns.example.com/v1/admin/export > catalogue.json
+```
+
 ## Queue Model
 
 The service uses four Redis structures:
@@ -423,7 +459,7 @@ string is skipped with a boot warning naming its key id; any other malformed ent
 | Scope | Routes |
 |---|---|
 | `notify:send` | `POST /v1/notify`, `POST /notify` |
-| `templates:admin` | `/v1/admin/templates*`, `/v1/admin/policies*`, `POST /failed/retry` |
+| `templates:admin` | `/v1/admin/templates*`, `/v1/admin/policies*`, `GET /v1/admin/export`, `POST /failed/retry` |
 | any authenticated | `GET /providers`, `GET /providers/:name`, `GET /metrics/queue` |
 
 A missing scope is `403 {"error":"Insufficient scope","required":"<scope>"}`. `GET /metrics`

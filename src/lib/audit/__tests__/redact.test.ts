@@ -137,3 +137,28 @@ describe('toAcceptedRecord — content refs', () => {
     expect(toAcceptedRecord(job, 's').payload).not.toHaveProperty('content_refs');
   });
 });
+
+describe('toAcceptedRecord — event identity', () => {
+  it('an event send records its event type and domain, and no event-level template_key', () => {
+    const job: Job = {
+      job_id: 'j', channel: 'sms', priority: 'other', to: '+919999999999', template_id: 'k_sms',
+      variables: {}, audit: { ...ids, eventType: 'apply', domain: 'seeker' },
+    };
+    expect(toAcceptedRecord(job, 's')).toMatchObject({ eventType: 'apply', domain: 'seeker', templateKey: null, templateId: 'k_sms' });
+  });
+
+  it('an event send without a domain records domain null', () => {
+    const job: Job = {
+      job_id: 'j', channel: 'sms', priority: 'realtime', to: '+91', template_id: 'k',
+      variables: {}, audit: { ...ids, eventType: 'apply' },
+    };
+    expect(toAcceptedRecord(job, 's')).toMatchObject({ eventType: 'apply', domain: null, templateKey: null });
+  });
+
+  it('a template_key (or legacy) send records the template and a null event type', () => {
+    const job: Job = { job_id: 'j', channel: 'sms', priority: 'other', to: '+91', template_id: 'login_otp', variables: {}, audit: ids };
+    expect(toAcceptedRecord(job, 's')).toMatchObject({ eventType: null, domain: null, templateKey: 'login_otp' });
+    const withDomain: Job = { ...job, audit: { ...ids, domain: 'seeker' } };
+    expect(toAcceptedRecord(withDomain, 's')).toMatchObject({ eventType: null, domain: 'seeker', templateKey: 'login_otp' });
+  });
+});

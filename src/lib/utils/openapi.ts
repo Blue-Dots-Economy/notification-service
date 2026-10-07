@@ -99,6 +99,20 @@ const policyChannels = {
 };
 
 const adminSchemas = {
+  Catalogue: {
+    type: 'object',
+    required: ['version', 'templates', 'policies'],
+    additionalProperties: false,
+    properties: {
+      version: { type: 'string', pattern: '^[A-Za-z0-9._-]{1,64}$' },
+      templates: {
+        type: 'array',
+        maxItems: 500,
+        items: { $ref: '#/components/schemas/TemplateEntry' },
+      },
+      policies: { type: 'array', maxItems: 500, items: { $ref: '#/components/schemas/PolicyCreate' } },
+    },
+  },
   SendAccepted: {
     type: 'object',
     required: ['notification_event_id', 'correlation_id', 'status', 'mode', 'deliveries'],
@@ -195,6 +209,19 @@ const adminSchemas = {
     },
   },
   TemplatePatch: { type: 'object', additionalProperties: false, properties: templatePatchProperties },
+  TemplateEntry: {
+    type: 'object',
+    description: 'A catalogue template: the template create body plus `provider`. Only email entries may omit `provider`; SMS and WhatsApp entries name the vendor they are for.',
+    required: ['channel', 'template_key'],
+    additionalProperties: false,
+    properties: {
+      channel: { type: 'string', minLength: 1, maxLength: 32, example: 'sms' },
+      template_key: { type: 'string', pattern: '^[a-z0-9_.-]+$', maxLength: 128, example: 'welcome' },
+      locale: { type: 'string', pattern: '^[a-z]{2,3}(-[A-Z]{2})?$', description: 'Defaults to NS_DEFAULT_LOCALE.' },
+      provider: { type: 'string', minLength: 1, maxLength: 32, example: 'msg91', description: 'Required unless channel is email.' },
+      ...templatePatchProperties,
+    },
+  },
   Policy: {
     type: 'object',
     properties: {
@@ -368,6 +395,27 @@ const adminPaths = {
   },
 };
 
+const adminExportPath = {
+  '/v1/admin/export': {
+    get: adminOp(
+      'Export the active catalogue',
+      'Active templates (for the deployment\'s current vendors) and policies of NS_NETWORK, in the catalogue format that NS_SEED_FILE reads. Carries no ids, versions, actors or timestamps; output is sorted so two exports of one store are identical apart from `version` (the export timestamp).',
+      {
+        responses: {
+          '200': {
+            description: 'Catalogue',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Catalogue' } } },
+          },
+          '401': adminErrors['401'],
+          '403': adminErrors['403'],
+          '422': errorBody('export_invalid: the active rows do not fit the catalogue format (e.g. more than 500 templates); the message names paths only'),
+          '503': adminErrors['503'],
+        },
+      }
+    ),
+  },
+};
+
 export function openApiDocument() {
   const providerExamples = Object.fromEntries(
     Object.values(providers).map((provider) => [
@@ -389,6 +437,7 @@ export function openApiDocument() {
     },
     paths: {
       ...adminPaths,
+      ...adminExportPath,
       '/v1/notify': {
         post: {
           summary: 'Send a notification (Send API v1)',
@@ -416,7 +465,13 @@ export function openApiDocument() {
                 },
               },
               locale: { type: 'string', pattern: '^[a-z]{2,3}(-[A-Z]{2})?$' },
-              variables: { type: 'object', additionalProperties: true, default: {} },
+              variables: {
+                type: 'object',
+                additionalProperties: true,
+                default: {},
+                description:
+                  'With `event_type`, variables are data: each planned template takes the ones it declares and the rest are ignored; a required one that is missing is `missing_variable`. With `template_key`, a name the template does not declare is `422 unknown_variable`.',
+              },
               priority: { type: 'string', enum: ['urgent', 'normal', 'bulk'], default: 'normal' },
               idempotency_key: { type: 'string', minLength: 1, maxLength: 128 },
               deadline: {

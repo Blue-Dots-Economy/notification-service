@@ -4,19 +4,11 @@ import type { PolicyRow } from '../lib/db/schema';
 import * as repo from '../lib/policies/repo';
 import { principalLabel } from '../lib/auth/principal';
 import { authenticate } from '../plugins/auth';
+import { PolicyCreateSchema as CreateSchema, PolicyModeSchema, PolicyChannelsSchema } from '../lib/catalogue/schema';
 import { sendAdminError } from './admin-errors';
 import { clearResolveCache } from '../lib/send/resolver-cache';
 
-// Slug requires at least one character, so an empty string can never collide with NULL
-// under the DB's coalesce-based unique indexes.
-const Slug = (max: number) => z.string().regex(/^[a-z0-9_.-]+$/).max(max);
-const Channels = z.array(z.object({ channel: z.string().min(1).max(32), template_key: Slug(128) }).strict()).max(10);
-const Mode = z.enum(['first_available', 'all']);
-
-const CreateSchema = z
-  .object({ domain: Slug(64).nullable().optional(), event_type: Slug(64).nullable().optional(), mode: Mode, channels: Channels })
-  .strict();
-const PatchSchema = z.object({ mode: Mode.optional(), channels: Channels.optional() }).strict();
+const PatchSchema = z.object({ mode: PolicyModeSchema.optional(), channels: PolicyChannelsSchema.optional() }).strict();
 const ListQuery = z.object({ domain: z.string().optional(), event_type: z.string().optional(), status: z.enum(['draft', 'active', 'retired']).optional() });
 const IdParams = z.object({ id: z.uuid() });
 

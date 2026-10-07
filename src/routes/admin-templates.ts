@@ -1,7 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { TemplateRow } from '../lib/db/schema';
-import { VariableContractSchema } from '../lib/templates/contract';
+import { TemplatePatchSchema as PatchSchema, TemplateCreateSchema as CreateSchema } from '../lib/catalogue/schema';
 import { withContent } from '../lib/content/inject';
 import { renderTemplate } from '../lib/templates/render';
 import * as repo from '../lib/templates/repo';
@@ -11,30 +11,6 @@ import { principalLabel } from '../lib/auth/principal';
 import { authenticate } from '../plugins/auth';
 import { sendAdminError } from './admin-errors';
 import { clearResolveCache } from '../lib/send/resolver-cache';
-
-const nullableText = (max: number) => z.string().max(max).nullable().optional();
-
-const PatchSchema = z
-  .object({
-    subject: nullableText(998),
-    body_html: nullableText(200_000),
-    body_text: nullableText(10_000),
-    variables: VariableContractSchema.optional(),
-    provider_template_id: nullableText(255),
-    sender_id: nullableText(64),
-    dlt_entity_id: nullableText(64),
-    dlt_header_id: nullableText(64),
-    dlt_tag_id: nullableText(64),
-    approval_ref: nullableText(255),
-    default_deadline_s: z.number().int().positive().max(86_400).nullable().optional(),
-  })
-  .strict();
-
-const CreateSchema = PatchSchema.extend({
-  channel: z.string().min(1).max(32),
-  template_key: z.string().regex(/^[a-z0-9_.-]+$/).max(128),
-  locale: z.string().regex(/^[a-z]{2,3}(-[A-Z]{2})?$/).optional(),
-}).strict();
 
 const ListQuery = z.object({
   channel: z.string().optional(),

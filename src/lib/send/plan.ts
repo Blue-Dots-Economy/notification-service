@@ -82,10 +82,15 @@ export async function planSend(req: V1Request, now = Date.now()): Promise<SendPl
   }
   if (resolved.length === 0) throw firstConfigError ?? new SendError('no_reachable_channel', 'nothing to send');
 
-  // Content variables are filled by NS, never the caller: naming one is unknown_variable.
-  const union = new Set(resolved.flatMap((r) => callerVariables(r.template.variables).map((s) => s.name)));
-  const unknown = Object.keys(req.variables).filter((k) => !union.has(k));
-  if (unknown.length) throw new SendError('unknown_variable', `unknown variables: ${unknown.join(', ')}`, { variables: unknown });
+  // template_key sends are strict: a name the template does not declare is unknown_variable
+  // (content variables are filled by NS, never the caller). Event variables are data: each
+  // planned template picks its own below, so the others are ignored and planning reads no
+  // template beyond the candidates it delivers.
+  if (req.template_key) {
+    const union = new Set(resolved.flatMap((r) => callerVariables(r.template.variables).map((s) => s.name)));
+    const unknown = Object.keys(req.variables).filter((k) => !union.has(k));
+    if (unknown.length) throw new SendError('unknown_variable', `unknown variables: ${unknown.join(', ')}`, { variables: unknown });
+  }
 
   const deliveries: PlannedDelivery[] = [];
   const variables: Record<string, string> = {};
