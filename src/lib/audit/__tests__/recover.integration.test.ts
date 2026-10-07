@@ -18,7 +18,9 @@ import redis from '../../redis';
 import { pushManyToPriority, QUEUE_KEYS } from '../../queue';
 import { closeDb, getPool } from '../../db/client';
 import { runMigrations } from '../../db/migrate';
-import { recordAccepted, upsertAttempt, type AcceptedRecord } from '../store';
+import { recordAccepted, recordAcceptedMany, upsertAttempt, type AcceptedRecord } from '../store';
+import { toAcceptedRecord } from '../redact';
+import type { Job } from 'src/types';
 import { ABANDONED_ERROR, recoverLostJobs, REDIS_EPOCH_KEY, REDIS_RECOVERY_LOCK_KEY } from '../recover';
 import { attemptMarkerKey } from '../marker';
 
@@ -36,7 +38,7 @@ function rec(priority: 'realtime' | 'other' | 'bulk', createdAt = new Date()): A
   const recoverable = priority !== 'realtime';
   return {
     ids: { eventId: randomUUID(), attemptId: randomUUID(), createdAt: createdAt.toISOString(), correlationId: jobId },
-    network: 'n', source: 's', priority, channel: 'email', templateId: 't',
+    network: 'n', source: 's', priority, channel: 'email', templateId: 't', templateKey: 't', eventType: null, domain: null,
     payload: {}, recoverable,
     job: recoverable ? { job_id: jobId, channel: 'email', priority, to: 'x', template_id: 't', variables: {} } : undefined,
   };
@@ -310,6 +312,143 @@ describe('recoverLostJobs', () => {
       expect(rows[0].n).toBe(2);
       // The committed rows are newer than Redis now, so the retry picks up only the third.
       expect(await recoverLostJobs({ batchSize: 2 })).toMatchObject({ epochLost: true, requeued: 1 });
+    });
+  });
+
+  describe('Send API v1 jobs', () => {
+    function v1BulkJob(redactValues: boolean): Job {
+      const createdAt = new Date().toISOString();
+      const delivery = {
+        channel: 'email', to: 'a@b.co', templateKey: 'digest', provider: 'smtp', providerTemplateId: null,
+        rendered: { subject: 's', html: '<p>h</p>' },
+        dlt: { senderId: null, dltEntityId: null, dltHeaderId: null, dltTagId: null },
+      } as unknown as NonNullable<Job['v1']>['deliveries'][number];
+      return {
+        job_id: randomUUID(), channel: 'email', priority: 'bulk', to: 'a@b.co', template_id: 'digest',
+        variables: redactValues ? {} : { name: 'A' },
+        v1: { mode: 'single', deliveries: [delivery], index: 0 },
+        audit: {
+          eventId: randomUUID(), attemptId: randomUUID(), createdAt, correlationId: 'c',
+          deliveryMode: 'single', redactValues, variableNames: ['name'],
+        },
+      };
+    }
+
+    it('re-queues a recoverable bulk v1 job copy onto queue:bulk, intact', async () => {
+      const job = v1BulkJob(false);
+      const r = toAcceptedRecord(job, 'api');
+      await recordAccepted(r);
+      await backdate(r);
+      await redis.del(REDIS_EPOCH_KEY);
+      expect(await recoverLostJobs()).toMatchObject({ epochLost: true, requeued: 1 });
+      const bulk = (await redis.lrange(QUEUE_KEYS.bulk, 0, -1)).map((raw) => JSON.parse(raw) as Job);
+      expect(bulk).toHaveLength(1);
+      expect(bulk[0]).toMatchObject({ job_id: job.job_id, priority: 'bulk', v1: job.v1, audit: job.audit });
+      expect(await redis.llen(QUEUE_KEYS.other)).toBe(0);
+      expect(await redis.llen(QUEUE_KEYS.realtime)).toBe(0);
+    });
+
+    it('never re-queues a redacted v1 job (no job copy, not recoverable)', async () => {
+      const r = toAcceptedRecord(v1BulkJob(true), 'api');
+      expect(r).toMatchObject({ job: undefined, recoverable: false });
+      await recordAccepted(r);
+      await upsertAttempt(r, { status: 'dispatching', attemptNo: 1 });
+      await backdate(r);
+      await redis.del(REDIS_EPOCH_KEY);
+      expect(await recoverLostJobs({ staleDispatchMs: 60_000 })).toMatchObject({ requeued: 0, marked: 0, abandoned: 0 });
+      expect(pushed).toHaveLength(0);
+      for (const key of Object.values(QUEUE_KEYS)) expect(await redis.llen(key)).toBe(0);
+    });
+  });
+
+  describe('multi-attempt events roll up (never overwritten by the stamped attempt)', () => {
+    beforeEach(async () => { await redis.set(REDIS_EPOCH_KEY, 'x'); });
+
+    function siblings(mode: 'first_available' | 'all', createdAt = new Date()): [AcceptedRecord, AcceptedRecord] {
+      const base = rec('other', createdAt);
+      const a1: AcceptedRecord = { ...base, ids: { ...base.ids, deliveryMode: mode } };
+      const b = rec('other', createdAt);
+      const a2: AcceptedRecord = { ...b, ids: { ...a1.ids, attemptId: b.ids.attemptId } };
+      return [a1, a2];
+    }
+
+    it('first_available: a stale earlier attempt stamped failed from its marker leaves a sent event sent', async () => {
+      const [a1, a2] = siblings('first_available');
+      await recordAcceptedMany([a1]);
+      await upsertAttempt(a1, { status: 'dispatching', attemptNo: 1 });
+      // a1 failed and fell through; its `failed` stamp was lost, its marker was not.
+      await redis.set(attemptMarkerKey(a1.ids.attemptId), 'failed:1', 'EX', 60);
+      for (const status of ['queued', 'dispatching', 'sent'] as const) await upsertAttempt(a2, { status, attemptNo: 1 });
+      expect(await event(a1)).toMatchObject({ status: 'sent' });
+      await backdate(a1, '1 hour');
+
+      expect(await recoverLostJobs({ staleDispatchMs: 60_000 })).toMatchObject({ marked: 1, requeued: 0 });
+      expect(await row(a1)).toMatchObject({ status: 'failed' });
+      expect(await event(a1)).toMatchObject({ status: 'sent' });
+    });
+
+    it('first_available: a stale earlier attempt stamped failed leaves the event on the open later attempt', async () => {
+      const [a1, a2] = siblings('first_available');
+      await recordAcceptedMany([a1]);
+      await upsertAttempt(a1, { status: 'dispatching', attemptNo: 1 });
+      await redis.set(attemptMarkerKey(a1.ids.attemptId), 'failed:1', 'EX', 60);
+      await upsertAttempt(a2, { status: 'queued', attemptNo: 1 });
+      await backdate(a1, '1 hour');
+
+      expect(await recoverLostJobs({ staleDispatchMs: 60_000 })).toMatchObject({ marked: 1 });
+      expect(await event(a1)).toMatchObject({ status: 'accepted' }); // a2 is queued
+    });
+
+    it('all: recovery stamping one attempt still rolls the event up across attempts', async () => {
+      const [a1, a2] = siblings('all');
+      await recordAcceptedMany([a1, a2]);
+      await upsertAttempt(a1, { status: 'sent', attemptNo: 1 });
+      await upsertAttempt(a2, { status: 'dispatching', attemptNo: 1 });
+      await redis.set(attemptMarkerKey(a2.ids.attemptId), 'failed:1', 'EX', 60);
+      await backdate(a2, '1 hour');
+
+      expect(await recoverLostJobs({ staleDispatchMs: 60_000 })).toMatchObject({ marked: 1 });
+      expect(await row(a2)).toMatchObject({ status: 'failed' });
+      expect(await event(a1)).toMatchObject({ status: 'partially_delivered' });
+    });
+
+    it('all: an abandoned attempt rolls up too', async () => {
+      const [a1, a2] = siblings('all', new Date(Date.now() - 48 * 3600_000));
+      await recordAcceptedMany([a1, a2]);
+      await upsertAttempt(a1, { status: 'sent', attemptNo: 1 });
+      await upsertAttempt(a2, { status: 'dispatching', attemptNo: 1 });
+      await backdate(a2, '1 hour');
+
+      expect(await recoverLostJobs({ staleDispatchMs: 60_000, maxAgeHours: 24 })).toMatchObject({ abandoned: 1 });
+      expect(await row(a2)).toMatchObject({ status: 'failed', error: ABANDONED_ERROR });
+      expect(await event(a1)).toMatchObject({ status: 'partially_delivered' });
+    });
+
+    it('a re-queued attempt rolls its event up too', async () => {
+      const [a1, a2] = siblings('all');
+      await recordAcceptedMany([a1, a2]);
+      await upsertAttempt(a1, { status: 'failed', attemptNo: 1, error: 'x' });
+      await upsertAttempt(a2, { status: 'dispatching', attemptNo: 1 });
+      expect(await event(a1)).toMatchObject({ status: 'dispatching' });
+      await backdate(a2, '1 hour');
+
+      expect(await recoverLostJobs({ staleDispatchMs: 60_000 })).toMatchObject({ requeued: 1 });
+      expect(await row(a2)).toMatchObject({ status: 'queued', attempt_no: 2 });
+      expect(await event(a1)).toMatchObject({ status: 'accepted' }); // a2 queued again, nothing dispatching
+
+      const single = await staleDispatching(1);
+      expect(await recoverLostJobs({ staleDispatchMs: 60_000 })).toMatchObject({ requeued: 1 });
+      expect(await event(single)).toMatchObject({ status: 'accepted' });
+    });
+
+    it('an expired marker stamps the attempt and a single event expired', async () => {
+      const r = await staleDispatching(1);
+      await redis.set(attemptMarkerKey(r.ids.attemptId), 'expired:1', 'EX', 60);
+      expect(await recoverLostJobs({ staleDispatchMs: 60_000 })).toMatchObject({ marked: 1, requeued: 0 });
+      expect(pushed).toHaveLength(0);
+      expect(await row(r)).toMatchObject({ status: 'expired', attempt_no: 1 });
+      expect((await row(r)).completed_at).not.toBeNull();
+      expect(await event(r)).toMatchObject({ status: 'expired' });
     });
   });
 });

@@ -5,7 +5,10 @@ import { pushManyToPriority } from '../queue';
 import { getPool } from '../db/client';
 import * as metrics from '../metrics';
 import type { Job } from 'src/types';
-import { ATTEMPT_RANK, eventStatusFor } from './status';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import type { SQL } from 'drizzle-orm';
+import { ATTEMPT_RANK } from './status';
+import { rollUpEvent, type SqlExecutor } from './store';
 import { readAttemptMarkers, type AttemptMarker } from './marker';
 import { describeDbError } from '../db/errors';
 
@@ -92,7 +95,7 @@ export interface RecoveryResult {
   epochLost: boolean;
   /** Pushed back onto the queue. */
   requeued: number;
-  /** Stamped from an attempt marker (sent / failed) instead of re-sent. */
+  /** Stamped from an attempt marker (sent / failed / expired) instead of re-sent. */
   marked: number;
   /** Older than the recovery window: marked failed, not re-sent. */
   abandoned: number;
@@ -115,8 +118,8 @@ export interface RecoveryResult {
  * `queued` rows would double-send; closing it needs a claim written at pop.
  *
  * Each candidate is resolved in this order:
- * 1. An attempt marker (see marker.ts) for this attempt → `sent`/`failed` is
- *    stamped on the row; `retry` means the job is in the retry set → left as is.
+ * 1. An attempt marker (see marker.ts) for this attempt → `sent`/`failed`/
+ *    `expired` is stamped on the row; `retry` means the job is in the retry set → left as is.
  * 2. Created more than `maxAgeHours` ago → marked failed (abandoned) and
  *    counted in ns_recovery_abandoned_total; a late send is worse than none.
  * 3. Otherwise → attempt_no + 1, status queued, pushed back onto its own
@@ -237,14 +240,9 @@ async function recoverBatch(p: {
           WHERE id = ANY($1::uuid[]) AND created_at = ANY($2::timestamptz[])`,
         [toAbandon.map((r) => r.id), toAbandon.map((r) => r.created_at), ATTEMPT_RANK.failed, ABANDONED_ERROR],
       );
-      await q(
-        `UPDATE notification_event
-            SET status = 'failed', updated_at = now()
-          WHERE id = ANY($1::uuid[]) AND created_at = ANY($2::timestamptz[])`,
-        [toAbandon.map((r) => r.notification_event_id), toAbandon.map((r) => r.created_at)],
-      );
     }
 
+    let requeueJobs: Job[] = [];
     if (toRequeue.length > 0) {
       const { rows: bumped } = await q<{ id: string; attempt_no: number }>(
         `UPDATE delivery_attempt
@@ -254,10 +252,26 @@ async function recoverBatch(p: {
         [toRequeue.map((r) => r.id), toRequeue.map((r) => r.created_at)],
       );
       const attemptById = new Map(bumped.map((b) => [b.id, b.attempt_no]));
-      await pushManyToPriority(
-        toRequeue.map((r) => ({ ...r.job, attempt: (attemptById.get(r.id) ?? r.attempt_no + 1) - 1 })),
-      );
+      requeueJobs = toRequeue.map((r) => ({ ...r.job, attempt: (attemptById.get(r.id) ?? r.attempt_no + 1) - 1 }));
     }
+
+    // The events of every attempt written above (stamped, abandoned or
+    // re-queued), rolled up from all their attempts (a first_available/all
+    // event has siblings; writing one attempt's status straight onto the event
+    // would overwrite them). Sorted, so two concurrent sweeps take the event
+    // row locks in the same order.
+    const touched = new Map<string, { eventId: string; createdAt: string }>();
+    for (const r of [...toMark.map((m) => m.row), ...toAbandon, ...toRequeue]) {
+      touched.set(`${r.notification_event_id}|${r.created_at}`, { eventId: r.notification_event_id, createdAt: r.created_at });
+    }
+    const exec = sqlExecutor(q);
+    for (const key of [...touched.keys()].sort()) {
+      const { eventId, createdAt } = touched.get(key)!;
+      await rollUpEvent(exec, eventId, createdAt);
+    }
+
+    // Last, so a failed push rolls back every write of this batch.
+    if (requeueJobs.length > 0) await pushManyToPriority(requeueJobs);
 
     await client.query('COMMIT');
     const lastRow = rows[rows.length - 1];
@@ -292,20 +306,32 @@ function queryWithTimeout(client: PoolClient): Query {
     client.query<R>({ text, values, query_timeout: RECOVERY_QUERY_TIMEOUT_MS } as QueryConfig);
 }
 
-/** Record the state the worker marked, instead of re-sending. */
+const dialect = new PgDialect();
+
+/** Runs rollUpEvent's drizzle `sql` on recovery's own (pg) transaction client. */
+function sqlExecutor(q: Query): SqlExecutor {
+  return {
+    execute: (query: SQL) => {
+      const { sql: text, params } = dialect.sqlToQuery(query);
+      return q(text, params);
+    },
+  };
+}
+
+const MARKER_STATUS = { sent: 'sent', failed: 'failed', expired: 'expired' } as const;
+
+/**
+ * Record the state the worker marked on the attempt, instead of re-sending.
+ * The event is rolled up afterwards, by the caller, from all its attempts.
+ */
 async function stampFromMarker(q: Query, row: Candidate, marker: AttemptMarker): Promise<void> {
-  const status = marker.fate === 'sent' ? 'sent' : 'failed';
-  const terminal = status === 'failed';
+  const status = MARKER_STATUS[marker.fate as keyof typeof MARKER_STATUS] ?? 'failed';
+  const terminal = status !== 'sent';
   await q(
     `UPDATE delivery_attempt
         SET status = $3, status_rank = $4, attempt_no = $5,
             error = $6, completed_at = ${terminal ? 'now()' : 'NULL'}, updated_at = now()
       WHERE id = $1 AND created_at = $2`,
-    [row.id, row.created_at, status, ATTEMPT_RANK[status], marker.attemptNo, terminal ? 'failed (recorded by attempt marker)' : null],
-  );
-  await q(
-    `UPDATE notification_event SET status = $3, updated_at = now()
-      WHERE id = $1 AND created_at = $2`,
-    [row.notification_event_id, row.created_at, eventStatusFor(status)],
+    [row.id, row.created_at, status, ATTEMPT_RANK[status], marker.attemptNo, terminal ? `${status} (recorded by attempt marker)` : null],
   );
 }

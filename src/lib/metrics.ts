@@ -95,6 +95,11 @@ const HELP: Record<string, [type: string, help: string]> = {
     'Redacted (OTP) jobs that failed and were deliberately not dead-lettered, by channel and reason.',
   ],
   ns_rate_limited_total: ['counter', 'Sends deferred because no vendor token was available, by channel and priority.'],
+  ns_send_rejected_total: ['counter', 'POST /v1/notify sends refused at planning, by kind and code.'],
+  ns_send_fallthrough_total: [
+    'counter',
+    'first_available sends that moved to their next channel after a delivery failed, by from and to channel.',
+  ],
   ns_audit_write_failures_total: [
     'counter',
     'Best-effort audit status writes that failed, by stage (the status being written).',
@@ -115,6 +120,14 @@ const HELP: Record<string, [type: string, help: string]> = {
   ns_provider_balance_poll_failures_total: [
     'counter',
     'Balance polls that failed, by provider and reason.',
+  ],
+  ns_content_load_failures_total: [
+    'counter',
+    'Content loads (boot or reload) that failed, by provider. The last good content keeps being served.',
+  ],
+  ns_content_loaded: [
+    'gauge',
+    'Unix time of the latest successful load of this content (version, fingerprint = first 12 hex of the file sha256), by provider. Alert on staleness.',
   ],
   ns_queue_depth: ['gauge', 'Jobs currently in each queue.'],
   ns_retry_eta_seconds: ['gauge', 'Seconds until the oldest scheduled retry is due.'],

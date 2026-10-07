@@ -47,7 +47,7 @@ This is a **Fastify notification service** that queues and asynchronously proces
      is never a healthy-looking API queueing work that nothing drains.
 
 2. **Request Pipeline** (e.g., `POST /notify`)
-   - HMAC signature validation (`src/plugins/request-auth.ts`)
+   - Authentication: bearer token or HMAC signature, plus route scope (`src/plugins/auth.ts`)
    - Payload validation via Zod schemas
    - Record in Postgres and enqueue to Redis (order depends on priority; see Persistence)
 
@@ -133,9 +133,10 @@ Postgres is the record of every send; Redis is only the dispatch queue. Code: `s
 path); normal-priority stamps are awaited but bounded by the pool timeouts. A failed stamp never
 turns a delivered message into a retry; it is counted in `ns_audit_write_failures_total{stage}`.
 
-**Attempt markers.** The worker writes `ns:attempt:<attemptId>` = `<sent|retry|failed>:<attemptNo>`
-(TTL 7 days). `sent`/`failed` are written right after the fate is decided and **before** the stamp
-(best-effort). `retry` is written in the **same MULTI** as the retry-set ZADD
+**Attempt markers.** The worker writes `ns:attempt:<attemptId>` = `<sent|retry|failed|expired>:<attemptNo>`
+(TTL 7 days). `sent`/`failed`/`expired` are written right after the fate is decided and **before** the stamp
+(best-effort); a v1 fall-through's `failed` marker rides in the MULTI that queues the next delivery.
+`retry` is written in the **same MULTI** as the retry-set ZADD
 (`queue.scheduleRetryWithMarker`), so the marker exists iff the retry is scheduled, and the
 `queued` stamp comes **after** that MULTI: the row stays `dispatching` until the retry is in Redis,
 so a crash before (or a failed) MULTI leaves a `dispatching` row with no marker, which the
@@ -149,7 +150,12 @@ re-send: delivery is at-least-once.
 **Status model.** Rows are upserted monotonically on `(attempt_no, status_rank)`, so a late or
 replayed stamp cannot move a row backwards. An event's status mirrors its *current* attempt, so it
 can read `accepted` again when a retry is queued. A DLQ replay is a **new** attempt row (fresh
-`attemptId`, same event).
+`attemptId`, same event) and **clears the job's deadline** (an explicit operator action; redacted
+jobs never reach the DLQ). Multi-attempt events (`delivery_mode` `all` / `first_available`) are
+rolled up from all their attempts by `rollUpEvent` (`store.ts`), under a `FOR UPDATE` lock on the
+event row, from both `upsertAttempt` and recovery: `all` → `partially_delivered` when mixed;
+`first_available` → `sent`/`delivered` if **any** attempt reached it (never back to `failed`),
+else the latest attempt (open first, then most recently completed: attempts share `created_at`).
 
 **Recovery (`recoverLostJobs`).** `ns:epoch` in Redis means "Redis still has its data".
 - If it is missing, the holder of a short `ns:recovery` lock re-queues recoverable open attempts
@@ -160,8 +166,10 @@ can read `accepted` again when a retry is queued. A DLQ replay is a **new** atte
   recovery run fails while the epoch is missing (**including the first deploy**), so lost work is
   never recovered.
 - Stale `dispatching` rows (> 10 min) are re-queued: at-least-once by design.
+- Every event whose attempt recovery writes (stamped from a marker, abandoned or re-queued) is
+  rolled up by `rollUpEvent` in the same transaction, in sorted order.
 - Every candidate (recoverable, with a job copy) is resolved in order: its **attempt marker**
-  (`sent`/`failed` → that state is stamped, `retry` → left alone, the job is in the retry set);
+  (`sent`/`failed`/`expired` → that state is stamped and the event rolled up, `retry` → left alone, the job is in the retry set);
   then **age** — created more than `RECOVERY_MAX_AGE_HOURS` (default 24) ago → marked `failed`
   (`abandoned: not delivered within recovery window`), counted in `ns_recovery_abandoned_total`;
   otherwise re-queued onto **its own priority's queue** (`pushManyToPriority`: one `MULTI`, each
@@ -199,22 +207,70 @@ move rows out of a default partition, and a row in the default for a future rang
 `run_maintenance` skip that partition set. Each tick therefore runs
 `partman.check_default(p_exact_count := false)`, logs a warning and sets
 `ns_partition_default_rows{parent}` (1 = non-empty); move the rows with
-`partman.partition_data_proc`. There is no retention until #65, so nothing is dropped today.
+`partman.partition_data_proc`.
 
-### Request Signing (Authentication)
+**Retention: 90 days** (`drizzle/0005_audit_retention_90d.sql`). `notification_event` and
+`delivery_attempt` are set to `retention = '90 days'` in `partman.part_config`, so the same
+maintenance run drops a monthly partition once its whole month is older than 90 days. A row lives
+at least 90 days and at most about 121 (the month it was written in, plus 90 days). Partitions are
+dropped, not detached, so the data is gone. Rows in a default partition are not covered (see
+`check_default` above). The `idempotency_key` table is pruned separately after 90 days. Tier-2
+rollups and erasure tooling remain #65.
 
-All API routes require HMAC-SHA256 signed requests with headers:
-- `X-NS-Key` — Client identifier
-- `X-NS-Timestamp` — Unix timestamp
-- `X-NS-Nonce` — Random string (prevents replay)
-- `X-NS-Signature` — `v1=<hmac_sha256>` of signed base string
+### Authentication
 
-**Signed base string:**
+One preHandler, `authenticate({ scope, legacyHmacV1? })` (`src/plugins/auth.ts`), guards every route except `GET /metrics` (unauthenticated, content-free). A request carries **one** of two credential types:
+
+- **HMAC v2** headers: `X-NS-Key`, `X-NS-Timestamp`, `X-NS-Nonce`, `X-NS-Signature: v2=<64 lowercase hex>`.
+- **Keycloak bearer token**: `Authorization: Bearer <jwt>`.
+
+An `Authorization` header together with any of the four HMAC headers is `401 Ambiguous credentials`; the caller picks one.
+
+**HMAC v2.** The signature is HMAC-SHA256 with the key's secret over
 ```
-METHOD\nPATH\nTIMESTAMP\nNONCE
+METHOD\npath\ntimestamp\nnonce\nsha256(body)
 ```
+`path` is `req.url` including the query string. The digest is lowercase hex SHA-256 of the exact body bytes, or of the empty string when there is no body. The signature format is strict: `v1=` or `v2=` followed by 64 lowercase hex characters. Allowed clock skew is 30 s; a non-numeric timestamp is `401 Request expired`. The **signature is verified first, then the nonce is claimed** (`nonce:<keyId>:<nonce>`, `SET NX EX 60`), so `Replay detected` always means a correctly signed request seen twice.
 
-Implementation: `src/lib/auth/secrets.ts` (loads the JSON file named by `INTERNAL_SECRETS_JSON`), `src/plugins/request-auth.ts` (validates).
+**Bodies.** JSON is the only accepted body type; any other content type is `415` before authentication runs, and every accepted body is covered by the v2 signature. A bodyless POST (publish, retire, `POST /failed/retry`) sends no `Content-Type`, or sends `{}` as JSON; an empty body declared as `application/json` is `400`. `registerRawJsonBody` (`src/plugins/raw-body.ts`) removes all default content-type parsers and installs one `application/json` parser that keeps the raw bytes on `req.rawBody` and then parses with Fastify's own JSON parser. The built-in parser is replaced because it hands over only the parsed object, and re-serialising an object does not reproduce the bytes the caller signed.
+
+**HMAC v1** (`METHOD\npath\ntimestamp\nonce`, no body digest) is accepted on legacy `POST /notify` only (`legacyHmacV1: true`), until the cutover release deletes that route. Every other route answers `401 Signature version not accepted` for `v1=`.
+
+**Scopes.** Two scopes: `notify:send` and `templates:admin`. A route's scope is in its `authenticate` options; the table is pinned by `src/__tests__/route-scopes.test.ts`.
+
+| Route | Scope |
+| --- | --- |
+| `POST /v1/notify` | `notify:send` |
+| `POST /notify` (legacy; HMAC v1 or v2) | `notify:send` |
+| `/v1/admin/templates*`, `/v1/admin/policies*`, `GET /v1/admin/export` | `templates:admin` |
+| `POST /failed/retry` | `templates:admin` |
+| `GET /providers`, `GET /providers/:name`, `GET /metrics/queue` | any authenticated principal |
+| `GET /metrics` | none |
+| `GET /`, `GET /openapi.json` | none; registered only when `NS_DOCS_ENABLED=true` |
+
+A missing scope is `403 {"error":"Insufficient scope","required":"<scope>"}`. `POST /failed/retry` needs `templates:admin` because replaying the dead-letter queue re-sends other callers' messages: a sending-only credential gets `403` there. Administration of DLT-registered templates likewise needs the admin scope, which a sending credential does not carry.
+
+**HMAC keys and scopes.** `INTERNAL_SECRETS_JSON` names a file of this shape (`src/lib/auth/secrets.ts`, validated at boot):
+```json
+{ "<keyId>": { "secret": "...", "scopes": ["notify:send", "templates:admin"] } }
+```
+`scopes` is optional and defaults to `["notify:send"]`, so a key may send but administers nothing unless it is granted `templates:admin`. Unknown scopes (reported by index, `scopes[<i>] is not a known scope`, never by value), an empty list, a non-string `secret` or a non-object entry fail the boot. An entry whose `secret` is **empty or whitespace-only** is skipped with a `console.warn` naming the key id only, and `getKey` returns `null` for it (`401 Invalid key` at request time): deployments render an unset secret as `""` (e.g. `"keycloak": {"secret": ""}` when the SMS plugin secret is unset) and chart defaults use a placeholder space, and throwing would stop the pod from booting. Each `loadSecrets()` replaces the whole key set.
+
+**Bearer tokens** (`src/lib/auth/bearer.ts`). One Keycloak realm is shared by every service, so a token must carry `aud` = `NS_AUTH_AUDIENCE` **and** an `azp` on the `NS_AUTH_ALLOWED_AZP` allowlist. Signature, issuer and audience alone are not enough.
+- `typ` must be `Bearer`; `exp` and `sub` are required. Algorithms: RS256, PS256, ES256; 30 s clock tolerance.
+- Scopes are the `notification-service` client roles in `resource_access` (`notify:send`, `templates:admin`). The audience comes from the role grant (Keycloak's built-in `roles` client scope adds `aud: notification-service` to a token whose subject holds a `notification-service` client role), so granting a role is the whole act of authorising a caller and no client definition changes.
+- Principal id: the caller is a service account only when `client_id === azp` (id = `azp`); otherwise the id is `<azp>:<sub>`.
+- Env: `NS_KEYCLOAK_ISSUER` turns bearer auth on; it must equal the token `iss` exactly (`https://<host>/auth/realms/<realm>`), with **no trailing slash**, and be an http(s) URL, or boot fails. `NS_KEYCLOAK_JWKS_URI` is optional (default `<issuer>/protocol/openid-connect/certs`). `NS_AUTH_AUDIENCE` defaults to `notification-service`. `NS_AUTH_ALLOWED_AZP` (comma-separated client ids) must list at least one client when the issuer is set. With no issuer, a bearer token is `401 Bearer auth not enabled`.
+- Status codes: a bad, expired, wrong-audience or non-allowlisted token is `401`; a key set that cannot be fetched (unreachable, timeout, non-200 or invalid set) is `503 Auth service unavailable`.
+- **`jose` is ESM-only**, and this package builds as CommonJS under `module: Node16`. It is loaded with `await import('jose')`; a static `import` is compile error TS1479. Type-only imports use `with { 'resolution-mode': 'import' }`. Tests inject a local key set with `setKeyResolverForTests`.
+
+**`NS_DOCS_ENABLED`.** The API reference (`/`) and `/openapi.json` are registered only when `NS_DOCS_ENABLED=true`. The local-dev `example.env` sets it; deployed environments leave it unset.
+
+**Caller identity in audit rows.** The audit `source` on `/notify` and `/v1/notify`, and the admin `created_by`/`published_by`, are `principalLabel(req.principal)`: `hmac:<keyId>` or `bearer:<id>`. Rows written before this change hold the bare key id.
+
+**Rejection logging.** Every refused request logs `{ status, error, credential }` with message `auth rejected` (`credential` is `bearer`, `hmac`, or `both` for ambiguous credentials) — at `warn`, or at `error` for a `503`. The token, signature, nonce, key secret and `Authorization` header are never logged.
+
+Implementation: `src/lib/auth/` (`secrets.ts`, `hmac.ts`, `bearer.ts`, `principal.ts`), `src/plugins/auth.ts`, `src/plugins/raw-body.ts`.
 
 ### Provider System
 
@@ -320,7 +376,7 @@ See README for the full request/response contract.
 
 Code: `src/lib/templates/` (`contract`, `render`, `repo`, `validate`, `vendors`, `seed`),
 `src/lib/policies/` (`repo`, `plan`), routes `src/routes/admin-templates.ts` and
-`admin-policies.ts`. Plan C wires these into `/notify`; until then `/notify` behaves as before.
+`admin-policies.ts`. Send API v1 (`POST /v1/notify`) uses them; legacy `/notify` does not.
 
 **Tables.** `template` is keyed `(network, channel, template_key, locale)` and `notification_policy`
 `(network, domain, event_type)` where NULL means "any". Both carry a `version` and a status of
@@ -379,13 +435,8 @@ switch can still leave a live policy on another vendor's template; that surfaces
 an email address; sms and whatsapp need a phone) because NS holds no user directory. `first_available`
 tries candidates in order; `all` fans out.
 
-**Admin scope.** `/v1/admin/templates` and `/v1/admin/policies` need a valid HMAC signature
-(`requestAuth`) **and** the key id in `NS_ADMIN_KEY_IDS`, else `403 {"error":"admin scope required"}`.
-Editing a DLT-registered template has a compliance blast radius a sending credential must not
-carry. Interim until Keycloak admin roles (#62). **Keep `NS_ADMIN_KEY_IDS` empty in production
-until HMAC v2 (#62) signs request bodies**: the current signature covers method, path, timestamp and
-nonce but not the body, so whoever can see a signed admin request in flight can send a different
-template or policy under its headers. Request bodies (including each variable spec) are strict, so unknown keys → `400`; list query params are not strict.
+**Admin scope.** `/v1/admin/templates` and `/v1/admin/policies` need the `templates:admin` scope, from an HMAC key's `scopes` entry or a bearer token's role (see Authentication). Editing a DLT-registered template has a compliance blast radius a sending credential must not carry; a credential without the scope gets `403 Insufficient scope`.
+Request bodies (including each variable spec) are strict, so unknown keys → `400`; list query params are not strict.
 Errors: `404 not_found`, `409 invalid_state` / `template_in_use`, `422` for any other rule violation, `503
 network_not_configured`, and `503 database_unavailable` for anything else (`sendAdminError`). That
 last path logs only `describeDbError(err)` and returns a fixed body: a `DrizzleQueryError` message
@@ -409,13 +460,233 @@ current vendor's template is created and published, which retires the old vendor
 serialise on a session advisory lock. Seeding is non-fatal (logged, never blocks listen) and is
 skipped when `NS_NETWORK` is unset; a template that fails publish validation is left as a draft and retried next boot.
 
+**Catalogue** (`src/lib/catalogue/`: `schema`, `seed`, `export`; route `src/routes/admin-export.ts`).
+A catalogue is one JSON file `{ version, templates: [...], policies: [...] }` (at most 1 MiB, 500
+templates, 500 policies). Its entries are exactly the admin create bodies, plus an optional
+`provider` on a template, so a catalogue holds only what the admin API accepts. `NS_SEED_FILE`
+names the file; unset, nothing is seeded. A missing, unreadable or invalid file is logged and
+skipped, and the boot always continues.
+- **Seed-if-absent (F1-1).** An entry is created only when no row of any status exists for its key:
+  a template by `(network, channel, template_key, locale, provider)`, a policy by `(network, domain,
+  event_type)`. Existing rows are never updated, retired or replaced, so admin edits survive every
+  restart; after seeding, changes go through the admin API.
+- **Boot only (F1-2).** Seeding runs once per boot, after `login_otp` env seeding, templates before
+  policies, under the `notification-service:seed` advisory lock. Replicas booting together
+  serialise, and the wait for the lock is bounded at about 2 minutes. A catalogue change reaches a
+  cluster at the next rollout.
+- **Providers.** A template entry naming a vendor other than the deployment's is skipped, so one
+  catalogue can carry msg91 and pinnacle variants of an SMS template. Only email entries may omit
+  `provider` (they seed for the deployment's email vendor); SMS and WhatsApp entries must name it
+  (`TemplateEntrySchema` refine). A provider-less SMS entry would otherwise seed the old vendor's
+  ids under the new vendor after a vendor switch, and its publish would retire the old row.
+- **Drafts.** An entry that fails publish validation is left as a draft and logged by code, never
+  with values; a database error between create and publish logs `left as draft: db_error`. A draft
+  counts as existing on later boots, so an operator publishes it through the admin API (fix it with
+  `PATCH`, then `POST .../publish`). A template with a `content_ref` variable needs content loaded
+  at its first boot: without it the template, and every policy that lists it, is created as a
+  draft and stays one on later boots. Publish them through the admin API once content loads.
+- **Export and round trip (F1-3).** `GET /v1/admin/export` (`templates:admin`) returns the active
+  templates (current vendors only) and active policies of `NS_NETWORK` as a catalogue with no ids,
+  versions, actors or timestamps. Output is sorted by code point, so two exports of one store are
+  identical apart from `version`, which is the export timestamp. A store that does not fit the
+  catalogue format (e.g. more than 500 active templates) answers `422 export_invalid`, naming paths
+  only. Seeding an empty network from an export reproduces the
+  export. Unset `NS_NETWORK` answers `503 network_not_configured`.
+
+### Content resolver
+
+Code: `src/lib/content/` (`types`, `configmap`, `resolver`, `inject`). A template variable can take its
+value from shared content, such as a terms-and-conditions link, instead of from the caller.
+
+**Variable fields.** `source: "request"` (default) or `"content_ref"`, plus `contentKey` for
+`content_ref`. The key is dotted lowercase segments matching `CONTENT_KEY`
+(`^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){1,7}$`), e.g. `tnc.in_force.url` or `tnc.on_offer.text`; NS does
+not interpret the segments, and `in_force` versus `on_offer` is part of the key (an acceptance receipt
+carries the in-force text, a re-consent broadcast the offered one). A `content_ref` variable is always
+required, is never `sensitive` (shared public content has nothing to redact), and may be `raw` under
+the same email-only rule as other variables.
+
+**File format.** One JSON document, at most 1 MiB:
+`{ "version": "2026-10-01", "entries": { "<key>": { "<locale>": "<value>" } } }`. `version` matches
+`^[A-Za-z0-9._-]{1,64}$`; locales look like `en` or `en-IN`; at most 500 keys; each value is a
+non-blank string of at most 2000 characters. Unknown top-level fields are rejected. A `url` variable's
+value passes the same checks as a caller URL (http(s), no userinfo, `urlHosts` when declared).
+
+**Configuration.** `NS_CONTENT_PROVIDER` (`configmap`), `NS_CONTENT_FILE` (the path), and
+`NS_CONTENT_RELOAD_MS` (1 to 3600000, default 30000). Deployments set
+`NS_CONTENT_FILE=/app/content/content.json`. The provider reads only that file, never environment
+variables, secrets or other config. The provider interface leaves room for `db` and `http` providers
+as a configuration change.
+
+**Allowlist (E1).** The keys of the loaded file are the allowlist. A template may reference a key only
+if the current file defines it; there is no second list of permitted prefixes. Keys come from template
+contracts, which only `templates:admin` can write, never from requests.
+
+**Resolution at accept (E2).** Content resolves where the send is planned, so a failure is a
+synchronous `422` and a queued message carries the version current when it was accepted. The worker
+never consults content. Values are memoised per `(key, locale, version)`. Preview and publish resolve
+content too: publish checks that the key exists, that the template's locale chain resolves
+(`content_unresolved`), and that the value passes the variable's type and `urlHosts` checks
+(`invalid_content`). A template cannot be published before its content exists for its locale.
+
+**Locale chain.** The resolved template's locale, then its language, then `NS_DEFAULT_LOCALE`.
+
+**Errors.** All four are configuration errors (`422`, `kind: configuration` on `/v1/notify`), and a
+send is refused rather than rendered with an empty value:
+`content_unavailable` (no content loaded), `unknown_content_key`, `content_unresolved` (no value for
+the locale chain), `invalid_content` (the value fails the variable's type or `urlHosts` check).
+Messages name the key and variable, never the value.
+
+**Callers cannot supply content.** A request variable under a content variable's name is
+`422 unknown_variable` on a `template_key` send (an `event_type` send ignores it); content variables are not part of the caller contract.
+
+**Event record (E3).** The event payload carries `content_refs`, a per-channel map
+`{ "<channel>": [{ key, version, locale, fingerprint }] }`, de-duplicated per channel and built from each planned
+delivery's own references (`src/lib/content/refs.ts`). Every job of a send carries the whole map, so
+the event row holds every channel's entry in any mode, and the delivering attempt's channel selects
+the entry that applied. These are references, never values, and are recorded for redacted sends
+too, so an audit can answer which terms version a message carried. `fingerprint` is the first 12 hex
+of the sha256 of the resolved value: it pins the exact text, so an edit that keeps `version` still
+yields a different ref.
+
+**Reload and boot (E4).** The first load happens at boot and the file is re-read every
+`NS_CONTENT_RELOAD_MS`; a slow load never overlaps the next. Every successful reload takes effect
+and clears the memo. A same-version reload that has different content still takes effect and logs a
+warning (bump the version on edits). A bad or unreadable file keeps the last good snapshot, logs
+the problem without values and increments `ns_content_load_failures_total`; every successful load
+sets `ns_content_loaded{version,fingerprint}` (fingerprint = first 12 hex of the file's sha256) to
+the load time. An invalid `NS_CONTENT_PROVIDER` or `NS_CONTENT_RELOAD_MS` fails boot
+like other config (`validateBootConfig`); a missing or broken content file never does: until a valid
+file loads, `content_ref` sends answer `422 content_unavailable`.
+
+**Rollout.** Publish templates with `content_ref` variables only after every pod runs a build with
+the content resolver: an older pod treats the variable as a caller variable and answers
+`missing_variable`.
+
+**Isolation.** A template with no content variables never consults the resolver, so OTP and every
+other send are unaffected by content being off, missing or broken.
+
+**Mounting.** Mount the ConfigMap as a directory, not with `subPath`: Kubernetes updates directory
+mounts in place and never updates `subPath` mounts, so only a directory mount receives edits
+without a restart.
+
+## Send API v1
+
+Code: `src/routes/v1-notify.ts`, `src/lib/send/` (`request`, `plan`, `errors`, `idempotency`,
+`resolver-cache`), and the
+`job.v1` branch of `src/lib/worker.ts` (`processV1Job`, `failDelivery`, `fallThrough`). Legacy `/notify`
+is unchanged and stays until the cutover release.
+
+**Request** (`V1NotifySchema`, strict: unknown keys → `400`). Exactly one of `event_type` (a policy
+picks the channels) or `template_key`; `template_key` requires `channel`, `event_type` forbids it.
+`to` carries `email` and/or E.164 `phone` (at least one). `priority` is `urgent | normal | bulk`
+(default `normal`), mapped to `realtime | other | bulk` by `PRIORITY_MAP`. `cc`, `reply_to` and
+`attachments` are email-only: with `template_key` they require `channel: 'email'`, with `event_type`
+they apply to the email deliveries (they ride only on jobs that hold an email delivery). `network` is never request input: it is `currentNetwork()`, and
+unset answers `503 network_not_configured` on `/v1/notify` only. Free-text bodies and sender
+identity are not accepted; the sender is server config (`EMAIL_FROM_ADDRESS`, `EMAIL_FROM_NAME`).
+Without `EMAIL_FROM_ADDRESS` an email delivery fails permanently with `email sender not configured`.
+
+**Planning** (`planSend`) renders and validates everything before the request is accepted. Request
+variables are checked by send type. With `template_key` a name the template does not declare is
+`unknown_variable`. With `event_type` the variables are data: each planned template picks the ones it
+declares and the rest are ignored (a phone-only guardian OTP can carry the email template's variables),
+while a missing required one is `missing_variable`; planning reads no template beyond the candidates it
+delivers, so the urgent path adds no Postgres dependency. Each template
+renders with only its own declared variables. A failure is
+`422 {error, kind, message, details?}` and counts `ns_send_rejected_total{kind,code}`:
+- `caller`: `missing_variable`, `unknown_variable`, `invalid_variable`, `no_reachable_channel`.
+- `configuration`: `not_found`, `vendor_mismatch`, `incomplete_template`, `body_too_long`,
+  `unknown_channel`, `no_policy`.
+With `template_key` a configuration problem fails the request. With a policy, a candidate whose
+template cannot resolve or render is skipped while another can carry the message; if none can, the
+first configuration error is returned. Messages name variables and keys, never values.
+
+**Resolver cache** (`resolver-cache.ts`). `planSend` resolves templates and policies through an
+in-process stale-while-revalidate cache keyed by network and the resolver arguments (channel, key,
+locale; domain, event type), so a send for a template or policy this pod has already resolved makes
+**no Postgres read**. Only positive results are cached: a missing policy or a template error
+(`not_found`, `vendor_mismatch`, ...) re-queries every time. An entry older than
+`NS_RESOLVE_CACHE_TTL_MS` (default 60 s, validated at boot) is still served, and one single-flight
+background refresh per key replaces it; a refresh that fails on the database keeps the stale entry
+(logged through `describeDbError`), one that finds nothing active drops it. A **cold miss** does read
+Postgres; if that read fails the send is refused `503 {"error":"template store unavailable"}` and the
+claim released. Bounded to 1000 keys, oldest first. Admin publish/retire clears this pod's cache;
+other pods pick the change up through the background refresh, so each key there serves the old
+version for up to the TTL, plus one more request if the key sat idle longer than the TTL.
+
+**Modes and event status.** `single` (template_key), `first_available` and `all` (policy). A request's
+jobs are enqueued in one MULTI (`pushManyToPriority`): `all` is one job per delivery,
+the others one job carrying every candidate. Event status: `single` mirrors its attempt; `all` is a
+roll-up across deliveries (`partially_delivered` when outcomes are mixed); `first_available` is
+`sent`/`delivered` if any attempt got there, otherwise the latest attempt's status, so it never
+regresses. `rollUpEvent` (`audit/store.ts`) does this inside the attempt's transaction under the
+event row lock.
+
+**Fallthrough** is synchronous only. A `first_available` delivery that fails permanently or exhausts
+its retries is closed `failed` and the next candidate starts as a **new attempt row** (fresh attempt
+id, attempt counter reset; `ns_send_fallthrough_total{from,to}`). Order, like a retry: stamp the new
+attempt `queued` → one MULTI {LPUSH it, SET the old attempt's `failed` marker}
+(`queue.pushToPriorityWithMarker`) → stamp the old attempt `failed`, so the old marker exists iff the
+next delivery is queued. If the deadline has passed the event
+expires instead. The `expired` fate is recorded by marker (`markAttempt`). Async bounces after a
+vendor accepted a message are out of scope (Stage 2.5/3). The last delivery takes the legacy fate
+(`dropOrDeadLetter`). `sendRendered` sends the content rendered at accept and never re-renders; a
+vendor change since accept (`vendor_changed`) fails the delivery.
+
+**Redaction.** A send is redacted when its priority is `urgent` **or** any planned template declares
+a `sensitive` variable. A redacted send persists only the variable **names** (`audit.variableNames`),
+keeps no job copy, is not recoverable, and is never dead-lettered (`ns_job_dropped_total`). Urgent
+sends enqueue first and write the audit row afterwards, so the audit write never delays an OTP (planning
+reads Postgres only on a resolver-cache miss);
+normal and bulk record first and answer `503 audit store unavailable` if they cannot. The event
+payload records every contact point the request supplied (`to: {email, phone}`, via
+`audit.recipients`), recipients only, for redacted sends too.
+
+**Deadline**, in order: request `deadline` (ISO-8601 with offset, in the future, at most 24 h ahead,
+else `400 invalid_deadline`) → the smallest `default_deadline_s` among the planned templates → for
+`urgent`, `URGENT_DEFAULT_DEADLINE_S`. DLQ replay clears the deadline (an explicit operator action).
+
+**Idempotency** (`idempotency.ts`). `idempotency_key` is 1-128 chars and is claimed before planning.
+`urgent` claims live in Redis (`idem:<network>:<key>`, 15-minute window) so the claim makes no
+Postgres round trip (with the resolver cache warm, neither does planning); `normal` and `bulk` use the
+Postgres `idempotency_key` table, pruned after 90 days. A repeat returns `200` with the original
+response; a repeat while the first is in flight is `409 idempotency_in_progress`. **Urgent replays
+expire with the Redis window**: after 15 minutes the same key is a new send. A Postgres claim with no
+response older than 15 minutes is reclaimable (Redis expires by TTL). Completing the claim is retried
+once; if both tries fail the send still stands and the claim stays pending, so a repeat answers `409`
+until the 15-minute window makes it reclaimable. Any refusal after a claim releases it. Because the two
+priorities claim in different stores, every claim also pins the key's priority in Redis
+(`idem-priority:<network>:<key>`, same 15-minute window, renewed when an urgent claim completes); a
+repeat at a different priority inside the window is `409 idempotency_key_priority_mismatch`, never a
+second send. Releasing a claim drops the pin. **Residual:** past the window the pin has expired with the
+urgent claim, so a repeat that switches between `urgent` and `normal`/`bulk` is a new send (`normal`
+and `bulk` share Postgres and still replay). If the claim (or, without a key, the duplicate guard) cannot
+reach its store the send is refused with `503 idempotency_store_unavailable`, logged via `describeDbError`. Without a key,
+a 5-second content guard answers a repeat with `409 duplicate-fallback`.
+
+**Correlation id.** The body's `correlation_id` (trimmed, at most 128, else `400`) wins over the
+`x-correlation-id` header; blank falls back to the header, then the event id.
+
+**Event row identity.** `notification_event.event_type` and `domain` are the request's `event_type`
+and recipient `domain` as sent, null when absent (never the policy's matched domain, so a send that
+fell back to a network-wide policy still records the caller's domain). They ride on `job.audit`, so
+every writer of the row records the same values: the accepted insert, a worker upsert that lands
+first (urgent), a fall-through, a DLQ replay and a recovered job. `template_key` is the request's
+`template_key` (legacy `/notify`: its `template_id`) and is **null for event sends**: their templates
+are per delivery and live on `delivery_attempt.template_id`.
+
+**Response:** `202 {notification_event_id, correlation_id, status: "accepted", mode, deliveries:
+[{channel}]}`. See README for examples.
+
 ## Key Files
 
 **Routes** (`src/routes/`):
 - `docs.ts` — Scalar API reference and OpenAPI JSON
-- `notify.ts` — Enqueue notification endpoint
+- `notify.ts` — Enqueue notification endpoint (legacy)
+- `v1-notify.ts` — Send API v1 (see Send API v1)
 - `providers.ts` — Provider discovery endpoints
-- `metrics.ts` — Queue metrics endpoint (HMAC-authed JSON) **and** `/metrics`,
+- `metrics.ts` — Queue metrics endpoint (authenticated JSON) **and** `/metrics`,
   the unauthenticated Prometheus scrape endpoint
 - `retry.ts` — Manual DLQ retry endpoint (`refused` in the response; see DLQ replay cap)
 - `admin-templates.ts`, `admin-policies.ts` — template and policy admin API (see Templates and policies)
@@ -428,7 +699,7 @@ skipped when `NS_NETWORK` is unset; a template that fails publish validation is 
 - `rate_limit.ts` — Split shared/reserved vendor quota
 - `deadline.ts` — Deadline and redaction helpers
 - `db/`, `audit/` — Postgres client, migrations, partition maintenance, audit store, stamps, recovery (see Persistence)
-- `auth/secrets.ts` — Load signing secrets from the JSON file at `INTERNAL_SECRETS_JSON`
+- `auth/` — `secrets.ts` (signing keys and scopes from `INTERNAL_SECRETS_JSON`), `hmac.ts`, `bearer.ts`, `principal.ts`
 - `providers/` — Provider implementations (auto-loaded)
 - `utils/openapi.ts` — OpenAPI document builder
 - `utils/provider-docs.ts` — Provider schema/payload serialization
@@ -439,7 +710,7 @@ skipped when `NS_NETWORK` is unset; a template that fails publish validation is 
 
 **Tests** (`src/**/__tests__/`):
 - `lib/__tests__/redis-fake.ts` — in-memory ioredis stand-in shared by the suites
-- `lib/__tests__/queue.test.ts`, `lib/__tests__/dedupe.test.ts`, `plugins/__tests__/request-auth.test.ts`
+- `lib/__tests__/queue.test.ts`, `lib/__tests__/dedupe.test.ts`, `plugins/__tests__/auth.test.ts`, `__tests__/route-scopes.test.ts`
 
 ## Environment Setup
 
@@ -472,8 +743,15 @@ Required for persistence and Redis:
   `503 network_not_configured` and seeding is skipped. Still recorded on each event, `unknown`
   when unset.
 - `NS_DEFAULT_LOCALE` — optional, default `en`; the last step of the template locale chain.
-- `NS_ADMIN_KEY_IDS` — comma-separated HMAC key ids allowed to use `/v1/admin/*`. Unset means
-  nobody can.
+- `NS_KEYCLOAK_ISSUER`, `NS_KEYCLOAK_JWKS_URI`, `NS_AUTH_AUDIENCE`, `NS_AUTH_ALLOWED_AZP` — bearer-token
+  auth; see Authentication. `NS_DOCS_ENABLED` — serves `/` and `/openapi.json` when `true`.
+- `NS_CONTENT_FILE` — optional; the content file for `content_ref` variables. Unset, content is off.
+  Deployments set `/app/content/content.json`. `NS_CONTENT_PROVIDER` (default and only value
+  `configmap`) and `NS_CONTENT_RELOAD_MS` (integer 1 to 3600000, default 30000) are validated
+  whether or not a file is set: an invalid value fails boot like other config. A missing or broken
+  content file never fails boot. See Content resolver.
+- `NS_RESOLVE_CACHE_TTL_MS` — optional, default 60000, positive integer (invalid fails boot). See
+  Resolver cache.
 - `PARTITION_MAINTENANCE_INTERVAL_MS` — optional, default 6h.
 - `RECOVERY_MAX_AGE_HOURS` — optional, default 24, positive integer (invalid fails boot). Open
   recoverable sends older than this are marked failed by recovery instead of sent late.
@@ -533,7 +811,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 445 unit tests across 39 files (plus 88 integration tests). The unit suite runs in about a second because Redis
+vitest 4, 755 unit tests across 56 files, plus 138 integration tests across 17 files. The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
@@ -608,7 +886,7 @@ you need times the timeout, or lower the timeout.
 
 **Deadlines.** `Job.deadline` is an absolute epoch-ms. Legacy `/notify` sets it for `realtime` jobs
 to now plus `URGENT_DEFAULT_DEADLINE_S`. `processJob` checks it first, and again before every
-deferral and before scheduling a retry. A job past its deadline is never sent: marker `failed`,
+deferral and before scheduling a retry. A job past its deadline is never sent: marker `expired`,
 status `expired` (the error keeps the last provider error, `deadline passed: <error>`),
 `ns_job_expired_total`, and never the DLQ. An OTP that arrives late is worse than none.
 
@@ -654,6 +932,10 @@ live at scrape time rather than counted, so they cannot drift.
 | `ns_rate_limited_total` | counter | `channel`, `priority` |
 | `ns_job_expired_total` | counter | `channel` |
 | `ns_job_dropped_total` | counter | `channel`, `reason` |
+| `ns_send_rejected_total` | counter | `kind` (`caller`/`configuration`), `code` |
+| `ns_send_fallthrough_total` | counter | `from`, `to` (channels) |
+| `ns_content_load_failures_total` | counter | `provider` (boot or reload failures; last good content keeps serving) |
+| `ns_content_loaded` | gauge | `provider`, `version`, `fingerprint` (value = unix time of the latest successful load of that content; alert on staleness) |
 | `ns_queue_depth` | gauge | `queue` (`realtime`/`other`/`bulk`/`retry_count`/`dlq`) |
 | `ns_retry_eta_seconds` | gauge | — |
 
@@ -683,16 +965,14 @@ dead-letters on EC1003. **Alert on staleness, not just on the number.**
 
 ## Known Issues
 
-Two design problems found while writing the tests, both filed rather than fixed:
+Design problems found while writing the tests, filed rather than fixed unless marked resolved:
 
 - **#51 — `popScheduledRetries` is not atomic.** It does `zrangebyscore` then
   `zremrangebyscore` in two round trips, deleting by *score range* rather than by the members
   read, despite a comment claiming atomicity. A retry written between the two calls is deleted
   without being returned (silent job loss, no concurrency required), and two workers can both
   return the same jobs.
-- **#52 — the nonce is claimed before the signature is verified.** A client with a bad
-  signature gets `Invalid signature` first and `Replay detected` on every retry with the same
-  nonce, and anyone who knows a key id (it is not secret) can write nonce keys unauthenticated.
+- **#52 — resolved.** The HMAC signature is now verified before the nonce is claimed, so only a correctly signed request can claim one and `Replay detected` always means a valid request seen twice.
 
 ## CI
 

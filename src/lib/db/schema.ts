@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { check, integer, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { check, index, integer, jsonb, pgTable, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 
 /**
  * Tables drizzle-kit manages (db:generate diffs this file).
@@ -23,6 +23,10 @@ export interface VariableSpec {
   raw: boolean;
   /** url only: the value's host must equal one of these or be a subdomain of one. */
   urlHosts?: string[];
+  /** `content_ref`: the value comes from the content resolver, never the caller. Absent = `request`. */
+  source?: 'request' | 'content_ref';
+  /** content_ref only: the content key, e.g. `tnc.in_force.url`. */
+  contentKey?: string;
 }
 
 export interface PolicyChannel {
@@ -102,3 +106,18 @@ export const notificationPolicy = pgTable(
 
 export type TemplateRow = typeof template.$inferSelect;
 export type PolicyRow = typeof notificationPolicy.$inferSelect;
+
+/** Send idempotency for normal/bulk priority (urgent uses Redis). Kept 90 days. */
+export const idempotencyKey = pgTable(
+  'idempotency_key',
+  {
+    network: text('network').notNull(),
+    key: text('key').notNull(),
+    response: jsonb('response'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.network, t.key] }),
+    index('idempotency_key_created_at_idx').on(t.createdAt),
+  ],
+);

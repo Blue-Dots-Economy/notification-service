@@ -75,6 +75,23 @@ export async function pushToPriority(job: Job): Promise<void> {
 }
 
 /**
+ * Push `job` onto its priority queue and write `marker` in the same MULTI, so
+ * the marker exists if and only if the job was queued (the fall-through
+ * counterpart of scheduleRetryWithMarker). Throws if any command failed.
+ */
+export async function pushToPriorityWithMarker(
+  job: Job,
+  marker?: { key: string; value: string; ttlSeconds: number },
+): Promise<void> {
+  const tx = redis.multi().lpush(queueKeyFor(job.priority), JSON.stringify(job));
+  if (marker) tx.set(marker.key, marker.value, 'EX', marker.ttlSeconds);
+  const results = await tx.exec();
+  if (!results) throw new Error('Redis MULTI aborted while queueing a job');
+  const failed = results.find(([err]) => err);
+  if (failed) throw failed[0];
+}
+
+/**
  * Blocking pop for one priority on the caller's own connection. BRPOP holds its
  * connection until it returns, so every pool loop owns a dedicated connection —
  * sharing one would let a bulk pop hold up an urgent one.
@@ -162,7 +179,7 @@ export async function moveDueRetries(now = Date.now()): Promise<number> {
 
 /**
  * Enqueue many jobs, each on its own priority's queue, in one MULTI round trip
- * (recovery). Throws if any push failed, so the caller can roll back what it
+ * (recovery, v1 send). Throws if any push failed, so the caller can roll back what it
  * recorded.
  */
 export async function pushManyToPriority(jobs: Job[]): Promise<void> {
@@ -170,7 +187,7 @@ export async function pushManyToPriority(jobs: Job[]): Promise<void> {
   const tx = redis.multi();
   for (const job of jobs) tx.lpush(queueKeyFor(job.priority), serializeJob(job));
   const results = await tx.exec();
-  if (!results) throw new Error('Redis MULTI aborted while re-queueing');
+  if (!results) throw new Error('Redis MULTI aborted while enqueueing');
   const failed = results.find(([err]) => err);
   if (failed) throw failed[0];
 }
@@ -214,6 +231,10 @@ async function requeueFailedJob(raw: string, priority: Priority) {
     priority,
     attempt: 0,
     next_attempt_at: undefined,
+    // A replay is an explicit operator action: the original deadline (if any)
+    // no longer applies, or a replayed job would only expire. Redacted (OTP)
+    // jobs never reach the DLQ, so this cannot revive a stale code.
+    deadline: undefined,
     replays: (job.replays ?? 0) + 1,
     // A replay is a new delivery attempt: it gets its own attempt id so its
     // status writes are not rejected as older than the stored failed attempt.

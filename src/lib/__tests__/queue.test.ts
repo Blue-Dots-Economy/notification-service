@@ -256,6 +256,40 @@ describe('scheduleRetryWithMarker', () => {
   });
 });
 
+describe('pushToPriorityWithMarker', () => {
+  const marker = { key: 'ns:attempt:a1', value: 'failed:1', ttlSeconds: 604800 };
+
+  it('pushes the job and writes the marker in one MULTI', async () => {
+    const multi = vi.spyOn(redis, 'multi');
+    try {
+      await queue.pushToPriorityWithMarker(job({ job_id: 'f1', priority: 'realtime' }), marker);
+      expect(multi).toHaveBeenCalledTimes(1);
+    } finally {
+      multi.mockRestore();
+    }
+    expect(await redis.llen('queue:realtime')).toBe(1);
+    expect(await redis.get('ns:attempt:a1')).toBe('failed:1');
+  });
+
+  it('leaves neither the job nor the marker when the MULTI fails', async () => {
+    const multi = vi.spyOn(redis, 'multi').mockImplementationOnce(() => {
+      const chain = {
+        lpush: () => chain,
+        set: () => chain,
+        exec: async () => { throw new Error('connection lost'); },
+      };
+      return chain as never;
+    });
+    try {
+      await expect(queue.pushToPriorityWithMarker(job({ job_id: 'f2' }), marker)).rejects.toThrow('connection lost');
+    } finally {
+      multi.mockRestore();
+    }
+    expect(await redis.get('ns:attempt:a1')).toBeNull();
+    expect(await redis.llen('queue:other')).toBe(0);
+  });
+});
+
 describe('pushManyToPriority', () => {
   it('pushes each job to its own priority queue, in order', async () => {
     await queue.pushManyToPriority([
@@ -347,6 +381,17 @@ describe('retryFailedJobs replay accounting', () => {
     expect(replayed.audit.eventId).toBe('ev-1');
     expect(replayed.audit.createdAt).toBe(audit.createdAt);
     expect(replayed.audit.correlationId).toBe('corr-1');
+  });
+
+  it('clears the deadline on a replayed job (operator action), in both drain modes', async () => {
+    const past = Date.now() - 60_000;
+    await queue.pushDLQ(job({ job_id: 'late-1', deadline: past }));
+    await queue.retryFailedJobs({ jobId: 'late-1' });
+    await queue.pushDLQ(job({ job_id: 'late-2', deadline: past }));
+    await queue.retryFailedJobs({ limit: 1 });
+    const replayed = (await redis.lrange('queue:other', 0, -1)).map((r) => JSON.parse(r) as Job);
+    expect(replayed.map((j) => j.job_id).sort()).toEqual(['late-1', 'late-2']);
+    for (const j of replayed) expect(j).not.toHaveProperty('deadline');
   });
 
   it('replays a job without audit without adding one', async () => {
