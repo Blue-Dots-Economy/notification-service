@@ -28,12 +28,22 @@ describe('toAcceptedRecord', () => {
   it('keeps the full job for a normal job so it can be recovered', () => {
     const job: Job = {
       job_id: 'j', channel: 'email', priority: 'other', to: 'a@b.c',
-      template_id: 'basic_email', variables: { subject: 's' }, audit: ids,
+      template_id: 'welcome', variables: { subject: 's' }, audit: ids,
     };
     const rec = toAcceptedRecord(job, 'dpg-api-client');
     expect(rec.recoverable).toBe(true);
     expect(rec.job).toMatchObject({ job_id: 'j', variables: { subject: 's' } });
     expect(rec.source).toBe('dpg-api-client');
+  });
+});
+
+describe('toAcceptedRecord — payload', () => {
+  it('records recipient and variables only; a stray legacy body is not copied into the payload', () => {
+    const job = {
+      job_id: 'j', channel: 'sms', priority: 'other', to: '+919999999999',
+      template_id: 't', variables: { name: 'A' }, body: 'Hi {{name}}', audit: ids,
+    } as unknown as Job;
+    expect(toAcceptedRecord(job, 's').payload).toEqual({ to: '+919999999999', variables: { name: 'A' } });
   });
 });
 
@@ -54,7 +64,7 @@ describe('toAcceptedRecord — sticky redaction', () => {
   it('keeps values for a normal-origin job even when replayed as realtime', () => {
     const job: Job = {
       job_id: 'j', channel: 'email', priority: 'realtime', to: 'a@b.c',
-      template_id: 'basic_email', variables: { subject: 's' },
+      template_id: 'welcome', variables: { subject: 's' },
       audit: { ...ids, redactValues: false },
     };
     const rec = toAcceptedRecord(job, 'worker');
@@ -66,7 +76,7 @@ describe('toAcceptedRecord — sticky redaction', () => {
 describe('toAcceptedRecord — email attachments', () => {
   const data = Buffer.from('%PDF-1.7 secret contract body').toString('base64');
   const job: Job = {
-    job_id: 'j', channel: 'email', priority: 'other', to: 'a@b.c', template_id: 'basic_email',
+    job_id: 'j', channel: 'email', priority: 'other', to: 'a@b.c', template_id: 'welcome',
     variables: { subject: 's', attachments: [{ filename: 'c.pdf', contentType: 'application/pdf', data }] },
     audit: ids,
   };

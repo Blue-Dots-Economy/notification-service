@@ -42,8 +42,8 @@ export const V1NotifySchema = z
     (b) => !b.template_key || b.channel === 'email' || (!b.cc && !b.reply_to && !b.attachments),
     { message: 'cc, reply_to and attachments apply to email only', path: ['channel'] },
   )
-  .refine((b) => (b.attachments ?? []).length <= attachmentMaxFiles(), { path: ['attachments'], message: `at most ${attachmentMaxFiles()} attachments are accepted` })
-  .refine((b) => totalAttachmentBytes(b.attachments) <= attachmentMaxTotalBytes(), { path: ['attachments'], message: `attachments exceed the ${attachmentMaxTotalBytes()} byte total limit` });
+  .refine((b) => (b.attachments ?? []).length <= attachmentMaxFiles(), { path: ['attachments'], error: () => `at most ${attachmentMaxFiles()} attachments are accepted` })
+  .refine((b) => totalAttachmentBytes(b.attachments) <= attachmentMaxTotalBytes(), { path: ['attachments'], error: () => `attachments exceed the ${attachmentMaxTotalBytes()} byte total limit` });
 
 export type V1Request = z.infer<typeof V1NotifySchema>;
 

@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 vi.mock('../../providers', () => ({ providers: {} }));
+vi.mock('../../metrics', () => ({ incr: vi.fn(async () => {}), setGauge: vi.fn(async () => {}) }));
 import { CONTENT_KEY } from '../../templates/contract';
 import { openApiDocument } from '../openapi';
+import { serializeProvider } from '../provider-docs';
+import { smsProvider as msg91Provider } from '../../providers/sms/msg91';
 
 const SEND_SECURITY = [{ requestSignature: [] }, { bearerAuth: ['notify:send'] }];
 const ADMIN_SECURITY = [{ requestSignature: [] }, { bearerAuth: ['templates:admin'] }];
@@ -53,21 +56,49 @@ describe('openApiDocument', () => {
     expect(JSON.stringify(doc)).not.toContain('NS_ADMIN_KEY_IDS');
   });
 
-  it('requires templates:admin on POST /failed/retry and notify:send on both send routes', () => {
+  it('requires templates:admin on POST /failed/retry and notify:send on POST /v1/notify', () => {
     const doc = openApiDocument() as { paths: Record<string, any> };
     expect(doc.paths['/failed/retry'].post.security).toEqual(ADMIN_SECURITY);
     expect(doc.paths['/failed/retry'].post.responses['403']).toBeDefined();
-    for (const path of ['/v1/notify', '/notify']) {
-      const op = doc.paths[path].post;
-      expect(op.security).toEqual(SEND_SECURITY);
-      expect(op.responses['401'], path).toBeDefined();
-      expect(op.responses['403'], path).toBeDefined();
-    }
+    const op = doc.paths['/v1/notify'].post;
+    expect(op.security).toEqual(SEND_SECURITY);
+    expect(op.responses['401']).toBeDefined();
+    expect(op.responses['403']).toBeDefined();
     for (const path of ['/providers', '/providers/{name}', '/metrics/queue']) {
       const op = doc.paths[path].get;
       expect(op.security).toEqual([{ requestSignature: [] }, { bearerAuth: [] }]);
       expect(op.responses['401'], path).toBeDefined();
     }
+  });
+
+  it('documents Send API v1 as the only send route, signed with HMAC v2', () => {
+    const doc = openApiDocument() as { paths: Record<string, any>; components: { securitySchemes: Record<string, any> } };
+    expect(doc.paths['/notify']).toBeUndefined();
+    const sendPaths = Object.keys(doc.paths).filter((p) => p.endsWith('/notify'));
+    expect(sendPaths).toEqual(['/v1/notify']);
+    const text = JSON.stringify(doc);
+    expect(text).not.toMatch(/[`' ]\/notify\b/);
+    expect(text).not.toContain('v1=');
+    expect(text).not.toContain('basic_email');
+    expect(text).not.toContain('dedupe_id');
+    expect(doc.components.securitySchemes.requestSignature.description).not.toMatch(/\bv1\b/);
+  });
+
+  it('documents GET /providers and /providers/{name} as {name, vendor, renders}', () => {
+    const doc = openApiDocument() as { paths: Record<string, any> };
+    const list = doc.paths['/providers'].get;
+    expect(list.summary).toMatch(/vendor/);
+    const listSchema = list.responses['200'].content['application/json'].schema;
+    expect(listSchema).toMatchObject({ type: 'array', items: { $ref: '#/components/schemas/ProviderInfo' } });
+    const one = doc.paths['/providers/{name}'].get.responses['200'].content['application/json'].schema;
+    expect(one).toEqual({ $ref: '#/components/schemas/ProviderInfo' });
+    const info = (openApiDocument() as { components: { schemas: Record<string, any> } }).components.schemas.ProviderInfo;
+    expect(info.additionalProperties).toBe(false);
+    expect(info.required).toEqual(['name', 'vendor', 'renders']);
+    expect(Object.keys(info.properties)).toEqual(['name', 'vendor', 'renders']);
+    expect(info.properties.renders.enum).toEqual(['ns', 'provider']);
+    // The schema documents exactly what the route returns for a real provider.
+    expect(Object.keys(serializeProvider(msg91Provider)).sort()).toEqual([...info.required].sort());
   });
 
   it('documents POST /v1/notify', () => {

@@ -14,7 +14,7 @@ vi.mock('../../../metrics', () => ({
   renderPrometheus: vi.fn(async () => ''),
 }));
 
-import { errorCodeLabel, loadPinnacleConfig, pinnacleSmsProvider, pollPinnacleBalance, sendSmsWithPinnacle } from '../pinnacle';
+import { errorCodeLabel, loadPinnacleConfig, pinnacleSmsProvider, pollPinnacleBalance, sendPinnacleText } from '../pinnacle';
 
 const ENV = {
   PINNACLE_API_KEY: 'key-123',
@@ -39,22 +39,22 @@ function bodyOf(fetchMock: ReturnType<typeof vi.fn>) {
   return JSON.parse((fetchMock.mock.calls[0]![1] as { body: string }).body);
 }
 
-const DEFAULT_BODY = '{{message}} is your OTP. - Team Blue Dots';
+/** NS renders at accept (Send API v1); the adapter gets final text. */
+const DEFAULT_TEXT = '123456 is your OTP. - Team Blue Dots';
 
 interface SendOverrides {
   to?: string;
   templateId?: string;
-  variables?: Record<string, string>;
-  body?: string | null; // null = omit the body entirely
+  text?: string;
   env?: NodeJS.ProcessEnv;
 }
 
 function send(over: SendOverrides = {}) {
-  return sendSmsWithPinnacle(
+  return sendPinnacleText(
     over.to ?? '+919000000001',
     over.templateId ?? 'DLT-TEMPLATE-1',
-    over.variables ?? { message: '123456' },
-    over.body === null ? undefined : (over.body ?? DEFAULT_BODY),
+    over.text ?? DEFAULT_TEXT,
+    {},
     'job-1',
     over.env ?? ENV
   );
@@ -65,7 +65,7 @@ describe('pinnacle SMS provider', () => {
   afterEach(() => vi.unstubAllGlobals());
 
   describe('request shape', () => {
-    it('sends rendered text, not variables — pinnacle renders nothing', async () => {
+    it('sends the rendered text verbatim — pinnacle renders nothing', async () => {
       const fetchMock = mockFetch(OK);
       const res = await send();
 
@@ -104,7 +104,7 @@ describe('pinnacle SMS provider', () => {
 
     it('marks Devanagari copy as UNI so it is not garbled on the handset', async () => {
       const fetchMock = mockFetch(OK);
-      await send({ body: 'आपका OTP {{message}} है' });
+      await send({ text: 'आपका OTP 123456 है' });
       expect(bodyOf(fetchMock).messagetype).toBe('UNI');
     });
 
@@ -144,40 +144,9 @@ describe('pinnacle SMS provider', () => {
   });
 
   describe('body handling', () => {
-    it('fails permanently with no body — no retry count produces one', async () => {
-      mockFetch(OK);
-      const res = await send({ body: null });
-      expect(res.ok).toBe(false);
-      expect(res.retryable).toBe(false);
-      expect(res.error).toMatch(/no body configured/);
-    });
-
-    it('refuses to send a body with an unresolved variable', async () => {
-      const fetchMock = mockFetch(OK);
-      const res = await sendSmsWithPinnacle(
-        '919000000001',
-        'T1',
-        {},
-        'Hi {{name}}',
-        'job-2',
-        ENV
-      );
-      expect(res.ok).toBe(false);
-      expect(res.retryable).toBe(false);
-      expect(res.error).toMatch(/missing template variables: name/);
-      expect(fetchMock).not.toHaveBeenCalled();
-    });
-
     it('rejects a rendered body past the vendor length ceiling', async () => {
       const fetchMock = mockFetch(OK);
-      const res = await sendSmsWithPinnacle(
-        '919000000001',
-        'T1',
-        { message: 'x'.repeat(2100) },
-        '{{message}}',
-        'job-3',
-        ENV
-      );
+      const res = await send({ templateId: 'T1', text: 'x'.repeat(2100) });
       expect(res.ok).toBe(false);
       expect(res.retryable).toBe(false);
       expect(fetchMock).not.toHaveBeenCalled();

@@ -20,9 +20,8 @@ function isProviderDefinition(value: unknown): value is ProviderDefinition {
   const candidate = value as Partial<ProviderDefinition>;
   return (
     typeof candidate.name === 'string' &&
-    typeof candidate.send === 'function' &&
-    typeof candidate.templates === 'object' &&
-    candidate.templates !== null
+    typeof candidate.vendor === 'string' &&
+    typeof candidate.sendRendered === 'function'
   );
 }
 

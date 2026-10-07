@@ -37,7 +37,6 @@ const ADMIN = { scope: 'templates:admin' };
 const ANY = { scope: 'any' };
 
 function expected(method: string, url: string): unknown {
-  if (method === 'POST' && url === '/notify') return { scope: 'notify:send', legacyHmacV1: true };
   if (method === 'POST' && url === '/v1/notify') return SEND;
   if (url.startsWith('/v1/admin/')) return ADMIN;
   if (method === 'POST' && url === '/failed/retry') return ADMIN;
@@ -48,7 +47,7 @@ function expected(method: string, url: string): unknown {
 describe('route scope table', () => {
   it('registers the routes the table lists', () => {
     const keys = seen.map((r) => `${r.method} ${r.url}`);
-    for (const k of ['POST /notify', 'POST /v1/notify', 'POST /failed/retry', 'GET /providers', 'GET /providers/:name', 'GET /metrics/queue', 'GET /metrics', 'GET /v1/admin/templates', 'GET /v1/admin/policies', 'GET /v1/admin/export']) {
+    for (const k of ['POST /v1/notify', 'POST /failed/retry', 'GET /providers', 'GET /providers/:name', 'GET /metrics/queue', 'GET /metrics', 'GET /v1/admin/templates', 'GET /v1/admin/policies', 'GET /v1/admin/export']) {
       expect(keys).toContain(k);
     }
   });
@@ -61,6 +60,12 @@ describe('route scope table', () => {
 
   it('GET /metrics is the only route without a preHandler', () => {
     expect(seen.filter((r) => !r.hasPreHandler).map((r) => `${r.method} ${r.url}`)).toEqual(['GET /metrics']);
+  });
+
+  it('legacy POST /notify is not registered', async () => {
+    expect(seen.map((r) => `${r.method} ${r.url}`)).not.toContain('POST /notify');
+    const res = await app.inject({ method: 'POST', url: '/notify', payload: {} });
+    expect(res.statusCode).toBe(404);
   });
 
   it('docs routes are not registered unless NS_DOCS_ENABLED=true', () => {

@@ -90,128 +90,26 @@ async function holdForToken(
 }
 
 /**
- * Runs one job through its provider, then decides its fate: delivered, scheduled
- * for another attempt with exponential backoff, or moved to the dead-letter queue.
+ * Runs one job: Send API v1 jobs go to processV1Job, which sends the content
+ * rendered at accept and decides the job's fate (delivered, retried with
+ * exponential backoff, fallen through, or dead-lettered).
+ *
+ * A job with no `v1` plan has the pre-v1 job shape and can still arrive
+ * through recovery or a DLQ replay. It is never sent: its attempt
+ * is counted and closed `failed`, and it is dead-lettered (dropped when
+ * redacted) with reason `legacy_job_shape`, like any other DLQ reason.
  *
  * Exported for tests. The worker pools are the only production caller.
  * Returns `{ deferredMs }` when the job was deferred (rate limit or a failed
- * token check) so the pool loop backs off; other outcomes return as before.
+ * token check) so the pool loop backs off.
  *
  * @param job - The job to attempt. Its `attempt` counter is incremented in place.
  */
 export async function processJob(job: Job) {
   if (job.v1) return processV1Job(job);
-  if (isExpired(job)) return expire(job, (job.attempt ?? 0) + 1);
-
-  const provider = providers[job.channel];
-
-  // Before the attempt is counted: a rate-limited job has not been tried, so it
-  // is deferred, not failed, and uses none of its retry budget.
-  const held = await holdForToken(job, job.channel, provider);
-  if (held) return held.result;
-
   job.attempt = (job.attempt ?? 0) + 1;
-
-  if (!provider) {
-    console.log(`Unknown provider, ${fate(job)}:`, job.job_id, job.channel);
-    return dropOrDeadLetter(job, 'unknown_channel');
-  }
-
-  // Resolve a known template name to its provider-side id; when the provider
-  // owns raw ids (SMS, #532/#535) an unknown id is passed through verbatim.
-  const named = provider.templates[job.template_id];
-  const namedBody = provider.bodies?.[job.template_id];
-
-  // A template the provider NAMES but has no id — or no body, where it owns one
-  // — is the placeholder case: the vendor's DLT approval has not landed yet.
-  //
-  // The body half is the security-relevant one. `bodies` and `templates` are
-  // both declarations that THIS service owns the template, so a blank body must
-  // not silently fall back to the caller's `body`: that would put arbitrary
-  // caller text on the wire under a DLT-approved template id, which is both a
-  // compliance break and a phishing primitive. Declared-but-blank is a
-  // configuration gap, never an invitation for the caller to fill it.
-  if (named === '' || namedBody === '') {
-    console.log(
-      `Template '${job.template_id}' is named but not fully configured for the active provider ` +
-        `(id=${named === '' ? 'missing' : 'ok'}, body=${namedBody === '' ? 'missing' : 'ok'}), ${fate(job)}:`,
-      job.job_id
-    );
-    return dropOrDeadLetter(job, 'template_not_configured');
-  }
-
-  const templateId = named ?? (provider.allowRawTemplateId ? job.template_id : undefined);
-  if (!templateId) {
-    console.log(`Unknown provider template, ${fate(job)}:`, job.job_id);
-    return dropOrDeadLetter(job, 'unknown_template');
-  }
-
-  console.log(`Processing ${job.job_id} (attempt ${job.attempt})`);
-
-  // `??`, never `||`: a provider that NAMES the template owns its body, and the
-  // blank case was already dead-lettered above. Only a template this service
-  // does not name — a raw pass-through id — falls back to the caller's body.
-  const body = namedBody ?? job.body;
-
-  await stamp(job, { status: 'dispatching', attemptNo: job.attempt });
-
-  let res: ProviderSendResult;
-  try {
-    res = await provider.send({
-      to: job.to,
-      template_id: templateId,
-      variables: job.variables,
-      body,
-      job_id: job.job_id,
-    });
-  } catch (err) {
-    // The job is already popped and not yet in the DLQ, so an unexpected throw
-    // from a provider would drop the notification silently. Treat it as a
-    // retryable failure and let the normal ladder below decide its fate.
-    console.log(
-      `Provider threw for ${job.job_id}:`,
-      err instanceof Error ? err.message : String(err)
-    );
-    res = { ok: false, error: 'provider threw', retryable: true };
-  }
-
-  if (!res.ok) {
-    // A failure the provider knows is permanent — an unregistered template, a
-    // rejected sender id — will fail identically four more times. Retrying it
-    // only delays the diagnosis and buries the cause under "max retries".
-    if (res.retryable === false) {
-      console.log(`Permanent failure ${fate(job)}: ${job.job_id}${res.error ? ` (${res.error})` : ''}`);
-      return dropOrDeadLetter(job, 'permanent_failure', res.error);
-    }
-
-    if (job.attempt >= MAX_RETRIES) {
-      console.log(
-        `Max retries reached ${fate(job)}: ${job.job_id}${res.error ? ` (${res.error})` : ''}`
-      );
-      return dropOrDeadLetter(job, 'max_retries', res.error);
-    }
-
-    const delay = 5 * Math.pow(2, job.attempt - 1);
-    if (wouldExpire(job, delay * 1000)) return expire(job, job.attempt, res.error);
-    console.log(`Retry scheduled in ${delay}s:`, job.job_id);
-
-    // The retry ZADD and the `retry` marker in one MULTI, THEN the `queued`
-    // stamp. The marker exists iff the retry is scheduled, and the row stays
-    // `dispatching` until it is, so the stale-dispatch sweep covers every crash
-    // here: before (or a failed) MULTI → no marker → re-queued; after it → the
-    // marker says the job is in the retry set → left alone, whether or not the
-    // `queued` stamp landed. Stamping `queued` first would strand the row: the
-    // sweep only re-queues stale `dispatching` rows. A late `queued` stamp can
-    // never overwrite the retry's own stamps (monotonic on attempt_no, rank).
-    await scheduleRetryWithMarker(job, delay, attemptMarker(job, 'retry', job.attempt + 1));
-    await stamp(job, { status: 'queued', attemptNo: job.attempt + 1, error: res.error });
-    return;
-  }
-
-  // Marker before stamp: a failed `sent` stamp must not let recovery re-send.
-  await markAttempt(job, 'sent', job.attempt);
-  await stamp(job, { status: 'sent', attemptNo: job.attempt, providerMessageId: res.provider_message_id });
-  console.log('Delivered:', job.job_id);
+  console.log(`Legacy-shaped job (no v1 plan), ${fate(job)}:`, job.job_id);
+  return dropOrDeadLetter(job, 'legacy_job_shape');
 }
 
 /** The delivery at `index`, or undefined when the job's plan is missing or malformed. */
@@ -250,7 +148,7 @@ async function fallThrough(job: Job, next: PlannedDelivery, attemptNo: number, e
     v1: { ...v1, index: v1.index + 1 },
     audit: { ...job.audit!, attemptId: randomUUID() },
   };
-  // Record before queue, as on /notify: the row exists before the job can be popped.
+  // Record before queue, as on /v1/notify: the row exists before the job can be popped.
   await stamp(advanced, { status: 'queued', attemptNo: 1 });
   try {
     await pushToPriorityWithMarker(advanced, attemptMarker(job, 'failed', attemptNo));
@@ -271,8 +169,8 @@ async function fallThrough(job: Job, next: PlannedDelivery, attemptNo: number, e
  * A v1 delivery that cannot succeed (permanent failure or retries exhausted).
  * first_available with a delivery left: close this attempt `failed` and fall
  * through — unless the deadline has passed, when the event expires instead of
- * starting a delivery that could only arrive late. Otherwise the job takes the
- * same fate as a legacy job: dropOrDeadLetter, which closes the attempt itself.
+ * starting a delivery that could only arrive late. Otherwise the job is
+ * dead-lettered (dropOrDeadLetter, which closes the attempt itself).
  */
 async function failDelivery(job: Job, reason: string, error?: string) {
   const next = nextDelivery(job);
@@ -287,9 +185,9 @@ async function failDelivery(job: Job, reason: string, error?: string) {
 
 /**
  * Send API v1: content was rendered and validated at accept, so the worker
- * only sends it (`sendRendered`) and decides its fate. Deadline, vendor token,
- * retry ladder and redaction rules are the legacy path's; the difference is
- * what happens when a delivery cannot succeed (see failDelivery).
+ * only sends it (`sendRendered`) and decides its fate: deadline, vendor token,
+ * retry ladder and redaction rules, with fall-through when a delivery cannot
+ * succeed (see failDelivery).
  */
 async function processV1Job(job: Job) {
   if (isExpired(job)) return expire(job, (job.attempt ?? 0) + 1);

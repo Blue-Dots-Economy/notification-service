@@ -41,12 +41,11 @@ export function isOtpTemplate(templateId: unknown): boolean {
  * NAMES only, and no job copy — so they are also not recoverable after a Redis
  * loss, which is acceptable because the user simply requests a new code.
  *
- * The decision keys on `audit.redactValues`, set once at /notify from the
- * original priority and template, not on the job's current priority: a DLQ
- * replay may move an OTP job to 'other', and it must stay redacted. Jobs queued
- * before the flag existed fall back to the priority. An OTP template is
- * redacted whatever the flag or priority says: priority is the caller's
- * choice, and an OTP sent without one must not be persisted either.
+ * The decision keys on `audit.redactValues`, set once at /v1/notify (urgent
+ * priority, or a template with a sensitive variable), not on the job's current
+ * priority: an OTP job stays redacted under any later priority. Jobs queued
+ * before the flag existed fall back to the priority. An OTP template id is
+ * redacted whatever the flag or priority says, as a backstop.
  */
 export function toAcceptedRecord(job: Job, source: string): AcceptedRecord {
   if (!job.audit) throw new Error(`job ${job.job_id} has no audit ids`);
@@ -72,7 +71,6 @@ export function toAcceptedRecord(job: Job, source: string): AcceptedRecord {
       : {
           to,
           variables: withoutAttachmentBodies(job.channel, job.variables),
-          ...(job.body ? { body: job.body } : {}),
           ...contentRefs,
         },
     job: realtime ? undefined : (job as unknown as Record<string, unknown>),

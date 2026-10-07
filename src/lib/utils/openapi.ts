@@ -113,6 +113,20 @@ const adminSchemas = {
       policies: { type: 'array', maxItems: 500, items: { $ref: '#/components/schemas/PolicyCreate' } },
     },
   },
+  ProviderInfo: {
+    type: 'object',
+    required: ['name', 'vendor', 'renders'],
+    additionalProperties: false,
+    properties: {
+      name: { type: 'string', description: 'The channel: `email`, `sms` or `whatsapp`.', example: 'sms' },
+      vendor: { type: 'string', description: 'The configured vendor for the channel.', example: 'msg91' },
+      renders: {
+        type: 'string',
+        enum: ['ns', 'provider'],
+        description: '`ns`: the service renders the final text. `provider`: the vendor renders its registered template from the variables.',
+      },
+    },
+  },
   SendAccepted: {
     type: 'object',
     required: ['notification_event_id', 'correlation_id', 'status', 'mode', 'deliveries'],
@@ -433,7 +447,7 @@ export function openApiDocument() {
       title: 'Notification Service API',
       version: '1.0.0',
       description:
-        'Provider-agnostic notification API with Redis-backed priority queues, retries, dedupe, and provider metadata.',
+        'Notification API (Send API v1): catalogue templates and policies, Redis-backed priority queues with retries, idempotent sends, and provider metadata.',
     },
     paths: {
       ...adminPaths,
@@ -483,7 +497,7 @@ export function openApiDocument() {
               reply_to: { type: 'string', format: 'email', description: 'Email deliveries only.' },
               attachments: {
                 type: 'array',
-                description: 'Email deliveries only. Count and total size limits as on `/notify`.',
+                description: 'Email deliveries only. At most `NOTIFY_ATTACHMENT_MAX_FILES` files (default 3) and `NOTIFY_ATTACHMENT_MAX_TOTAL_BYTES` decoded bytes in total (default 5 MB).',
                 items: {
                   type: 'object',
                   required: ['filename', 'contentType', 'data'],
@@ -538,125 +552,19 @@ export function openApiDocument() {
           },
         },
       },
-      '/notify': {
-        post: {
-          summary: 'Queue a notification',
-          description:
-            'Legacy send route, kept until the cutover release. Requires `notify:send`. Also accepts HMAC `v1` signatures (no body digest).',
-          security: sendSecurity,
-          requestBody: {
-            required: true,
-            content: {
-              'application/json': {
-                schema: {
-                  type: 'object',
-                  required: ['channel', 'to', 'template_id', 'variables'],
-                  properties: {
-                    channel: { type: 'string', example: 'email' },
-                    to: { type: 'string', example: 'user@example.com' },
-                    template_id: { type: 'string', example: 'basic_email' },
-                    priority: {
-                      type: 'string',
-                      enum: ['realtime', 'other'],
-                      default: 'other',
-                    },
-                    variables: { type: 'object', additionalProperties: true },
-                    dedupe_id: { type: 'string' },
-                  },
-                },
-                examples: {
-                  email: {
-                    value: {
-                      channel: 'email',
-                      template_id: 'basic_email',
-                      to: 'user@example.com',
-                      priority: 'realtime',
-                      variables: {
-                        fromName: 'Notification Service',
-                        fromEmail: 'no-reply@example.com',
-                        subject: 'Welcome',
-                        html: '<h1>Hello</h1>',
-                        replyTo: 'support@example.com',
-                      },
-                    },
-                  },
-                  sms: {
-                    value: {
-                      channel: 'sms',
-                      template_id: 'login_otp',
-                      to: '+918888888888',
-                      variables: {
-                        message: 'Your OTP is 987654',
-                      },
-                    },
-                  },
-                  whatsapp: {
-                    value: {
-                      channel: 'whatsapp',
-                      template_id: 'dialflow',
-                      to: '+918888888888',
-                      variables: {
-                        contentSid: null,
-                        contentVariables: {},
-                      },
-                    },
-                  },
-                },
-              },
-            },
-          },
-          responses: {
-            '200': {
-              description:
-                'Job accepted, or suppressed as a duplicate of a send the caller asked to dedupe via `dedupe_id`. Inspect `enqueued`: false means nothing was sent.',
-              content: {
-                'application/json': {
-                  schema: {
-                    type: 'object',
-                    properties: {
-                      job_id: { type: 'string' },
-                      enqueued: { type: 'boolean' },
-                      reason: { type: 'string', enum: ['duplicate'] },
-                    },
-                  },
-                },
-              },
-            },
-            '400': { description: 'Invalid request or provider/template' },
-            '401': unauthorized(),
-            '403': forbidden('notify:send'),
-            '503': authUnavailable(),
-            '409': {
-              description:
-                'Suppressed as a duplicate by the fallback content-hash key (no `dedupe_id` was supplied). Nothing was sent. Pass an explicit `dedupe_id` if the send is a deliberate retry.',
-              content: {
-                'application/json': {
-                  schema: {
-                    type: 'object',
-                    properties: {
-                      job_id: { type: 'string' },
-                      enqueued: { type: 'boolean' },
-                      reason: { type: 'string', enum: ['duplicate-fallback'] },
-                    },
-                  },
-                },
-              },
-            },
-          },
-        },
-      },
       '/providers': {
         get: {
-          summary: 'List providers and complete notify payloads',
+          summary: 'List the configured provider per channel: name, vendor and who renders',
           security: anySecurity,
           responses: {
             '401': unauthorized(),
             '503': authUnavailable(),
             '200': {
-              description: 'Provider metadata',
+              description: 'One entry per channel',
               content: {
                 'application/json': {
-                  examples: providerExamples,
+                  schema: { type: 'array', items: { $ref: '#/components/schemas/ProviderInfo' } },
+                  example: Object.values(providers).map(serializeProvider),
                 },
               },
             },
@@ -665,7 +573,7 @@ export function openApiDocument() {
       },
       '/providers/{name}': {
         get: {
-          summary: 'Find a provider by name',
+          summary: 'Read one channel\'s provider: name, vendor and who renders',
           security: anySecurity,
           parameters: [
             {
@@ -678,9 +586,10 @@ export function openApiDocument() {
           ],
           responses: {
             '200': {
-              description: 'Provider metadata',
+              description: 'The channel\'s provider',
               content: {
                 'application/json': {
+                  schema: { $ref: '#/components/schemas/ProviderInfo' },
                   examples: providerExamples,
                 },
               },
@@ -712,6 +621,7 @@ export function openApiDocument() {
                       retry_oldest: null,
                       retry_eta_seconds: null,
                       dlq: 0,
+                      bulk: 0,
                     },
                   },
                 },
@@ -813,7 +723,7 @@ export function openApiDocument() {
           in: 'header',
           name: 'X-NS-Signature',
           description:
-            'HMAC v2. Send X-NS-Key (key id), X-NS-Timestamp (unix seconds, within 30 s of server time), X-NS-Nonce (unique per request) and X-NS-Signature: v2=<64 lowercase hex>. The signature is HMAC-SHA256 with the key secret over the canonical string METHOD\\npath\\ntimestamp\\nnonce\\nsha256(body), where path includes the query string and the digest is lowercase hex SHA-256 over the exact body bytes (the empty string when there is no body). v1 (METHOD\\npath\\ntimestamp\\nnonce) is accepted only on legacy /notify until the cutover release. Scopes come from the key\'s `scopes` entry in internal-secrets.json (default `notify:send`). Do not send alongside an Authorization header.',
+            'HMAC v2. Send X-NS-Key (key id), X-NS-Timestamp (unix seconds, within 30 s of server time), X-NS-Nonce (unique per request) and X-NS-Signature: v2=<64 lowercase hex>. The signature is HMAC-SHA256 with the key secret over the canonical string METHOD\\npath\\ntimestamp\\nnonce\\nsha256(body), where path includes the query string and the digest is lowercase hex SHA-256 over the exact body bytes (the empty string when there is no body). Scopes come from the key\'s `scopes` entry in internal-secrets.json (default `notify:send`). Do not send alongside an Authorization header.',
         },
       },
     },

@@ -14,7 +14,7 @@ function rec(): AcceptedRecord {
       createdAt: new Date().toISOString(), correlationId: randomUUID(),
     },
     network: 'blue_dot', source: 'test', priority: 'other',
-    channel: 'email', templateId: 'basic_email', templateKey: 'basic_email', eventType: null, domain: null,
+    channel: 'email', templateId: 'welcome', templateKey: 'welcome', eventType: null, domain: null,
     payload: { to: 'a@b.c' }, job: { job_id: 'j' }, recoverable: true,
   };
 }
