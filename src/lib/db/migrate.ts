@@ -4,6 +4,7 @@ import { drizzle, type NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { migrate } from 'drizzle-orm/node-postgres/migrator';
 import { closeDb } from './client';
 import { loadDbConfig } from './config';
+import { applyAuditRetention, auditRetentionDays } from './retention';
 
 /**
  * Advisory-lock key shared by every migration runner of this service.
@@ -53,7 +54,8 @@ export function migrationPoolConfig(env: NodeJS.ProcessEnv = process.env): PoolC
 }
 
 /**
- * Apply pending migrations from MIGRATIONS_FOLDER under the lock.
+ * Apply pending migrations from MIGRATIONS_FOLDER under the lock, then the
+ * configured audit retention (NS_AUDIT_RETENTION_DAYS, see retention.ts).
  *
  * Runs on a dedicated, short-lived pool with NO statement/query timeout: the
  * service pool's 5s bounds would abort a long DDL (or partman's partition
@@ -61,11 +63,20 @@ export function migrationPoolConfig(env: NodeJS.ProcessEnv = process.env): PoolC
  * is intended — a replica waits for the one migrating. Connect timeout stays.
  */
 export async function runMigrations(): Promise<void> {
+  // Parsed first: a bad NS_AUDIT_RETENTION_DAYS fails boot before any DDL runs.
+  const retentionDays = auditRetentionDays();
   console.log('Applying database migrations from', MIGRATIONS_FOLDER);
   const pool = new Pool(migrationPoolConfig());
   pool.on('error', (err) => console.error('Postgres migration pool error:', err.message));
   try {
     await migrateWithLock(drizzle(pool), pool, MIGRATIONS_FOLDER);
+    // After 0005 has landed (the migration lock guarantees it, on every
+    // replica) and before the first maintenance run. Outside the lock on
+    // purpose: the write is idempotent, and it runs on this no-timeout pool so
+    // a brief row lock held by another replica's run_maintenance_proc is
+    // waited out rather than failing boot. Throws, failing boot, if part_config
+    // has no row for an audit table.
+    await applyAuditRetention(pool, retentionDays);
   } finally {
     await pool.end();
   }

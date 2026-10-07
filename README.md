@@ -105,6 +105,7 @@ is for local runs only).
 | `NS_AUTH_ALLOWED_AZP` | required with the issuer | Comma-separated client ids whose tokens are accepted |
 | `NS_DOCS_ENABLED` | unset | `true` serves `GET /` and `GET /openapi.json`; leave unset in deployed environments |
 | `PARTITION_MAINTENANCE_INTERVAL_MS` | 6 hours | Partition pre-creation interval |
+| `NS_AUDIT_RETENTION_DAYS` | `90` | Audit history kept, in days; integer 31 to 3650. Partitions are monthly, so a record is kept between N and about N + 31 days, then deleted |
 | `RECOVERY_MAX_AGE_HOURS` | `24` | Open sends older than this are marked failed by recovery, not re-sent |
 | `WORKER_URGENT_CONCURRENCY` | `2` | Urgent loops, each on its own Redis connection; must be a positive integer |
 | `WORKER_NORMAL_CONCURRENCY` | `2` | Normal loops |

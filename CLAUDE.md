@@ -34,7 +34,7 @@ This is a **Fastify notification service** that queues and asynchronously proces
 
 1. **API Server** (`src/server.ts`) — Listens on `SERVER_PORT` (default 3000)
    - Registers routes from `src/routes/`
-   - Boot order: `loadSecrets` → migrations (advisory lock) → partition maintenance →
+   - Boot order: `loadSecrets` → migrations (advisory lock) → audit retention → partition maintenance →
      `recoverLostJobs` → listen → fork worker. Nothing may touch a table before its migration
      lands, and recovery runs before the worker drains so recovered jobs join the queue in order.
      A failed migration or invalid config exits non-zero; a failed **boot recovery does not** — it
@@ -209,11 +209,21 @@ move rows out of a default partition, and a row in the default for a future rang
 `ns_partition_default_rows{parent}` (1 = non-empty); move the rows with
 `partman.partition_data_proc`.
 
-**Retention: 90 days** (`drizzle/0005_audit_retention_90d.sql`). `notification_event` and
-`delivery_attempt` are set to `retention = '90 days'` in `partman.part_config`, so the same
-maintenance run drops a monthly partition once its whole month is older than 90 days. A row lives
-at least 90 days and at most about 121 (the month it was written in, plus 90 days). Partitions are
-dropped, not detached, so the data is gone. Rows in a default partition are not covered (see
+**Retention: `NS_AUDIT_RETENTION_DAYS`, default 90** (`src/lib/db/retention.ts`). Migration
+`drizzle/0005_audit_retention_90d.sql` set `retention = '90 days'` on `notification_event` and
+`delivery_attempt` in `partman.part_config`; `runMigrations` then writes the configured value
+(`<N> days`, bound as a parameter) at every boot, after the migrations and before the first
+maintenance run, and only where it differs, so replicas booting together race to a no-op. The same
+maintenance run drops a monthly partition once its whole month is older than the window. Partitions
+are monthly, so retention is rounded **up** to whole partitions: a row lives at least N days and at
+most about N + 31 (the month it was written in, plus N). That is why the range is **31 to 3650**
+(integer; anything else fails boot): below one partition width the number stops describing what
+happens. If `part_config` has no row for either audit table, boot fails: nothing would ever be
+dropped, and retention silently off is the failure to avoid. The boot write also pins
+`retention_keep_table`/`retention_keep_index = false`: partitions are dropped, not detached, so the
+data is gone. Shortening the window drops the now-expired partitions at the next maintenance run
+(boot, then every `PARTITION_MAINTENANCE_INTERVAL_MS`); lengthening it cannot bring back partitions
+already dropped. Rows in a default partition are not covered (see
 `check_default` above). The `idempotency_key` table is pruned separately after 90 days. Tier-2
 rollups and erasure tooling remain #65.
 
@@ -753,6 +763,9 @@ Required for persistence and Redis:
 - `NS_RESOLVE_CACHE_TTL_MS` — optional, default 60000, positive integer (invalid fails boot). See
   Resolver cache.
 - `PARTITION_MAINTENANCE_INTERVAL_MS` — optional, default 6h.
+- `NS_AUDIT_RETENTION_DAYS` — optional, default 90; integer 31 to 3650 (invalid fails boot). Audit
+  partitions older than this are dropped; effective retention is N to about N + 31 days because
+  partitions are monthly. See Persistence.
 - `RECOVERY_MAX_AGE_HOURS` — optional, default 24, positive integer (invalid fails boot). Open
   recoverable sends older than this are marked failed by recovery instead of sent late.
 
@@ -811,7 +824,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 755 unit tests across 56 files, plus 138 integration tests across 17 files. The unit suite runs in about a second because Redis
+vitest 4, 801 unit tests across 57 files, plus 159 integration tests across 17 files. The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real

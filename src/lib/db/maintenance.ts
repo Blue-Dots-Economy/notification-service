@@ -14,10 +14,12 @@ import { pruneIdempotencyKeys } from '../send/idempotency';
  * non-empty defaults (warning log + ns_partition_default_rows{parent}).
  * Moving them is a manual partman.partition_data_proc().
  *
- * run_maintenance also applies the 90-day retention that migration 0005 sets
- * on notification_event and delivery_attempt: it DROPS (not detaches) every
- * monthly partition whose whole month is older than 90 days, so that audit
- * data is gone. Rows in a default partition are not covered.
+ * run_maintenance also applies the audit retention on notification_event and
+ * delivery_attempt (NS_AUDIT_RETENTION_DAYS, default 90; migration 0005 set the
+ * initial 90 days and runMigrations writes the configured value at boot, see
+ * retention.ts): it DROPS (not detaches) every monthly partition whose whole
+ * month is older than the window, so that audit data is gone. Rows in a
+ * default partition are not covered.
  *
  * Every replica runs the loop; a try-lock makes all but one skip each round.
  */

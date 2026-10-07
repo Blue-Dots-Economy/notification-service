@@ -25,6 +25,8 @@ describe('validateBootConfig (API boot, before listen)', () => {
     ['URGENT_DEFAULT_DEADLINE_S', 'soon'],
     ['RECOVERY_MAX_AGE_HOURS', '-1'],
     ['NS_RESOLVE_CACHE_TTL_MS', 'soon'],
+    ['NS_AUDIT_RETENTION_DAYS', '7'],
+    ['NS_AUDIT_RETENTION_DAYS', 'ninety'],
   ])('throws naming %s on a bad value', (key, value) => {
     expect(() => validateBootConfig({ [key]: value })).toThrow(key);
   });

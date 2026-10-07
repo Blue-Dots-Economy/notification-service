@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { closeDb, getPool } from '../client';
 import { runMigrations } from '../migrate';
 import { runPartitionMaintenance } from '../maintenance';
+import { applyAuditRetention, auditRetentionDays } from '../retention';
 import redis from '../../redis';
 
 beforeAll(async () => {
@@ -50,33 +51,97 @@ describe('audit partitions', () => {
     await getPool().query(`DELETE FROM notification_event_default`);
   });
 
-  it.each(['notification_event', 'delivery_attempt'])(
-    '%s keeps 90 days: maintenance drops a partition whose whole month is older',
-    async (table) => {
-      const { rows: cfg } = await getPool().query(
-        `SELECT retention, retention_keep_table FROM partman.part_config WHERE parent_table = $1`,
-        [`public.${table}`],
-      );
-      expect(cfg[0]).toEqual({ retention: '90 days', retention_keep_table: false });
+  const tag = (d: Date) => `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+  const DAY_MS = 24 * 60 * 60 * 1000;
 
-      // A month that ended well over 90 days ago, and last month (inside the window).
+  async function retentionConfig(): Promise<Record<string, unknown>[]> {
+    const { rows } = await getPool().query(
+      `SELECT parent_table, retention, retention_keep_table, retention_keep_index
+         FROM partman.part_config
+        WHERE parent_table IN ('public.notification_event', 'public.delivery_attempt')
+        ORDER BY parent_table`,
+    );
+    return rows;
+  }
+
+  it('by default (NS_AUDIT_RETENTION_DAYS unset) both audit tables keep 90 days', async () => {
+    expect(auditRetentionDays({})).toBe(90);
+    await expect(applyAuditRetention(getPool(), auditRetentionDays({}))).resolves.toEqual({
+      retention: '90 days',
+      updated: [],
+    });
+    expect(await retentionConfig()).toEqual([
+      { parent_table: 'public.delivery_attempt', retention: '90 days', retention_keep_table: false, retention_keep_index: false },
+      { parent_table: 'public.notification_event', retention: '90 days', retention_keep_table: false, retention_keep_index: false },
+    ]);
+  });
+
+  it('NS_AUDIT_RETENTION_DAYS=40 updates part_config for both tables, once', async () => {
+    const days = auditRetentionDays({ NS_AUDIT_RETENTION_DAYS: '40' });
+    try {
+      const first = await applyAuditRetention(getPool(), days);
+      expect(first.retention).toBe('40 days');
+      expect([...first.updated].sort()).toEqual(['public.delivery_attempt', 'public.notification_event']);
+      expect((await retentionConfig()).map((r) => r.retention)).toEqual(['40 days', '40 days']);
+      // A second replica booting with the same value writes nothing.
+      await expect(applyAuditRetention(getPool(), days)).resolves.toEqual({ retention: '40 days', updated: [] });
+    } finally {
+      await applyAuditRetention(getPool(), 90);
+    }
+  });
+
+  it('runMigrations applies NS_AUDIT_RETENTION_DAYS', async () => {
+    process.env.NS_AUDIT_RETENTION_DAYS = '45';
+    try {
+      await runMigrations();
+      expect((await retentionConfig()).map((r) => r.retention)).toEqual(['45 days', '45 days']);
+    } finally {
+      delete process.env.NS_AUDIT_RETENTION_DAYS;
+      await runMigrations();
+    }
+    expect((await retentionConfig()).map((r) => r.retention)).toEqual(['90 days', '90 days']);
+  });
+
+  it.each(['notification_event', 'delivery_attempt'])(
+    '%s: maintenance drops partitions past the configured window (90 days, then 31)',
+    async (table) => {
+      // Six months back: past 90 days. Three months back: its upper bound is
+      // 59 to 92 days ago, so inside 90 days (bar the last day or so of a long
+      // month) and always past 31. Last month: inside both windows.
       const now = new Date();
       const old = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 6, 1));
+      const mid = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 3, 1));
+      const midEnd = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 2, 1));
       const recent = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
-      await getPool().query(`SELECT partman.create_partition_time($1, ARRAY[$2::timestamptz, $3::timestamptz])`, [
-        `public.${table}`,
-        old.toISOString(),
-        recent.toISOString(),
-      ]);
-      const tag = (d: Date) => `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
-      expect((await childPartitions(table)).some((p) => p.includes(tag(old)))).toBe(true);
+      await getPool().query(
+        `SELECT partman.create_partition_time($1, ARRAY[$2::timestamptz, $3::timestamptz, $4::timestamptz])`,
+        [`public.${table}`, old.toISOString(), mid.toISOString(), recent.toISOString()],
+      );
+      const before = await childPartitions(table);
+      expect(before.some((p) => p.includes(tag(old)))).toBe(true);
+      expect(before.some((p) => p.includes(tag(mid)))).toBe(true);
 
+      // Default 90 days: only the six-month-old partition goes.
       await expect(runPartitionMaintenance()).resolves.toBe(true);
-
-      const after = await childPartitions(table);
+      let after = await childPartitions(table);
       expect(after.some((p) => p.includes(tag(old)))).toBe(false);
+      if (now.getTime() - midEnd.getTime() < 90 * DAY_MS) {
+        expect(after.some((p) => p.includes(tag(mid)))).toBe(true);
+      }
       expect(after.some((p) => p.includes(tag(recent)))).toBe(true);
-      expect(after.some((p) => p.includes(tag(now)))).toBe(true);
+
+      // NS_AUDIT_RETENTION_DAYS=31: the three-month-old partition goes too.
+      try {
+        await applyAuditRetention(getPool(), auditRetentionDays({ NS_AUDIT_RETENTION_DAYS: '31' }));
+        await expect(runPartitionMaintenance()).resolves.toBe(true);
+        after = await childPartitions(table);
+        expect(after.some((p) => p.includes(tag(mid)))).toBe(false);
+        expect(after.some((p) => p.includes(tag(now)))).toBe(true);
+        // Last month ended 0 to 31 days ago, so 31 days never reaches it.
+        expect(after.some((p) => p.includes(tag(recent)))).toBe(true);
+      } finally {
+        await applyAuditRetention(getPool(), 90);
+      }
     },
   );
 
