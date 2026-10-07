@@ -24,6 +24,16 @@ function withoutAttachmentBodies(channel: string, variables: unknown): unknown {
 }
 
 /**
+ * An OTP template: `otp` as a whole token of the template id (`login_otp`,
+ * `otp.login`, `guardian-otp`), case-insensitive. Raw provider ids (DLT flow
+ * ids) carry no name, so an OTP sent under one is redacted only via
+ * `priority: 'realtime'`.
+ */
+export function isOtpTemplate(templateId: unknown): boolean {
+  return typeof templateId === 'string' && /(^|[._-])otp($|[._-])/i.test(templateId);
+}
+
+/**
  * What a job persists. The one place this is decided.
  *
  * Realtime jobs carry OTP codes in their variables, and OTP codes are never
@@ -32,13 +42,16 @@ function withoutAttachmentBodies(channel: string, variables: unknown): unknown {
  * loss, which is acceptable because the user simply requests a new code.
  *
  * The decision keys on `audit.redactValues`, set once at /notify from the
- * original priority, not on the job's current priority: a DLQ replay may move
- * an OTP job to 'other', and it must stay redacted. Jobs queued before the flag
- * existed fall back to the priority.
+ * original priority and template, not on the job's current priority: a DLQ
+ * replay may move an OTP job to 'other', and it must stay redacted. Jobs queued
+ * before the flag existed fall back to the priority. An OTP template is
+ * redacted whatever the flag or priority says: priority is the caller's
+ * choice, and an OTP sent without one must not be persisted either.
  */
 export function toAcceptedRecord(job: Job, source: string): AcceptedRecord {
   if (!job.audit) throw new Error(`job ${job.job_id} has no audit ids`);
-  const realtime = job.audit.redactValues ?? job.priority === 'realtime';
+  const realtime =
+    (job.audit.redactValues ?? job.priority === 'realtime') || isOtpTemplate(job.template_id);
   return {
     ids: job.audit,
     network: process.env.NS_NETWORK ?? 'unknown',

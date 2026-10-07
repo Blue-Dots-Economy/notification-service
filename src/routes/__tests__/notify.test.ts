@@ -208,6 +208,17 @@ describe('/notify audit', () => {
     expect(ot.audit.redactValues).toBe(false);
   });
 
+  it('redacts an OTP template sent without priority: the code is never persisted (spec: OTPs never stored)', async () => {
+    const res = await signedNotify({ ...body({ otp: '482913' }), template_id: 'login_otp' });
+    expect(res.statusCode).toBe(200);
+    const queued = (pushOther.mock.calls[0] as unknown as [{ audit: { redactValues: boolean } }])[0];
+    expect(queued.audit.redactValues).toBe(true);
+    const rec = recordAccepted.mock.calls[0]![0] as { payload: unknown; job?: unknown; recoverable: boolean };
+    expect(JSON.stringify(rec)).not.toContain('482913');
+    expect(rec.job).toBeUndefined();
+    expect(rec.recoverable).toBe(false);
+  });
+
   it('realtime still enqueues when the audit insert fails', async () => {
     recordAccepted.mockRejectedValueOnce(new Error('db down'));
     const res = await signedNotify({ ...body(), priority: 'realtime' });

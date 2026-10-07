@@ -86,9 +86,13 @@ Postgres is the record of every send; Redis is only the dispatch queue. Code: `s
 - **Realtime is queue-first.** The audit write is fire-and-forget so a slow database never delays
   an OTP. It persists the recipient and variable **names only, never values**, and keeps no job
   copy, so realtime sends are **not recoverable** after a Redis loss (the user requests a new code).
-- **Redaction is sticky.** `/notify` sets `audit.redactValues` (true for realtime) on the job, and
-  `toAcceptedRecord` keys on it, not on the current priority: a DLQ replay of an OTP as `other`
-  still persists names only and no job copy. Jobs without the flag fall back to the priority.
+- **Redaction is sticky.** `/notify` sets `audit.redactValues` (true for realtime **or an OTP
+  template**) on the job, and `toAcceptedRecord` keys on it, not on the current priority: a DLQ
+  replay of an OTP as `other` still persists names only and no job copy. Jobs without the flag fall
+  back to the priority. An OTP template (`isOtpTemplate`: `otp` as a whole token of the id, e.g.
+  `login_otp`, `otp.login`) is redacted at **any** priority, so an OTP sent without `priority` is
+  never persisted (and, like realtime, not recoverable). A raw provider id (DLT flow id) carries no
+  name: an OTP sent under one is redacted only if the caller sends `priority: 'realtime'`.
 - If the Redis push fails after the record was written, the attempt is stamped `failed`
   (`enqueue failed`, best-effort) and the dedupe claim is released (as on the 503 path) before the
   error propagates, so recovery never sends it later and the caller's retry is accepted.

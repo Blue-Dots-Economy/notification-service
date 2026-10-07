@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Job } from 'src/types';
-import { toAcceptedRecord } from '../redact';
+import { isOtpTemplate, toAcceptedRecord } from '../redact';
 
 const ids = { eventId: 'e', attemptId: 'a', createdAt: '2026-10-04T00:00:00.000Z', correlationId: 'c' };
 
@@ -77,5 +77,34 @@ describe('toAcceptedRecord — email attachments', () => {
     expect((rec.job as { variables: { attachments: Array<{ data: string }> } }).variables.attachments[0]!.data).toBe(data);
     // The original job is not mutated.
     expect((job.variables.attachments[0] as { data: string }).data).toBe(data);
+  });
+});
+
+describe('toAcceptedRecord — OTP templates are always redacted', () => {
+  it('redacts an OTP template queued as other, whatever the flag says', () => {
+    for (const redactValues of [undefined, false]) {
+      const job: Job = {
+        job_id: 'j', channel: 'sms', priority: 'other', to: '+919999999999',
+        template_id: 'login_otp', variables: { message: '771204' },
+        audit: { ...ids, ...(redactValues === undefined ? {} : { redactValues }) },
+      };
+      const rec = toAcceptedRecord(job, 'worker');
+      expect(JSON.stringify(rec)).not.toContain('771204');
+      expect(rec.job).toBeUndefined();
+      expect(rec.recoverable).toBe(false);
+    }
+  });
+});
+
+describe('isOtpTemplate', () => {
+  it('matches otp as a whole token of the template id', () => {
+    for (const id of ['login_otp', 'LOGIN_OTP', 'otp', 'otp.login', 'guardian-otp', 'otp_verify']) {
+      expect(isOtpTemplate(id), id).toBe(true);
+    }
+  });
+  it('does not match ids that merely contain the letters', () => {
+    for (const id of ['basic_email', 'hotpot_offer', 'shotput', '6896c26d6eb66c66340e1242']) {
+      expect(isOtpTemplate(id), id).toBe(false);
+    }
   });
 });

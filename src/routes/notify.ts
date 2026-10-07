@@ -6,7 +6,7 @@ import { buildDedupeKey } from '../lib/dedupe_key';
 import { providers } from '../lib/providers';
 import * as queue from '../lib/queue';
 import { recordAccepted } from '../lib/audit/store';
-import { toAcceptedRecord } from '../lib/audit/redact';
+import { isOtpTemplate, toAcceptedRecord } from '../lib/audit/redact';
 import { stamp } from '../lib/audit/stamp';
 import { describeDbError } from '../lib/db/errors';
 import { requestAuth } from '../plugins/request-auth';
@@ -97,8 +97,9 @@ export async function notifyRoutes(app: FastifyInstance) {
           attemptId: randomUUID(),
           createdAt: new Date().toISOString(),
           correlationId: correlationIdFrom(req.headers['x-correlation-id'], job_id),
-          // Sticky: decided by the priority the caller sent, never re-derived.
-          redactValues: priority === 'realtime',
+          // Sticky: decided by the priority the caller sent and the template,
+          // never re-derived. An OTP template is redacted at any priority.
+          redactValues: priority === 'realtime' || isOtpTemplate(body.template_id),
         },
       };
       const source = String(req.headers['x-ns-key'] ?? 'unknown');
