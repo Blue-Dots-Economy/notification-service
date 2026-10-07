@@ -312,11 +312,14 @@ The file named by `NS_CONTENT_FILE`:
 A body of `Read the terms: {{tnc_url}}` for an `hi-IN` template renders
 `Read the terms: https://example.com/hi/terms/v3` (the locale chain is `hi-IN`, `hi`, then
 `NS_DEFAULT_LOCALE`). Content resolves when the send is accepted, and the event records each channel's
-`content_refs` (`key`, `version`, `locale`). A `content_ref` variable is always required, cannot be
+`content_refs` (`key`, `version`, `locale`, and `fingerprint`: the first 12 hex of the sha256 of the
+value, so a ref pins the exact text even if the file was edited without a version bump). A `content_ref` variable is always required, cannot be
 `sensitive`, and cannot be supplied by the caller (`422 unknown_variable`). A missing key or locale, an
 invalid value, or no loaded content refuses the send with a configuration `422`
 (`content_unavailable`, `unknown_content_key`, `content_unresolved`, `invalid_content`). The file is
-re-read every `NS_CONTENT_RELOAD_MS`; a bad file keeps the last good version.
+re-read every `NS_CONTENT_RELOAD_MS`; a bad file keeps the last good version and increments
+`ns_content_load_failures_total`, and `ns_content_loaded{version,fingerprint}` holds the time of the
+latest successful load.
 
 
 ## Queue Model

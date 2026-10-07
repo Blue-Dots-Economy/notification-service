@@ -19,4 +19,10 @@ export interface ContentRef {
   key: string;
   version: string;
   locale: string;
+  /**
+   * First 12 hex characters of the sha256 of the resolved value. Pins the
+   * exact text the send carried, so an edit that keeps `version` still gives
+   * a different reference. A fingerprint, not the value.
+   */
+  fingerprint: string;
 }

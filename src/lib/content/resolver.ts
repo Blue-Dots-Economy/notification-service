@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import * as metrics from '../metrics';
 import { TemplateError } from '../templates/errors';
 import { configmapProvider } from './configmap';
 import type { ContentProvider, ContentRef, ContentSnapshot } from './types';
@@ -58,6 +60,25 @@ export function setContentForTests(snapshot: ContentSnapshot | null): void {
   active = snapshot;
 }
 
+/** First 12 hex of a sha256: short enough for a label or audit ref, long enough to tell edits apart. */
+export function shortFingerprint(text: string): string {
+  return createHash('sha256').update(text).digest('hex').slice(0, 12);
+}
+
+/**
+ * Best-effort, never awaited on the load path. `ns_content_loaded` is the unix
+ * time of the latest successful load of that exact content by any pod: the
+ * series still advancing is what is being served; one that stops advancing is
+ * content no pod loads any more.
+ */
+function recordLoaded(provider: string, snap: ContentSnapshot): void {
+  void metrics.setGauge('ns_content_loaded', Math.floor(Date.now() / 1000), {
+    provider,
+    version: snap.version,
+    fingerprint: snap.fingerprint ? snap.fingerprint.slice(0, 12) : 'none',
+  });
+}
+
 let loading = false;
 // Bumped by stopContent. A load started under an older generation neither
 // installs its snapshot nor touches the current run's `loading` flag.
@@ -68,10 +89,14 @@ async function loadOnce(provider: ContentProvider, gen: number): Promise<void> {
   loading = true;
   try {
     const next = await provider.load();
-    if (gen === generation) install(next);
+    if (gen === generation) {
+      install(next);
+      recordLoaded(provider.name, next);
+    }
   } catch (err) {
     // Keep the last good snapshot. The message names the problem, never content.
     if (gen === generation) {
+      void metrics.incr('ns_content_load_failures_total', { provider: provider.name });
       console.error(`content (${provider.name}) not loaded; keeping version ${active?.version ?? 'none'}: ${(err as Error).message}`);
     }
   } finally {
@@ -117,7 +142,9 @@ export function stopContent(): void {
 
 /**
  * The value for `key` in the first locale of `locales` that has one, memoised
- * per (key, locale, version). Every failure is a configuration error: a send
+ * per (key, locale, version) and dropped on every reload. The ref carries a
+ * fingerprint of the value, so it pins the exact text even when an edit kept
+ * the version. Every failure is a configuration error: a send
  * never goes out with a blank or stale-missing reference.
  */
 export function resolveContent(key: string, locales: string[]): { value: string; ref: ContentRef } {
@@ -130,7 +157,7 @@ export function resolveContent(key: string, locales: string[]): { value: string;
     if (hit) return hit;
     const value = snap.get(key, locale);
     if (value !== undefined) {
-      const out = { value, ref: { key, version: snap.version, locale } };
+      const out = { value, ref: { key, version: snap.version, locale, fingerprint: shortFingerprint(value) } };
       memo.set(id, out);
       return out;
     }

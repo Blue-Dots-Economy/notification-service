@@ -500,17 +500,21 @@ Messages name the key and variable, never the value.
 `422 unknown_variable` (a caller error); content variables are not part of the caller contract.
 
 **Event record (E3).** The event payload carries `content_refs`, a per-channel map
-`{ "<channel>": [{ key, version, locale }] }`, de-duplicated per channel and built from each planned
+`{ "<channel>": [{ key, version, locale, fingerprint }] }`, de-duplicated per channel and built from each planned
 delivery's own references (`src/lib/content/refs.ts`). Every job of a send carries the whole map, so
 the event row holds every channel's entry in any mode, and the delivering attempt's channel selects
 the entry that applied. These are references, never values, and are recorded for redacted sends
-too, so an audit can answer which terms version a message carried.
+too, so an audit can answer which terms version a message carried. `fingerprint` is the first 12 hex
+of the sha256 of the resolved value: it pins the exact text, so an edit that keeps `version` still
+yields a different ref.
 
 **Reload and boot (E4).** The first load happens at boot and the file is re-read every
 `NS_CONTENT_RELOAD_MS`; a slow load never overlaps the next. Every successful reload takes effect
 and clears the memo. A same-version reload that has different content still takes effect and logs a
-warning (bump the version on edits). A bad or unreadable file keeps the last good snapshot and logs
-the problem without values. An invalid `NS_CONTENT_PROVIDER` or `NS_CONTENT_RELOAD_MS` fails boot
+warning (bump the version on edits). A bad or unreadable file keeps the last good snapshot, logs
+the problem without values and increments `ns_content_load_failures_total`; every successful load
+sets `ns_content_loaded{version,fingerprint}` (fingerprint = first 12 hex of the file's sha256) to
+the load time. An invalid `NS_CONTENT_PROVIDER` or `NS_CONTENT_RELOAD_MS` fails boot
 like other config (`validateBootConfig`); a missing or broken content file never does: until a valid
 file loads, `content_ref` sends answer `422 content_unavailable`.
 
@@ -877,6 +881,8 @@ live at scrape time rather than counted, so they cannot drift.
 | `ns_job_dropped_total` | counter | `channel`, `reason` |
 | `ns_send_rejected_total` | counter | `kind` (`caller`/`configuration`), `code` |
 | `ns_send_fallthrough_total` | counter | `from`, `to` (channels) |
+| `ns_content_load_failures_total` | counter | `provider` (boot or reload failures; last good content keeps serving) |
+| `ns_content_loaded` | gauge | `provider`, `version`, `fingerprint` (value = unix time of the latest successful load of that content; alert on staleness) |
 | `ns_queue_depth` | gauge | `queue` (`realtime`/`other`/`bulk`/`retry_count`/`dlq`) |
 | `ns_retry_eta_seconds` | gauge | — |
 

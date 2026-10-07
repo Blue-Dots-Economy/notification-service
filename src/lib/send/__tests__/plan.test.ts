@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const policies = vi.hoisted(() => ({ resolvePolicy: vi.fn() }));
 const templates = vi.hoisted(() => ({ resolveTemplate: vi.fn() }));
@@ -177,6 +178,7 @@ describe('planSend — content_ref variables', () => {
   const tncV = v('tnc_url', { type: 'url', source: 'content_ref', contentKey: 'tnc.in_force.url', urlHosts: ['example.org'] });
   const tncSms = tpl({ channel: 'sms', templateKey: 'tnc_sms', variables: [v('name'), tncV] });
   const plainEmail = tpl({ channel: 'email', templateKey: 'tnc_email', provider: 'smtp', providerTemplateId: null, subject: 'Hi {{name}}', bodyText: 'Hi {{name}}', variables: [v('name')] });
+  const fp12 = (text: string) => createHash('sha256').update(text).digest('hex').slice(0, 12);
   const loadTnc = () => setContentForTests(parseContentDocument({ version: 'v3', entries: { 'tnc.in_force.url': { en: 'https://example.org/tnc' } } }));
   afterEach(() => setContentForTests(null));
 
@@ -199,7 +201,7 @@ describe('planSend — content_ref variables', () => {
     templates.resolveTemplate.mockResolvedValue({ template: tncSms, renders: 'provider' });
     const plan = await planSend(req({ template_key: 'tnc_sms', channel: 'sms', to: { phone: '+919999999999' }, variables: { name: 'A' } }));
     expect(plan.deliveries[0]!.rendered).toMatchObject({ mode: 'provider', variables: { name: 'A', tnc_url: 'https://example.org/tnc' } });
-    expect(plan.deliveries[0]!.contentRefs).toEqual([{ key: 'tnc.in_force.url', version: 'v3', locale: 'en' }]);
+    expect(plan.deliveries[0]!.contentRefs).toEqual([{ key: 'tnc.in_force.url', version: 'v3', locale: 'en', fingerprint: fp12('https://example.org/tnc') }]);
   });
 
   it('two content variables on one key: the per-channel map records the ref once', async () => {
@@ -209,7 +211,13 @@ describe('planSend — content_ref variables', () => {
     templates.resolveTemplate.mockResolvedValue({ template: twice, renders: 'provider' });
     const plan = await planSend(req({ template_key: 'tnc_sms', channel: 'sms', to: { phone: '+919999999999' }, variables: { name: 'A' } }));
     expect(plan.deliveries[0]!.rendered).toMatchObject({ variables: { tnc_url: 'https://example.org/tnc', tnc_link: 'https://example.org/tnc' } });
-    expect(contentRefsFor(plan.deliveries)).toEqual({ contentRefs: { sms: [{ key: 'tnc.in_force.url', version: 'v3', locale: 'en' }] } });
+    expect(contentRefsFor(plan.deliveries)).toEqual({ contentRefs: { sms: [{ key: 'tnc.in_force.url', version: 'v3', locale: 'en', fingerprint: fp12('https://example.org/tnc') }] } });
+  });
+
+  it('contentRefsFor keeps two refs that differ only by fingerprint', () => {
+    const a = { key: 'k.a', version: 'v1', locale: 'en', fingerprint: 'aaaaaaaaaaaa' };
+    const b = { ...a, fingerprint: 'bbbbbbbbbbbb' };
+    expect(contentRefsFor([{ channel: 'sms', contentRefs: [a, a, b] }])).toEqual({ contentRefs: { sms: [a, b] } });
   });
 
   it('a delivery with no content variables has empty contentRefs', async () => {

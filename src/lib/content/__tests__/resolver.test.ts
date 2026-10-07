@@ -1,7 +1,11 @@
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+
+const metrics = vi.hoisted(() => ({ incr: vi.fn(async () => {}), setGauge: vi.fn(async () => {}) }));
+vi.mock('../../metrics', () => metrics);
 import { parseContentDocument } from '../configmap';
 import type { ContentSnapshot } from '../types';
 import { contentConfig, currentContent, resolveContent, setContentForTests, startContent, startWithProvider, stopContent } from '../resolver';
@@ -21,6 +25,8 @@ afterEach(() => {
   setContentForTests(null);
   vi.useRealTimers();
   vi.restoreAllMocks();
+  metrics.incr.mockClear();
+  metrics.setGauge.mockClear();
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -38,15 +44,29 @@ function scripted(results: Array<ContentSnapshot | Promise<ContentSnapshot>>) {
   return { name: 'stub', load };
 }
 
+const fp12 = (text: string) => createHash('sha256').update(text).digest('hex').slice(0, 12);
+
 const tick = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 describe('resolveContent', () => {
   it('walks the locale chain and reports the ref', () => {
     setContentForTests(snap('v1'));
     expect(resolveContent('tnc.in_force.url', ['hi-IN', 'hi', 'en'])).toEqual({
-      value: 'https://example.org/hi', ref: { key: 'tnc.in_force.url', version: 'v1', locale: 'hi-IN' },
+      value: 'https://example.org/hi',
+      ref: { key: 'tnc.in_force.url', version: 'v1', locale: 'hi-IN', fingerprint: fp12('https://example.org/hi') },
     });
     expect(resolveContent('tnc.in_force.url', ['ta', 'en']).ref.locale).toBe('en');
+  });
+
+  it('the ref pins the exact text: an edit that keeps the version changes the fingerprint', () => {
+    setContentForTests(snap('v1', 'https://example.org/A'));
+    const a = resolveContent('tnc.in_force.url', ['en']).ref;
+    setContentForTests(snap('v1', 'https://example.org/B'));
+    const b = resolveContent('tnc.in_force.url', ['en']).ref;
+    expect(a.version).toBe(b.version);
+    expect(a.fingerprint).toBe(fp12('https://example.org/A'));
+    expect(b.fingerprint).toBe(fp12('https://example.org/B'));
+    expect(a.fingerprint).toMatch(/^[0-9a-f]{12}$/);
   });
 
   it('throws content_unavailable with no snapshot', () => {
@@ -166,6 +186,34 @@ describe('startContent (configmap reload)', () => {
     expect(await run(fp('x'), fp())).toBe(0);
     expect(await run(fp('x'), fp('x'))).toBe(0);
     expect(await run(fp('x'), fp('y'))).toBe(1);
+  });
+
+  it('counts every failed load and records the loaded content on every success', async () => {
+    const file = tempFile('content.json');
+    const doc = JSON.stringify({ version: 'v1', entries: { 'tnc.in_force.url': { en: 'https://a.example/1' } } });
+    fs.writeFileSync(file, doc);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    await startContent({ NS_CONTENT_FILE: file, NS_CONTENT_RELOAD_MS: '20' });
+    expect(metrics.setGauge).toHaveBeenCalledWith('ns_content_loaded', expect.any(Number), {
+      provider: 'configmap', version: 'v1', fingerprint: fp12(doc),
+    });
+    const [, seconds] = metrics.setGauge.mock.calls[0]!;
+    expect(Math.abs((seconds as number) - Date.now() / 1000)).toBeLessThan(60);
+    expect(metrics.incr).not.toHaveBeenCalled();
+
+    fs.writeFileSync(file, '{ broken');
+    await vi.waitFor(() => expect(metrics.incr).toHaveBeenCalledWith('ns_content_load_failures_total', { provider: 'configmap' }), { timeout: 2000 });
+  });
+
+  it('a provider without a fingerprint is recorded as fingerprint none', async () => {
+    await startWithProvider(scripted([snap('v1')]), 1000);
+    expect(metrics.setGauge).toHaveBeenCalledWith('ns_content_loaded', expect.any(Number), { provider: 'stub', version: 'v1', fingerprint: 'none' });
+  });
+
+  it('a missing file at start counts as a failed load', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    await startContent({ NS_CONTENT_FILE: '/nonexistent/content.json' });
+    expect(metrics.incr).toHaveBeenCalledWith('ns_content_load_failures_total', { provider: 'configmap' });
   });
 
   it('never throws when the file is missing at start; content stays unavailable', async () => {

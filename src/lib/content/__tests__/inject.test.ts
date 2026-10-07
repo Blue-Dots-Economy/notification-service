@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { parseContentDocument } from '../configmap';
-import { setContentForTests } from '../resolver';
+import { setContentForTests, shortFingerprint } from '../resolver';
 import { templateLocaleChain, withContent } from '../inject';
 
 const t = (variables: any[], locale = 'hi-IN') => ({ locale, variables }) as any;
@@ -16,7 +16,7 @@ describe('withContent', () => {
     load({ 'tnc.in_force.url': { hi: 'https://example.org/hi/tnc', en: 'https://example.org/tnc' } });
     const out = withContent(t([name, tnc]), { name: 'Asha' });
     expect(out.input).toEqual({ name: 'Asha', tnc_url: 'https://example.org/hi/tnc' });
-    expect(out.refs).toEqual([{ key: 'tnc.in_force.url', version: 'v3', locale: 'hi' }]);
+    expect(out.refs).toEqual([{ key: 'tnc.in_force.url', version: 'v3', locale: 'hi', fingerprint: shortFingerprint('https://example.org/hi/tnc') }]);
   });
 
   it('caller cannot override content', () => {
