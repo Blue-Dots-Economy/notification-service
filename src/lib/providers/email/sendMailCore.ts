@@ -1,9 +1,14 @@
 import { SendEmailCommand, SESv2Client } from '@aws-sdk/client-sesv2';
-import nodemailer from 'nodemailer';
+import nodemailer, { type Transporter } from 'nodemailer';
 import SMTPTransport from 'nodemailer/lib/smtp-transport';
 import { providerTimeoutMs } from '../http';
 
-let transporter: nodemailer.Transporter<SMTPTransport.SentMessageInfo>;
+// Left on the default `SentMessageInfo` rather than the SMTP-specific one: this
+// holds an SES transport or an SMTP transport depending on config, and nodemailer
+// v10 gives those distinct info types. Only `messageId` is read from a send result,
+// which is on the shared base. v9's types conflated the two, so the narrower
+// annotation only ever looked correct.
+let transporter: Transporter;
 
 export interface Email_attachment {
   filename: string;

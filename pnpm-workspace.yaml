@@ -31,7 +31,13 @@ overrides:
   # leaves two patched copies instead of one, for no security gain.
   # signals-dpg and aggregator-dpg DO floor both lines, because both majors are
   # genuinely present there.
-  fast-uri@>=4.0.0 <4.1.3: 4.1.4
+  #
+  # Raised 4.1.4 -> 4.1.5: 4.1.4 itself carries CVE-2026-86472 and CVE-2026-86818
+  # (host-case normalization bypass, and mailto header injection via
+  # percent-encoded field-name desynchronization). Both fixed in 4.1.5. The
+  # selector is widened to <4.1.5 so it catches the 4.1.4 the previous pin
+  # produced, not just the versions below it.
+  fast-uri@>=4.0.0 <4.1.5: 4.1.5
   fast-xml-parser@<5.7.0: '>=5.7.0'
   fast-xml-parser@>=5.0.0 <5.3.5: '>=5.3.5'
   fast-xml-parser@>=5.0.0 <5.3.6: '>=5.3.6'
