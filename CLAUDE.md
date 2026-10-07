@@ -185,7 +185,7 @@ else the latest attempt (open first, then most recently completed: attempts shar
   `dispatching` stays open until Redis restarts: (a) the worker dies between the `BRPOP` from a
   priority queue and the `dispatching` stamp (due retries are moved back onto those queues by the
   `moveDueRetries` Lua script, which claims and re-pushes atomically, so a crash loses only the one
-  job that was popped, never a batch); (b) the API dies between the `/notify` record insert and
+  job that was popped, never a batch); (b) the API dies between the `/v1/notify` record insert and
   the `LPUSH`. It is not swept by age because a `queued` row can legitimately wait in a queue or the
   retry set for a long time, so age is no proof of loss and re-queueing would double-send. Closing
   it needs a claim written atomically with the pop (e.g. `BLMOVE` into a processing list, or a
