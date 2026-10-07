@@ -696,6 +696,18 @@ describe('v1 jobs', () => {
     await processJob(v1Job() as never);
     expect(queue.scheduleRetryWithMarker).toHaveBeenCalledWith(expect.objectContaining({ attempt: 1 }), 5, expect.anything());
     expect(queue.pushToPriorityWithMarker).not.toHaveBeenCalled();
+    expect(stamp.mock.calls.at(-1)?.[1]).toMatchObject({ status: 'queued', attemptNo: 2 });
+    expect(vi.mocked(queue.scheduleRetryWithMarker).mock.invocationCallOrder[0]!).toBeLessThan(
+      stamp.mock.invocationCallOrder.at(-1)!,
+    );
+  });
+
+  it('leaves a v1 row dispatching when scheduling the retry fails, so the stale sweep recovers it', async () => {
+    smsSendRendered.mockResolvedValueOnce({ ok: false, error: 'timeout' });
+    stamp.mockClear();
+    vi.mocked(queue.scheduleRetryWithMarker).mockRejectedValueOnce(new Error('redis down'));
+    await expect(processJob(v1Job() as never)).rejects.toThrow('redis down');
+    expect(stamp.mock.calls.map((c) => (c[1] as { status: string }).status)).toEqual(['dispatching']);
   });
 
   it('first_available falls through on permanent failure', async () => {

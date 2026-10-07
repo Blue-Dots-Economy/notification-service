@@ -339,8 +339,10 @@ async function processV1Job(job: Job) {
   const delay = 5 * Math.pow(2, job.attempt - 1);
   if (wouldExpire(job, delay * 1000)) return expire(job, job.attempt, res.error);
   console.log(`Retry scheduled in ${delay}s:`, job.job_id);
+  // MULTI first, then the `queued` stamp, as on the legacy path (see processJob):
+  // the row stays `dispatching` until the retry is in Redis, so the stale sweep covers a crash.
+  await scheduleRetryWithMarker(job, delay, attemptMarker(job, 'retry', job.attempt + 1));
   await stamp(job, { status: 'queued', attemptNo: job.attempt + 1, error: res.error });
-  return scheduleRetryWithMarker(job, delay, attemptMarker(job, 'retry', job.attempt + 1));
 }
 
 /**
