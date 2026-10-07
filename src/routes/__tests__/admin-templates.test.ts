@@ -89,6 +89,14 @@ describe('admin template routes', () => {
     expect(codes).toEqual([404, 409, 422, 503]);
   });
 
+  it('refuses to retire a template an active policy still needs with 409 template_in_use', async () => {
+    repo.retireTemplate.mockRejectedValueOnce(new TemplateError('template_in_use', 'x', { policy_ids: ['p1'] }));
+    const app = await build();
+    const res = await app.inject({ method: 'POST', url: `/v1/admin/templates/${ID}/retire`, headers: admin });
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({ error: 'template_in_use', details: { policy_ids: ['p1'] } });
+  });
+
   it('answers a database failure with 503 and never leaks the query or its params', async () => {
     const drizzleErr = Object.assign(
       new Error('Failed query: insert into "template" ("body_text") values ($1)\nparams: SECRET-BODY'),

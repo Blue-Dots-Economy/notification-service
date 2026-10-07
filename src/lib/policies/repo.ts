@@ -3,7 +3,7 @@ import { getDb } from '../db/client';
 import { notificationPolicy, type LifecycleStatus, type PolicyChannel, type PolicyMode, type PolicyRow } from '../db/schema';
 import { currentNetwork } from '../network';
 import { TemplateError } from '../templates/errors';
-import { hasActiveTemplate } from '../templates/repo';
+import { lockTemplateRefs, resolveTemplate } from '../templates/repo';
 import { channelVendor } from '../templates/vendors';
 
 export interface PolicyDraftInput {
@@ -63,17 +63,31 @@ export async function updatePolicyDraft(id: string, patch: { mode?: PolicyMode; 
   });
 }
 
-async function validatePolicy(p: PolicyRow): Promise<void> {
+/**
+ * Every channel must resolve the way a send resolves it: an active template
+ * for the deployment's vendor on the default-locale chain. Holds the template
+ * ref locks for the rest of the transaction, so a concurrent retire of a
+ * template this policy needs waits and then sees the policy.
+ */
+async function validatePolicy(tx: Tx, p: PolicyRow): Promise<void> {
   if (p.channels.length === 0) throw new TemplateError('incomplete_template', 'a policy needs at least one channel');
   const seen = new Set<string>();
   for (const c of p.channels) {
     if (seen.has(c.channel)) throw new TemplateError('invalid_contract', `channel ${c.channel} listed twice`);
     seen.add(c.channel);
     if (!channelVendor(c.channel)) throw new TemplateError('unknown_channel', `no provider for channel ${c.channel}`);
-    if (!(await hasActiveTemplate(c.channel, c.template_key))) {
-      throw new TemplateError('incomplete_template', `no active ${c.channel} template ${c.template_key}`, {
-        channel: c.channel, template_key: c.template_key,
-      });
+  }
+  await lockTemplateRefs(tx, p.channels);
+  for (const c of p.channels) {
+    try {
+      await resolveTemplate(c.channel, c.template_key, undefined, tx);
+    } catch (e) {
+      if (!(e instanceof TemplateError)) throw e;
+      const details = { channel: c.channel, template_key: c.template_key };
+      if (e.code === 'not_found') {
+        throw new TemplateError('incomplete_template', `no active ${c.channel} template ${c.template_key}`, details);
+      }
+      throw new TemplateError(e.code, e.message, details);
     }
   }
 }
@@ -84,7 +98,7 @@ export async function publishPolicy(id: string, actor: string): Promise<PolicyRo
     await lockScope(tx, peek.network, peek.domain, peek.eventType);
     const current = await loadForUpdate(tx, id);
     if (current.status !== 'draft') throw new TemplateError('invalid_state', `only drafts can be published; this one is ${current.status}`);
-    await validatePolicy(current);
+    await validatePolicy(tx, current);
     const now = new Date();
     await tx
       .update(notificationPolicy)

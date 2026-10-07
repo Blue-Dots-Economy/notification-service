@@ -1,6 +1,6 @@
 import { and, eq, inArray, max, sql } from 'drizzle-orm';
 import { getDb } from '../db/client';
-import { template, type LifecycleStatus, type TemplateRow, type VariableSpec } from '../db/schema';
+import { notificationPolicy, template, type LifecycleStatus, type TemplateRow, type VariableSpec } from '../db/schema';
 import { currentNetwork, defaultLocale } from '../network';
 import { TemplateError } from './errors';
 import { validateForPublish } from './validate';
@@ -32,6 +32,19 @@ async function lockKey(tx: Tx, network: string, channel: string, key: string, lo
   await tx.execute(
     sql`SELECT pg_advisory_xact_lock(hashtext(${`template:${network}:${channel}:${key}:${locale}`}))`,
   );
+}
+
+type Executor = ReturnType<typeof getDb> | Tx;
+
+/**
+ * Serialise policy publish against template retire for one (channel, key):
+ * whichever commits second sees the other's result, so a policy can neither go
+ * live on a template being retired nor keep one retired under it.
+ */
+export async function lockTemplateRefs(tx: Tx, refs: { channel: string; template_key: string }[]): Promise<void> {
+  const network = currentNetwork();
+  const keys = [...new Set(refs.map((r) => `template-ref:${network}:${r.channel}:${r.template_key}`))].sort();
+  for (const k of keys) await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${k}))`);
 }
 
 async function loadForUpdate(tx: Tx, id: string): Promise<TemplateRow> {
@@ -126,18 +139,50 @@ export async function publishTemplate(id: string, actor: string): Promise<Templa
   });
 }
 
+/**
+ * Retire a template. Refuses with `template_in_use` when an active policy
+ * names its (channel, key) and, with this row gone, that key would no longer
+ * resolve the way a send resolves it (default-locale chain + vendor).
+ */
 export async function retireTemplate(id: string): Promise<TemplateRow> {
   return getDb().transaction(async (tx) => {
     const current = await loadForUpdate(tx, id);
     if (current.status === 'retired') throw new TemplateError('invalid_state', 'already retired');
+    if (current.status === 'active') await lockTemplateRefs(tx, [{ channel: current.channel, template_key: current.templateKey }]);
     const now = new Date();
     const [row] = await tx
       .update(template)
       .set({ status: 'retired', retiredAt: now, updatedAt: now })
       .where(eq(template.id, id))
       .returning();
+    if (current.status === 'active') await assertNotNeededByActivePolicy(tx, current);
     return row!;
   });
+}
+
+async function assertNotNeededByActivePolicy(tx: Tx, t: TemplateRow): Promise<void> {
+  const ref = JSON.stringify([{ channel: t.channel, template_key: t.templateKey }]);
+  const dependents = await tx
+    .select({ id: notificationPolicy.id })
+    .from(notificationPolicy)
+    .where(
+      and(
+        eq(notificationPolicy.network, t.network),
+        eq(notificationPolicy.status, 'active'),
+        sql`${notificationPolicy.channels} @> ${ref}::jsonb`,
+      ),
+    );
+  if (dependents.length === 0) return;
+  try {
+    await resolveTemplate(t.channel, t.templateKey, undefined, tx);
+  } catch (e) {
+    if (!(e instanceof TemplateError)) throw e;
+    throw new TemplateError(
+      'template_in_use',
+      `active policies still send ${t.channel} ${t.templateKey}; publish a replacement or retire them first`,
+      { channel: t.channel, template_key: t.templateKey, policy_ids: dependents.map((d) => d.id) },
+    );
+  }
 }
 
 export async function getTemplate(id: string): Promise<TemplateRow> {
@@ -185,11 +230,12 @@ export async function resolveTemplate(
   channel: string,
   templateKey: string,
   locale?: string,
+  db: Executor = getDb(),
 ): Promise<{ template: TemplateRow; renders: 'ns' | 'provider' }> {
   const vendor = channelVendor(channel);
   if (!vendor) throw new TemplateError('unknown_channel', `no provider for channel ${channel}`);
   const chain = localeChain(locale);
-  const rows = await getDb()
+  const rows = await db
     .select()
     .from(template)
     .where(

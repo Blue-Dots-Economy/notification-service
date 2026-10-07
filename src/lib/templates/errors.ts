@@ -1,6 +1,7 @@
 export type TemplateErrorCode =
   | 'not_found'
   | 'invalid_state'
+  | 'template_in_use'
   | 'unknown_channel'
   | 'vendor_mismatch'
   | 'incomplete_template'

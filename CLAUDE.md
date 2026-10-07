@@ -340,8 +340,13 @@ non-GSM variable cannot push a TXT-sized body past the UNI limit. Vendor-rendere
 provider template id and the validated variables.
 
 **Policies.** `resolvePolicy` picks the most specific active row: `(domain, event)` → `(any, event)`
-→ `(domain, any)` → `(any, any)` default. Publish requires an active template for every channel
-listed, checked at publish only: a template retired later surfaces as an error at send time.
+→ `(domain, any)` → `(any, any)` default. Publish requires every channel listed to resolve exactly as
+a send does (`resolveTemplate` on the default-locale chain, current vendor), inside the publish
+transaction: no row → `incomplete_template`, another vendor's row → `vendor_mismatch`. The reverse
+holds too: retiring an **active** template an active policy names answers `409 template_in_use`
+(`details.policy_ids`) unless the key still resolves without it. Both take a per-`(channel, key)`
+advisory lock (`lockTemplateRefs`), so a concurrent publish and retire cannot both win. A vendor
+switch can still leave a live policy on another vendor's template; that surfaces at send time.
 `planDelivery(policy, contacts)` filters the channel list by what the caller supplied (email needs
 an email address; sms and whatsapp need a phone) because NS holds no user directory. `first_available`
 tries candidates in order; `all` fans out.
@@ -353,7 +358,7 @@ carry. Interim until Keycloak admin roles (#62). **Keep `NS_ADMIN_KEY_IDS` empty
 until HMAC v2 (#62) signs request bodies**: the current signature covers method, path, timestamp and
 nonce but not the body, so whoever can see a signed admin request in flight can send a different
 template or policy under its headers. Request bodies (including each variable spec) are strict, so unknown keys → `400`; list query params are not strict.
-Errors: `404 not_found`, `409 invalid_state`, `422` for any other rule violation, `503
+Errors: `404 not_found`, `409 invalid_state` / `template_in_use`, `422` for any other rule violation, `503
 network_not_configured`, and `503 database_unavailable` for anything else (`sendAdminError`). That
 last path logs only `describeDbError(err)` and returns a fixed body: a `DrizzleQueryError` message
 embeds the SQL and every bound parameter (template bodies included), so it must never reach Fastify's

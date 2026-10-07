@@ -202,17 +202,18 @@ unknown keys return `400`.
 | GET | `/v1/admin/templates/:id` | Fetch one |
 | PATCH | `/v1/admin/templates/:id` | Edit a draft |
 | POST | `/v1/admin/templates/:id/publish` | Validate, activate, retire the previous active version |
-| POST | `/v1/admin/templates/:id/retire` | Retire |
+| POST | `/v1/admin/templates/:id/retire` | Retire (`409 template_in_use` while an active policy needs it) |
 | POST | `/v1/admin/templates/:id/preview` | Render with `{ "variables": {...} }`; any status, sends nothing |
 | GET | `/v1/admin/policies` | List (`domain`, `event_type`, `status` filters) |
 | POST | `/v1/admin/policies` | Create a draft (`201`) |
 | GET | `/v1/admin/policies/:id` | Fetch one |
 | PATCH | `/v1/admin/policies/:id` | Edit a draft |
-| POST | `/v1/admin/policies/:id/publish` | Activate (needs an active template per channel) |
+| POST | `/v1/admin/policies/:id/publish` | Activate (every channel must resolve to an active template for the current vendor, default locale) |
 | POST | `/v1/admin/policies/:id/retire` | Retire |
 
 Errors: `404 not_found`, `409 invalid_state` (active and retired rows are immutable; create a new
-draft), `422` for any other rule violation (`error` holds the code, `message` names variables and
+draft), `409 template_in_use` (retiring a template an active policy still resolves to; publish a
+replacement or retire the policy first), `422` for any other rule violation (`error` holds the code, `message` names variables and
 never their values).
 
 Create, preview and publish an email template:

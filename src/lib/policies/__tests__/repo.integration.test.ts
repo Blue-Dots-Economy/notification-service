@@ -7,7 +7,7 @@ vi.mock('../../templates/vendors', () => ({
 
 import { closeDb, getPool } from '../../db/client';
 import { runMigrations } from '../../db/migrate';
-import { createTemplateDraft, publishTemplate } from '../../templates/repo';
+import { createTemplateDraft, getTemplate, listTemplates, publishTemplate, retireTemplate } from '../../templates/repo';
 import { createPolicyDraft, getPolicy, listPolicies, publishPolicy, resolvePolicy, retirePolicy, updatePolicyDraft } from '../repo';
 import { TemplateError } from '../../templates/errors';
 
@@ -35,6 +35,20 @@ describe('policy repository', () => {
     const p = await createPolicyDraft({ eventType: 'apply', mode: 'all', channels: [{ channel: 'email', template_key: 'nope' }] }, 'a');
     expect(await codeOf(publishPolicy(p.id, 'a'))).toBe('incomplete_template');
     expect((await getPolicy(p.id)).status).toBe('draft');
+  });
+
+  it('publish resolves templates like a send: another vendor\'s active row does not count', async () => {
+    await getPool().query(`UPDATE template SET provider = 'pinnacle' WHERE template_key = 'otp_sms'`);
+    const p = await createPolicyDraft({ eventType: 'apply', mode: 'all', channels: sms }, 'a');
+    expect(await codeOf(publishPolicy(p.id, 'a'))).toBe('vendor_mismatch');
+    expect((await getPolicy(p.id)).status).toBe('draft');
+  });
+
+  it('publish resolves templates like a send: a non-default locale alone does not count', async () => {
+    const t = await createTemplateDraft({ channel: 'sms', templateKey: 'hi_only', locale: 'hi', providerTemplateId: 'flow-hi' }, 'a');
+    await publishTemplate(t.id, 'a');
+    const p = await createPolicyDraft({ eventType: 'apply', mode: 'all', channels: [{ channel: 'sms', template_key: 'hi_only' }] }, 'a');
+    expect(await codeOf(publishPolicy(p.id, 'a'))).toBe('incomplete_template');
   });
 
   it('rejects empty, duplicated and unknown channels', async () => {
@@ -79,5 +93,37 @@ describe('policy repository', () => {
     await Promise.all([publishPolicy(a.id, 'x'), publishPolicy(b.id, 'y')]);
     expect(await listPolicies({ eventType: 'apply', status: 'active' })).toHaveLength(1);
     expect(await listPolicies({ eventType: 'apply', status: 'retired' })).toHaveLength(1);
+  });
+});
+
+describe('template retire vs dependent policies', () => {
+  const otp = async () => (await listTemplates({ templateKey: 'otp_sms', status: 'active' }))[0]!;
+
+  it('refuses to retire the template an active policy resolves to', async () => {
+    const pol = await active(null, 'apply');
+    const t = await otp();
+    const err = await retireTemplate(t.id).catch((e: TemplateError) => e);
+    expect(err).toBeInstanceOf(TemplateError);
+    expect((err as TemplateError).code).toBe('template_in_use');
+    expect((err as TemplateError).details).toMatchObject({ policy_ids: [pol.id] });
+    expect((await getTemplate(t.id)).status).toBe('active');
+  });
+
+  it('allows the retire once the policy is retired, and for unreferenced templates', async () => {
+    const pol = await active(null, 'apply');
+    await retirePolicy(pol.id);
+    expect((await retireTemplate((await otp()).id)).status).toBe('retired');
+    const other = await createTemplateDraft({ channel: 'sms', templateKey: 'unused', providerTemplateId: 'f' }, 'a');
+    await publishTemplate(other.id, 'a');
+    expect((await retireTemplate(other.id)).status).toBe('retired');
+  });
+
+  it('allows retiring a row the policy does not resolve to (another locale, or a draft)', async () => {
+    await active(null, 'apply');
+    const hi = await createTemplateDraft({ channel: 'sms', templateKey: 'otp_sms', locale: 'hi', providerTemplateId: 'flow-hi' }, 'a');
+    await publishTemplate(hi.id, 'a');
+    expect((await retireTemplate(hi.id)).status).toBe('retired');
+    const draft = await createTemplateDraft({ channel: 'sms', templateKey: 'otp_sms', providerTemplateId: 'flow-2' }, 'a');
+    expect((await retireTemplate(draft.id)).status).toBe('retired');
   });
 });
