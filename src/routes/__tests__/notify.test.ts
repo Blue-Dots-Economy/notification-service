@@ -2,12 +2,26 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Auth, dedupe and Redis each have their own tests; this file is about what the
 // /notify route accepts and — crucially — what it refuses to enqueue.
-vi.mock('../../plugins/request-auth', () => ({ requestAuth: async () => {} }));
+const auth = vi.hoisted(() => ({
+  authenticate: vi.fn((_opts: unknown) => async (req: any) => {
+    req.principal = { kind: 'hmac', id: 'test-key', scopes: new Set(['notify:send', 'templates:admin']) };
+  }),
+}));
+vi.mock('../../plugins/auth', () => auth);
 // Only the Redis SET NX is doubled. `buildDedupeKey` lives in its own
 // dependency-free module and is used for real, so these tests exercise the key
 // the route actually derives.
 const dedupe = vi.fn(async (_key: string, _ttl?: number) => true);
-vi.mock('../../lib/dedupe', () => ({ dedupe: (key: string, ttl?: number) => dedupe(key, ttl) }));
+const releaseDedupe = vi.fn(async (_key: string) => {});
+vi.mock('../../lib/dedupe', () => ({
+  dedupe: (key: string, ttl?: number) => dedupe(key, ttl),
+  releaseDedupe: (key: string) => releaseDedupe(key),
+}));
+
+const { recordAccepted } = vi.hoisted(() => ({ recordAccepted: vi.fn(async (_rec: unknown) => {}) }));
+vi.mock('../../lib/audit/store', () => ({ recordAccepted }));
+const { stamp } = vi.hoisted(() => ({ stamp: vi.fn(async (_job: unknown, _u: unknown) => {}) }));
+vi.mock('../../lib/audit/stamp', () => ({ stamp }));
 
 const pushRealtime = vi.fn(async () => {});
 const pushOther = vi.fn(async () => {});
@@ -61,10 +75,10 @@ const body = (variables: Record<string, unknown> = {}) => ({
   },
 });
 
-const post = async (payload: unknown) => {
+const post = async (payload: unknown, headers: Record<string, string> = {}) => {
   const app = await buildApp();
   try {
-    return await app.inject({ method: 'POST', url: '/notify', payload: payload as object });
+    return await app.inject({ method: 'POST', url: '/notify', payload: payload as object, headers });
   } finally {
     await app.close();
   }
@@ -74,6 +88,7 @@ beforeEach(() => {
   pushRealtime.mockClear();
   pushOther.mockClear();
   dedupe.mockClear();
+  releaseDedupe.mockReset().mockResolvedValue(undefined);
   dedupe.mockImplementation(async () => true);
 });
 
@@ -161,5 +176,137 @@ describe('POST /notify — duplicate suppression (#88)', () => {
     expect(res.statusCode).toBe(409);
     expect(res.json()).toMatchObject({ enqueued: false, reason: 'duplicate-fallback' });
     expect(pushOther).not.toHaveBeenCalled();
+  });
+});
+
+// Request auth is mocked above, so a "signed" notify is a plain inject.
+const signedNotify = (payload: unknown) => post(payload);
+
+describe('/notify audit', () => {
+  beforeEach(() => recordAccepted.mockReset().mockResolvedValue(undefined));
+
+  it('records a normal send before queueing it, with audit ids on the job', async () => {
+    const res = await signedNotify(body());
+    expect(res.statusCode).toBe(200);
+    expect(recordAccepted).toHaveBeenCalledTimes(1);
+    expect(recordAccepted.mock.calls[0]![0]).toMatchObject({ source: 'hmac:test-key' });
+    expect(auth.authenticate).toHaveBeenCalledWith({ scope: 'notify:send', legacyHmacV1: true });
+    const queued = (pushOther.mock.calls[0] as unknown as [{ audit: unknown }])[0];
+    expect(queued.audit).toMatchObject({ eventId: expect.any(String), attemptId: expect.any(String) });
+    expect(recordAccepted.mock.invocationCallOrder[0]).toBeLessThan(
+      pushOther.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it('returns 503 when the record fails, and queues nothing', async () => {
+    recordAccepted.mockRejectedValueOnce(new Error('db down'));
+    const res = await signedNotify(body());
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toEqual({ error: 'audit store unavailable', enqueued: false });
+    expect(pushOther).not.toHaveBeenCalled();
+  });
+
+  it('marks realtime jobs redactValues=true and normal jobs false, on the queued job', async () => {
+    await signedNotify({ ...body(), priority: 'realtime' });
+    await signedNotify(body({ subject: 'other one' }));
+    const rt = (pushRealtime.mock.calls[0] as unknown as [{ audit: { redactValues: boolean } }])[0];
+    const ot = (pushOther.mock.calls[0] as unknown as [{ audit: { redactValues: boolean } }])[0];
+    expect(rt.audit.redactValues).toBe(true);
+    expect(ot.audit.redactValues).toBe(false);
+  });
+
+  it('redacts an OTP template sent without priority: the code is never persisted (spec: OTPs never stored)', async () => {
+    const res = await signedNotify({ ...body({ otp: '482913' }), template_id: 'login_otp' });
+    expect(res.statusCode).toBe(200);
+    const queued = (pushOther.mock.calls[0] as unknown as [{ audit: { redactValues: boolean } }])[0];
+    expect(queued.audit.redactValues).toBe(true);
+    const rec = recordAccepted.mock.calls[0]![0] as { payload: unknown; job?: unknown; recoverable: boolean };
+    expect(JSON.stringify(rec)).not.toContain('482913');
+    expect(rec.job).toBeUndefined();
+    expect(rec.recoverable).toBe(false);
+  });
+
+  it('gives a realtime job a deadline about 600s out, and an other job none', async () => {
+    const before = Date.now();
+    await signedNotify({ ...body(), priority: 'realtime' });
+    await signedNotify(body({ subject: 'other two' }));
+    const rt = (pushRealtime.mock.calls[0] as unknown as [{ deadline?: number }])[0];
+    const ot = (pushOther.mock.calls[0] as unknown as [{ deadline?: number }])[0];
+    expect(Math.abs(rt.deadline! - (before + 600_000))).toBeLessThan(5000);
+    expect(ot.deadline).toBeUndefined();
+  });
+
+  it('realtime still enqueues when the audit insert fails', async () => {
+    recordAccepted.mockRejectedValueOnce(new Error('db down'));
+    const res = await signedNotify({ ...body(), priority: 'realtime' });
+    expect(res.statusCode).toBe(200);
+    expect(pushRealtime).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases the dedupe claim on 503, so the same request is accepted on retry', async () => {
+    const claimed = new Set<string>();
+    dedupe.mockImplementation(async (k: string) => !claimed.has(k) && !!claimed.add(k));
+    releaseDedupe.mockImplementation(async (k: string) => void claimed.delete(k));
+    const payload = { ...body(), dedupe_id: 'x-1' };
+
+    recordAccepted.mockRejectedValueOnce(new Error('db down'));
+    expect((await signedNotify(payload)).statusCode).toBe(503);
+    expect(releaseDedupe).toHaveBeenCalledWith('x-1');
+
+    const retry = await signedNotify(payload);
+    expect(retry.statusCode).toBe(200);
+    expect(retry.json()).toMatchObject({ enqueued: true });
+    expect(recordAccepted).toHaveBeenCalledTimes(2);
+    expect(pushOther).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks the recorded attempt failed when the enqueue fails, and still fails the request', async () => {
+    stamp.mockClear();
+    pushOther.mockRejectedValueOnce(new Error('redis down'));
+    const res = await signedNotify(body());
+    expect(res.statusCode).toBe(500);
+    expect(recordAccepted).toHaveBeenCalledTimes(1);
+    expect(stamp).toHaveBeenCalledTimes(1);
+    const [job, update] = stamp.mock.calls[0]!;
+    expect(update).toEqual({ status: 'failed', attemptNo: 1, error: 'enqueue failed' });
+    expect((job as { audit: { attemptId: string } }).audit.attemptId).toEqual(expect.any(String));
+  });
+
+  it('caps x-correlation-id at 128 chars and falls back to job_id when blank', async () => {
+    await post(body(), { 'x-correlation-id': 'c'.repeat(500) });
+    await post(body({ subject: 'two' }), { 'x-correlation-id': '   ' });
+    await post(body({ subject: 'three' }), { 'x-correlation-id': ' corr-7 ' });
+    const audits = pushOther.mock.calls.map((c) => (c as unknown as [{ job_id: string; audit: { correlationId: string } }])[0]);
+    expect(audits[0]!.audit.correlationId).toBe('c'.repeat(128));
+    expect(audits[1]!.audit.correlationId).toBe(audits[1]!.job_id);
+    expect(audits[2]!.audit.correlationId).toBe('corr-7');
+  });
+
+  it('releases the dedupe claim when the enqueue fails, so the same dedupe_id is accepted again', async () => {
+    const claimed = new Set<string>();
+    dedupe.mockImplementation(async (k: string) => !claimed.has(k) && !!claimed.add(k));
+    releaseDedupe.mockImplementation(async (k: string) => void claimed.delete(k));
+    const payload = { ...body(), dedupe_id: 'enq-1' };
+
+    pushOther.mockRejectedValueOnce(new Error('redis down'));
+    expect((await signedNotify(payload)).statusCode).toBe(500);
+    expect(releaseDedupe).toHaveBeenCalledWith('enq-1');
+
+    const retry = await signedNotify(payload);
+    expect(retry.statusCode).toBe(200);
+    expect(retry.json()).toMatchObject({ enqueued: true });
+  });
+
+  it('still fails the request when the enqueue fails and releasing the claim fails too', async () => {
+    pushOther.mockRejectedValueOnce(new Error('redis down'));
+    releaseDedupe.mockRejectedValueOnce(new Error('redis down'));
+    expect((await signedNotify(body())).statusCode).toBe(500);
+  });
+
+  it('still answers 503 when releasing the claim fails', async () => {
+    recordAccepted.mockRejectedValueOnce(new Error('db down'));
+    releaseDedupe.mockRejectedValueOnce(new Error('redis down'));
+    const res = await signedNotify(body());
+    expect(res.statusCode).toBe(503);
   });
 });

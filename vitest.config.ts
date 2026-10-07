@@ -4,6 +4,9 @@ export default defineConfig({
   test: {
     // Node, not jsdom: this is a Fastify service with no DOM anywhere.
     environment: 'node',
+    // Unit tests run without a Redis password; the real client module is only
+    // constructed under this opt-out.
+    env: { REDIS_ALLOW_NO_AUTH: 'true' },
     include: ['src/**/*.test.ts'],
     // Redis is faked (src/lib/__tests__/redis-fake.ts), so nothing here needs a
     // server or Docker — keep it that way, and add any real-Redis coverage as a

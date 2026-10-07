@@ -89,6 +89,29 @@ const HELP: Record<string, [type: string, help: string]> = {
   ns_sms_send_total: ['counter', 'SMS sends attempted, by provider and outcome.'],
   ns_sms_provider_error_total: ['counter', 'SMS provider error responses, by provider and code.'],
   ns_job_dlq_total: ['counter', 'Jobs dead-lettered, by channel and reason.'],
+  ns_job_expired_total: ['counter', 'Jobs that passed their deadline and were never sent, by channel.'],
+  ns_job_dropped_total: [
+    'counter',
+    'Redacted (OTP) jobs that failed and were deliberately not dead-lettered, by channel and reason.',
+  ],
+  ns_rate_limited_total: ['counter', 'Sends deferred because no vendor token was available, by channel and priority.'],
+  ns_send_rejected_total: ['counter', 'POST /v1/notify sends refused at planning, by kind and code.'],
+  ns_send_fallthrough_total: [
+    'counter',
+    'first_available sends that moved to their next channel after a delivery failed, by from and to channel.',
+  ],
+  ns_audit_write_failures_total: [
+    'counter',
+    'Best-effort audit status writes that failed, by stage (the status being written).',
+  ],
+  ns_recovery_abandoned_total: [
+    'counter',
+    'Open recoverable attempts older than RECOVERY_MAX_AGE_HOURS marked failed by recovery instead of re-sent.',
+  ],
+  ns_partition_default_rows: [
+    'gauge',
+    '1 when a partitioned table\'s default partition is non-empty, 0 otherwise, by parent. Non-empty blocks partition pre-making for that range.',
+  ],
   ns_provider_balance: ['gauge', 'Provider account balance, where the provider exposes one.'],
   ns_provider_balance_updated_at: [
     'gauge',
@@ -97,6 +120,14 @@ const HELP: Record<string, [type: string, help: string]> = {
   ns_provider_balance_poll_failures_total: [
     'counter',
     'Balance polls that failed, by provider and reason.',
+  ],
+  ns_content_load_failures_total: [
+    'counter',
+    'Content loads (boot or reload) that failed, by provider. The last good content keeps being served.',
+  ],
+  ns_content_loaded: [
+    'gauge',
+    'Unix time of the latest successful load of this content (version, fingerprint = first 12 hex of the file sha256), by provider. Alert on staleness.',
   ],
   ns_queue_depth: ['gauge', 'Jobs currently in each queue.'],
   ns_retry_eta_seconds: ['gauge', 'Seconds until the oldest scheduled retry is due.'],
@@ -140,7 +171,7 @@ export async function renderPrometheus(
   }
 
   // Queue depths are read live, so a scrape always reflects the real backlog.
-  for (const q of ['realtime', 'other', 'retry_count', 'dlq'] as const) {
+  for (const q of ['realtime', 'other', 'bulk', 'retry_count', 'dlq'] as const) {
     const value = queue[q];
     if (typeof value === 'number') {
       push('ns_queue_depth', formatSeries('ns_queue_depth', { queue: q }, value));

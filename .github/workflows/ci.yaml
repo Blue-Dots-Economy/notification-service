@@ -77,6 +77,20 @@ jobs:
       - name: Test
         run: pnpm test
 
+      # Service containers cannot be built, and stock Postgres lacks pg_partman,
+      # so the integration suite's Postgres is built and started here. The probe
+      # uses -h 127.0.0.1 (TCP): the image's first-boot init server listens on the
+      # unix socket only, so a socket probe would report ready before init.sql ran.
+      - name: Start Postgres (pg_partman)
+        run: |
+          docker build -t ns-postgres docker/postgres
+          docker run -d --name ns-postgres -e POSTGRES_PASSWORD=postgres -p 5432:5432 ns-postgres
+          for i in $(seq 1 30); do
+            docker exec ns-postgres pg_isready -h 127.0.0.1 -U postgres -d notification && exit 0
+            sleep 2
+          done
+          docker logs ns-postgres; exit 1
+
       # Against the `redis` service above. Kept separate from `pnpm test` so the
       # fast suite stays runnable anywhere, including machines without Docker.
       - name: Test (integration, real Redis)
@@ -85,6 +99,11 @@ jobs:
           REDIS_HOST: 127.0.0.1
           REDIS_PORT: 6379
           REDIS_PASSWORD: ''
+          REDIS_ALLOW_NO_AUTH: 'true'
+          DATABASE_HOST: 127.0.0.1
+          DATABASE_NAME: notification
+          DATABASE_USER: notification
+          DATABASE_PASSWORD: notification
 
   # ── PR-path image smoke build (#756) ───────────────────────────────────────
   # Restores the review-time Dockerfile check that notification-image-build.yaml

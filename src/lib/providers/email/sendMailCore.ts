@@ -1,6 +1,7 @@
 import { SendEmailCommand, SESv2Client } from '@aws-sdk/client-sesv2';
 import nodemailer, { type Transporter } from 'nodemailer';
 import SMTPTransport from 'nodemailer/lib/smtp-transport';
+import { providerTimeoutMs } from '../http';
 
 // Left on the default `SentMessageInfo` rather than the SMTP-specific one: this
 // holds an SES transport or an SMTP transport depending on config, and nodemailer
@@ -22,7 +23,9 @@ interface Email_request {
   replyTo?: string;
   to: string;
   subject: string;
-  html: string;
+  /** Legacy /notify always sends `html`; v1 (sendRendered) sends `html` and/or `text`. */
+  html?: string;
+  text?: string;
   activationUrl?: string;
   cc?: string;
   attachments?: Email_attachment[];
@@ -50,6 +53,7 @@ const GMAIL_HOST = 'smtp.gmail.com';
 /** The SMTP connection, resolved from the environment. `SMTP_HOST` selects it (#112). */
 function resolveSmtp(): SMTPTransport.Options | undefined {
   if (!SMTP_HOST) return undefined;
+  const timeout = providerTimeoutMs();
 
   // 587 + STARTTLS is the common third-party default, so never assume 465.
   const port = Number(SMTP_PORT) || 587;
@@ -61,6 +65,11 @@ function resolveSmtp(): SMTPTransport.Options | undefined {
     host: SMTP_HOST,
     port,
     secure,
+    // Bound every phase so a silent relay cannot hold the worker loop; a timeout
+    // fails the send, which the worker retries.
+    connectionTimeout: timeout,
+    greetingTimeout: timeout,
+    socketTimeout: timeout,
     // An `auth` with undefined members still attempts AUTH, so omit it entirely.
     ...(SMTP_USER && SMTP_PASS ? { auth: { user: SMTP_USER, pass: SMTP_PASS } } : {}),
   };
@@ -84,8 +93,10 @@ async function initTransporter() {
 
   if (useSes) {
     try {
+      const timeout = providerTimeoutMs();
       const sesClient = new SESv2Client({
         region: AWS_REGION!,
+        requestHandler: { requestTimeout: timeout, connectionTimeout: timeout },
         credentials: {
           accessKeyId: AWS_ACCESS_KEY_ID!,
           secretAccessKey: AWS_SECRET_ACCESS_KEY!,
@@ -121,6 +132,7 @@ export async function sendMail({
   to,
   subject,
   html,
+  text,
   activationUrl,
   cc,
   attachments,
@@ -158,8 +170,13 @@ export async function sendMail({
       // legitimate unescaped `>` from visible copy — "Score > 90" became
       // "Score  90" and "A => B" became "A = B" — which silently corrupts the
       // plain-text body of ordinary mail. See the mailer test.
-      text: html.replace(/<[^>]+>/g, '').replace(/</g, ''),
-      html,
+      //
+      // Without `text` (legacy /notify) this is exactly the original behaviour:
+      // text derived from `html`, `html` passed as given. sendRendered checks
+      // that a v1 email has a body before it gets here.
+      ...(text === undefined
+        ? { text: (html as string).replace(/<[^>]+>/g, '').replace(/</g, ''), html }
+        : { text, ...(html ? { html } : {}) }),
       // Decoded here rather than passing `encoding: 'base64'` so nodemailer
       // handles the transfer encoding itself for whatever transport is active
       // (the SES transport re-encodes into raw MIME).

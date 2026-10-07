@@ -6,12 +6,20 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     environment:
       SERVER_PORT: $SERVER_PORT
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_PASSWORD: $REDIS_PASSWORD
       INTERNAL_SECRETS_JSON: $INTERNAL_SECRETS_JSON
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      DATABASE_NAME: notification
+      DATABASE_USER: notification
+      DATABASE_PASSWORD: notification
+      DATABASE_SSL: disable
       #Providers
       SMTP_AWS_SES: ${SMTP_AWS_SES}
       AWS_REGION: ${AWS_REGION}
@@ -43,11 +51,13 @@ services:
     container_name: notification-service-redis
     image: redis:7
     restart: always
+    # noeviction (as on the shared production Redis): an eviction policy could
+    # drop the ns:epoch key and trigger a needless full re-queue.
     command:
       - sh
       - -c
       - >
-        exec redis-server --appendonly yes --appendfsync everysec --save "" --maxmemory ${REDIS_MAXMEMORY:-256mb} --maxmemory-policy ${REDIS_MAXMEMORY_POLICY:-allkeys-lru} ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
+        exec redis-server --appendonly yes --appendfsync everysec --save "" --maxmemory ${REDIS_MAXMEMORY:-256mb} --maxmemory-policy ${REDIS_MAXMEMORY_POLICY:-noeviction} ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
 
     healthcheck:
       test: ['CMD-SHELL', 'redis-cli ${REDIS_PASSWORD:+-a ${REDIS_PASSWORD}} ping | grep PONG']
@@ -58,6 +68,25 @@ services:
       - notification-service-redis:/data
     networks:
       - notification-service-net
+  postgres:
+    container_name: notification-service-postgres
+    build: ./docker/postgres
+    environment:
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      # -h 127.0.0.1 probes over TCP. The image's first-boot init server listens
+      # on the unix socket only, so a socket probe reports ready before init.sql
+      # has run.
+      test: ['CMD-SHELL', 'pg_isready -h 127.0.0.1 -U postgres -d notification']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - '5432:5432'
+    volumes:
+      - notification-service-postgres:/var/lib/postgresql/data
+    networks:
+      - notification-service-net
 networks:
   notification-service-net:
     name: notification-service-net
@@ -65,3 +94,5 @@ networks:
 volumes:
   notification-service-redis:
     name: notification-service-redis
+  notification-service-postgres:
+    name: notification-service-postgres
