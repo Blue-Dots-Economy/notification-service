@@ -295,7 +295,7 @@ describe('planSend — content_ref variables', () => {
     expect(plan.deliveries.map((d) => d.channel)).toEqual(['sms', 'email']);
     expect(plan.deliveries[0]!.rendered).toMatchObject({ mode: 'provider', variables: { name: 'A', tnc_url: 'https://example.org/tnc' } });
     expect(plan.deliveries[1]!.rendered).toMatchObject({ mode: 'ns', channel: 'email', text: 'Terms: https://example.org/tnc' });
-    for (const d of plan.deliveries) expect(d.contentRefs).toEqual([{ key: 'tnc.in_force.url', version: 'v3', locale: 'en' }]);
+    for (const d of plan.deliveries) expect(d.contentRefs).toEqual([{ key: 'tnc.in_force.url', version: 'v3', locale: 'en', fingerprint: fp12('https://example.org/tnc') }]);
   });
 
   it('an event send carrying a content variable name renders the content value, not the caller value', async () => {
@@ -304,7 +304,7 @@ describe('planSend — content_ref variables', () => {
     templates.resolveTemplate.mockResolvedValue({ template: tncSms, renders: 'provider' });
     const plan = await planSend(req({ event_type: 'tnc', to: { phone: '+919999999999' }, variables: { name: 'A', tnc_url: 'https://example.org/other' } }));
     expect(plan.deliveries[0]!.rendered).toMatchObject({ mode: 'provider', variables: { name: 'A', tnc_url: 'https://example.org/tnc' } });
-    expect(plan.deliveries[0]!.contentRefs).toEqual([{ key: 'tnc.in_force.url', version: 'v3', locale: 'en' }]);
+    expect(plan.deliveries[0]!.contentRefs).toEqual([{ key: 'tnc.in_force.url', version: 'v3', locale: 'en', fingerprint: fp12('https://example.org/tnc') }]);
   });
 
   it('first_available: when every candidate fails on content, the first configuration error is thrown', async () => {
