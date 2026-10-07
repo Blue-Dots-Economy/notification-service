@@ -498,7 +498,13 @@ response; a repeat while the first is in flight is `409 idempotency_in_progress`
 expire with the Redis window**: after 15 minutes the same key is a new send. A Postgres claim with no
 response older than 15 minutes is reclaimable (Redis expires by TTL). Completing the claim is retried
 once; if both tries fail the send still stands and the claim stays pending, so a repeat answers `409`
-until the 15-minute window makes it reclaimable. Any refusal after a claim releases it. Without a key,
+until the 15-minute window makes it reclaimable. Any refusal after a claim releases it. Because the two
+priorities claim in different stores, every claim also pins the key's priority in Redis
+(`idem-priority:<network>:<key>`, same 15-minute window, renewed when an urgent claim completes); a
+repeat at a different priority inside the window is `409 idempotency_key_priority_mismatch`, never a
+second send. Releasing a claim drops the pin. **Residual:** past the window the pin has expired with the
+urgent claim, so a repeat that switches between `urgent` and `normal`/`bulk` is a new send (`normal`
+and `bulk` share Postgres and still replay). Without a key,
 a 5-second content guard answers a repeat with `409 duplicate-fallback`.
 
 **Correlation id.** The body's `correlation_id` (trimmed, at most 128, else `400`) wins over the

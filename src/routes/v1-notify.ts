@@ -89,6 +89,8 @@ export async function v1NotifyRoutes(app: FastifyInstance) {
         const claim = await claimIdempotency(network, body.idempotency_key, priority);
         if (claim.status === 'replay') return reply.code(200).send(claim.response);
         if (claim.status === 'in_progress') return reply.code(409).send({ error: 'idempotency_in_progress' });
+        if (claim.status === 'priority_mismatch')
+          return reply.code(409).send({ error: 'idempotency_key_priority_mismatch' });
         releaseOnce = () => releaseIdempotency(network, body.idempotency_key!, priority);
       } else {
         const key = fallbackKey(body);

@@ -98,6 +98,15 @@ describe('POST /v1/notify', () => {
     expect(plan.planSend).not.toHaveBeenCalled();
   });
 
+  it('a key reused with a different priority is a 409 and plans nothing', async () => {
+    idem.claimIdempotency.mockResolvedValueOnce({ status: 'priority_mismatch' });
+    const res = await post({ ...body, priority: 'urgent', idempotency_key: 'k' });
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toEqual({ error: 'idempotency_key_priority_mismatch' });
+    expect(plan.planSend).not.toHaveBeenCalled();
+    expect(idem.releaseIdempotency).not.toHaveBeenCalled();
+  });
+
   it('a content repeat without a key is a 409 duplicate-fallback', async () => {
     dd.dedupe.mockResolvedValueOnce(false);
     const res = await post(body);

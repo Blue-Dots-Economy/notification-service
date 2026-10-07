@@ -9,7 +9,7 @@ beforeAll(async () => { await runMigrations(); });
 afterAll(async () => { await closeDb(); redis.disconnect(); });
 beforeEach(async () => {
   await getPool().query(`DELETE FROM idempotency_key`);
-  for (const k of await redis.keys('idem:*')) await redis.del(k);
+  for (const k of await redis.keys('idem*')) await redis.del(k);
 });
 
 describe.each(['realtime', 'other'] as const)('idempotency (%s)', (priority) => {
@@ -41,6 +41,38 @@ describe.each(['realtime', 'other'] as const)('idempotency (%s)', (priority) => 
   it('keys are scoped per network', async () => {
     await claimIdempotency('a', 'k4', priority);
     expect(await claimIdempotency('b', 'k4', priority)).toEqual({ status: 'fresh' });
+  });
+});
+
+describe('one priority per key (urgent claims in Redis, normal/bulk in Postgres)', () => {
+  it.each([
+    ['realtime', 'other'],
+    ['other', 'realtime'],
+    ['other', 'bulk'],
+  ] as const)('a %s claim makes a %s retry a priority_mismatch, pending or completed', async (first, second) => {
+    expect(await claimIdempotency('n', 'pm', first)).toEqual({ status: 'fresh' });
+    expect(await claimIdempotency('n', 'pm', second)).toEqual({ status: 'priority_mismatch' });
+    await completeIdempotency('n', 'pm', first, { notification_event_id: 'e' });
+    expect(await claimIdempotency('n', 'pm', second)).toEqual({ status: 'priority_mismatch' });
+    expect(await claimIdempotency('n', 'pm', first)).toEqual({ status: 'replay', response: { notification_event_id: 'e' } });
+  });
+
+  it('a released claim lets a retry use a different priority', async () => {
+    await claimIdempotency('n', 'pr', 'realtime');
+    await releaseIdempotency('n', 'pr', 'realtime');
+    expect(await claimIdempotency('n', 'pr', 'other')).toEqual({ status: 'fresh' });
+  });
+
+  it('concurrent claims with mixed priorities: exactly one fresh, never one per store', async () => {
+    const claims = await Promise.all(
+      Array.from({ length: 8 }, (_, i) => claimIdempotency('n', 'mix', i % 2 ? 'realtime' : 'other')),
+    );
+    expect(claims.filter((c) => c.status === 'fresh')).toHaveLength(1);
+  });
+
+  it('the marker is scoped per network', async () => {
+    await claimIdempotency('a', 'pn', 'realtime');
+    expect(await claimIdempotency('b', 'pn', 'other')).toEqual({ status: 'fresh' });
   });
 });
 

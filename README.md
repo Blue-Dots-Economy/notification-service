@@ -391,7 +391,7 @@ keys return `400`.
 | `202` | Accepted; delivery is asynchronous |
 | `400` | Invalid request or `invalid_deadline` |
 | `401` | Missing or invalid request signature |
-| `409` | `idempotency_in_progress`, or `duplicate-fallback` (same content within 5 s and no key) |
+| `409` | `idempotency_in_progress`; `idempotency_key_priority_mismatch` (the key was used at another priority in the last 15 minutes); or `duplicate-fallback` (same content within 5 s and no key) |
 | `422` | `{ error, kind, message, details? }`; `kind` is `caller` or `configuration` |
 | `503` | `network_not_configured`; `template store unavailable` (a template or policy not yet cached could not be read); or `audit store unavailable` (normal/bulk) |
 

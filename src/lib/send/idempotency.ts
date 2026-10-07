@@ -9,7 +9,9 @@ import type { V1Request } from './request';
 export type Claim =
   | { status: 'fresh' }
   | { status: 'replay'; response: Record<string, unknown> }
-  | { status: 'in_progress' };
+  | { status: 'in_progress' }
+  /** The key was claimed at another priority (and so possibly in the other store) within the window. */
+  | { status: 'priority_mismatch' };
 
 /** How long a claim may stay pending before it is treated as abandoned (Redis TTL and Postgres stale-reclaim). */
 const CLAIM_WINDOW_S = 15 * 60;
@@ -17,17 +19,40 @@ const PENDING = 'pending';
 /** Atomic compare-and-delete: only drop the key while it is still pending. */
 const RELEASE_LUA = `if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end`;
 const redisKey = (network: string, key: string) => `idem:${network}:${key}`;
+/** Which priority claimed the key. Written by every claim, so both stores check one place. */
+const priorityKey = (network: string, key: string) => `idem-priority:${network}:${key}`;
+
+/**
+ * Pin the key to one priority for the claim window. Urgent and normal/bulk claims
+ * live in different stores, so without this a retry that changes priority would
+ * find no claim and send again. Returns false if another priority holds the key.
+ * Beyond the window the marker has expired with the urgent claim (by design), so a
+ * cross-store retry is then a new send; normal and bulk share Postgres and replay.
+ */
+async function pinPriority(network: string, key: string, priority: Priority): Promise<boolean> {
+  const k = priorityKey(network, key);
+  if ((await redis.set(k, priority, 'EX', CLAIM_WINDOW_S, 'NX')) === 'OK') return true;
+  const held = await redis.get(k);
+  if (held === null) return pinPriority(network, key, priority); // expired between the two calls
+  return held === priority;
+}
 
 /**
  * Claim an idempotency key. Urgent sends use Redis so an OTP never waits on
  * Postgres; normal and bulk use the idempotency_key table (kept 90 days).
+ * Every claim first pins the key's priority in Redis (see pinPriority).
  */
 export async function claimIdempotency(network: string, key: string, priority: Priority): Promise<Claim> {
+  if (!(await pinPriority(network, key, priority))) return { status: 'priority_mismatch' };
+  return claimInStore(network, key, priority);
+}
+
+async function claimInStore(network: string, key: string, priority: Priority): Promise<Claim> {
   if (priority === 'realtime') {
     const k = redisKey(network, key);
     if ((await redis.set(k, PENDING, 'EX', CLAIM_WINDOW_S, 'NX')) === 'OK') return { status: 'fresh' };
     const value = await redis.get(k);
-    if (value === null) return claimIdempotency(network, key, priority); // expired between the two calls
+    if (value === null) return claimInStore(network, key, priority); // expired between the two calls
     return value === PENDING ? { status: 'in_progress' } : { status: 'replay', response: JSON.parse(value) };
   }
   const inserted = await getDb().execute(
@@ -58,7 +83,9 @@ export async function completeIdempotency(
 ): Promise<void> {
   if (priority === 'realtime') {
     // XX: if the key already expired the no-op is intentional, the 15-minute window has passed.
+    // The priority pin is renewed with the replay window so the two expire together.
     await redis.set(redisKey(network, key), JSON.stringify(response), 'EX', CLAIM_WINDOW_S, 'XX');
+    await redis.expire(priorityKey(network, key), CLAIM_WINDOW_S);
     return;
   }
   await getDb().execute(
@@ -66,16 +93,22 @@ export async function completeIdempotency(
   );
 }
 
-/** Undo a claim so the caller's retry is accepted. Best-effort: never throws. */
+/**
+ * Undo a claim so the caller's retry is accepted (at any priority). Best-effort: never throws.
+ * The priority pin is dropped only once the claim itself is gone; a release that does
+ * nothing (e.g. after complete) leaves it in place.
+ */
 export async function releaseIdempotency(network: string, key: string, priority: Priority): Promise<void> {
   try {
     if (priority === 'realtime') {
-      await redis.eval(RELEASE_LUA, 1, redisKey(network, key), PENDING);
-      return;
+      if ((await redis.eval(RELEASE_LUA, 1, redisKey(network, key), PENDING)) !== 1) return;
+    } else {
+      const deleted = await getDb().execute(
+        sql`DELETE FROM idempotency_key WHERE network = ${network} AND key = ${key} AND response IS NULL`,
+      );
+      if (!deleted.rowCount) return;
     }
-    await getDb().execute(
-      sql`DELETE FROM idempotency_key WHERE network = ${network} AND key = ${key} AND response IS NULL`,
-    );
+    await redis.eval(RELEASE_LUA, 1, priorityKey(network, key), priority);
   } catch (err) {
     console.error('idempotency release failed:', describeDbError(err));
   }
