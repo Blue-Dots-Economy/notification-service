@@ -22,12 +22,11 @@
     "@aws-sdk/client-sesv2": "^3.1131.0",
     "fastify": "^5.12.4",
     "ioredis": "^6.0.0",
-    "nodemailer": "^9.1.1",
+    "nodemailer": "^10.0.9",
     "zod": "^4.6.4"
   },
   "devDependencies": {
     "@types/node": "^26.5.1",
-    "@types/nodemailer": "^8.0.1",
     "ts-node": "^10.9.2",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11"

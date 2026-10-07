@@ -26,6 +26,16 @@ updates:
       interval: "monthly"
       time: "03:00"
       timezone: "UTC"
+    # Do not adopt a release until it has been public for 7 days. A freshly
+    # published version is the window in which a compromised release is still
+    # undetected. GitHub applies an implicit 3-day cooldown already; 7 is the
+    # threshold zizmor checks for (zizmor dependabot-cooldown).
+    #
+    # This does NOT delay security patches: per GitHub's docs the cooldown option
+    # is only available for version updates, not security updates. A CVE fix still
+    # arrives immediately.
+    cooldown:
+      default-days: 7
     # The limit counts open *version-update* PRs. Grouped updates plus a singleton
     # can sit right at 5, after which Dependabot silently stops raising npm PRs —
     # indistinguishable from "nothing to update". Observed in aggregator-dpg on
@@ -59,23 +69,6 @@ updates:
       # what the next advisory on this package will need.
       - dependency-name: "vitest"
         update-types: ["version-update:semver-major"]
-      # nodemailer v10 ships its types in-package and drops the `nodemailer`
-      # global namespace that @types/nodemailer@^8 supplied. src/lib/providers/
-      # email/sendMailCore.ts declares
-      #   let transporter: nodemailer.Transporter<SMTPTransport.SentMessageInfo>
-      # which is a reference to that namespace, so #122 fails the Docker build
-      # outright with `TS2503: Cannot find namespace 'nodemailer'`. The fix is a
-      # code change, not a bump — drop @types/nodemailer and switch to
-      # `import type { Transporter } from 'nodemailer'` — and it is not something
-      # to do inside a dependency PR on the repo that owns every outbound email.
-      # Green types would not prove it either: nothing in CI performs an SMTP
-      # round trip, and the SMTP transport here was only just variabilized (#114).
-      # aggregator-dpg holds the same major in lockstep (its #750 is green but
-      # would split the fleet across two majors of the mail library); the two move
-      # together. 9.x patches and minors flow normally — that line is where the
-      # last advisory arrived (nodemailer 9.1.1, #117).
-      - dependency-name: "nodemailer"
-        update-types: ["version-update:semver-major"]
 
   # GitHub Actions — keeps CI workflow action versions current
   - package-ecosystem: "github-actions"
@@ -87,6 +80,16 @@ updates:
       interval: "monthly"
       time: "03:15"
       timezone: "UTC"
+    # Do not adopt a release until it has been public for 7 days. A freshly
+    # published version is the window in which a compromised release is still
+    # undetected. GitHub applies an implicit 3-day cooldown already; 7 is the
+    # threshold zizmor checks for (zizmor dependabot-cooldown).
+    #
+    # This does NOT delay security patches: per GitHub's docs the cooldown option
+    # is only available for version updates, not security updates. A CVE fix still
+    # arrives immediately.
+    cooldown:
+      default-days: 7
     labels:
       - "dependencies"
       - "ci"
@@ -110,6 +113,16 @@ updates:
       interval: "monthly"
       time: "03:30"
       timezone: "UTC"
+    # Do not adopt a release until it has been public for 7 days. A freshly
+    # published version is the window in which a compromised release is still
+    # undetected. GitHub applies an implicit 3-day cooldown already; 7 is the
+    # threshold zizmor checks for (zizmor dependabot-cooldown).
+    #
+    # This does NOT delay security patches: per GitHub's docs the cooldown option
+    # is only available for version updates, not security updates. A CVE fix still
+    # arrives immediately.
+    cooldown:
+      default-days: 7
     labels:
       - "dependencies"
       - "docker"
