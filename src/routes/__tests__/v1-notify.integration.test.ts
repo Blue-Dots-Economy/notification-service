@@ -4,7 +4,11 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 // End to end over real Postgres + Redis: accept → queue → worker → audit.
 // Only the vendor (an SMS double that renders on the provider side, like
 // MSG91 Flow) and the HMAC check are stubbed.
-vi.mock('../../plugins/request-auth', () => ({ requestAuth: async () => {} }));
+vi.mock('../../plugins/auth', () => ({
+  authenticate: () => async (req: any) => {
+    req.principal = { kind: 'hmac', id: 'test-key', scopes: new Set(['notify:send', 'templates:admin']) };
+  },
+}));
 const sms = vi.hoisted(() => ({
   sendRendered: vi.fn(async (_args: unknown) => ({ ok: true as const, provider_message_id: 'pm-1' })),
 }));
@@ -19,13 +23,14 @@ vi.mock('../../lib/providers', () => ({
 }));
 
 process.env.NS_NETWORK = 'test_net';
-delete process.env.NS_ADMIN_KEY_IDS;
 
 const Fastify = (await import('fastify')).default;
 const redis = (await import('../../lib/redis')).default;
 const { closeDb, getPool } = await import('../../lib/db/client');
 const { runMigrations } = await import('../../lib/db/migrate');
 const { createTemplateDraft, publishTemplate } = await import('../../lib/templates/repo');
+const { createPolicyDraft, publishPolicy } = await import('../../lib/policies/repo');
+const { clearResolveCache } = await import('../../lib/send/resolver-cache');
 const { popFrom, QUEUE_KEYS } = await import('../../lib/queue');
 const { processJob } = await import('../../lib/worker');
 const { v1NotifyRoutes } = await import('../v1-notify');
@@ -97,9 +102,11 @@ describe('POST /v1/notify end to end', () => {
     expect(attempt.job).toBeNull();
     expect(attempt.raw).not.toContain(OTP);
     const { rows: [event] } = await getPool().query(
-      `SELECT delivery_mode, status, payload, payload::text AS payload_text
+      `SELECT delivery_mode, status, payload, payload::text AS payload_text, event_type, domain, template_key
          FROM notification_event WHERE id = $1`, [eventId]);
     expect(event).toMatchObject({ delivery_mode: 'single', status: 'sent' });
+    // A template_key send: the template is the event's identity; no event type, no domain sent.
+    expect(event).toMatchObject({ event_type: null, domain: null, template_key: 'login_otp' });
     expect(event.payload).toMatchObject({ to: { phone: PHONE }, variable_names: ['message'] });
     expect(event.payload_text).not.toContain(OTP);
   });
@@ -117,5 +124,66 @@ describe('POST /v1/notify end to end', () => {
     const stored = await redis.get(`idem:test_net:${key}`);
     expect(stored ?? '').not.toContain(OTP);
     await redis.del(`idem:test_net:${key}`);
+  });
+});
+
+describe('POST /v1/notify — event row identity', () => {
+  /** A network-wide (domain null) policy, so a recorded domain can only be the one the caller sent. */
+  beforeEach(async () => {
+    const draft = await createPolicyDraft(
+      { domain: null, eventType: 'login', mode: 'all', channels: [{ channel: 'sms', template_key: 'login_otp' }] }, 'test');
+    await publishPolicy(draft.id, 'test');
+    clearResolveCache();
+  });
+
+  const eventRequest = (extra: Record<string, unknown> = {}) => ({
+    event_type: 'login', to: { phone: PHONE }, variables: { message: OTP }, ...extra,
+  });
+
+  async function eventRow(eventId: string) {
+    return vi.waitFor(async () => {
+      const { rows } = await getPool().query(
+        `SELECT event_type, domain, template_key FROM notification_event WHERE id = $1`, [eventId]);
+      expect(rows).toHaveLength(1);
+      return rows[0];
+    }, { timeout: 3000, interval: 50 });
+  }
+
+  it('a normal event send records the event type and the domain as sent, not the matched policy domain', async () => {
+    const res = await (await app()).inject({
+      method: 'POST', url: '/v1/notify', payload: eventRequest({ domain: 'seeker', priority: 'normal' }),
+    });
+    expect(res.statusCode).toBe(202);
+    const { notification_event_id: eventId } = res.json();
+    expect(await eventRow(eventId)).toEqual({ event_type: 'login', domain: 'seeker', template_key: null });
+
+    // The worker's status writes keep it; the delivered template lives on the attempt.
+    await processJob((await popFrom(redis, 'other', 1))!);
+    await attemptsOf(eventId, 'sent');
+    expect(await eventRow(eventId)).toEqual({ event_type: 'login', domain: 'seeker', template_key: null });
+    const { rows: [attempt] } = await getPool().query(
+      `SELECT template_id FROM delivery_attempt WHERE notification_event_id = $1`, [eventId]);
+    expect(attempt.template_id).toBe('login_otp');
+  });
+
+  it('an urgent event send without a domain records domain null (fire-and-forget insert)', async () => {
+    const res = await (await app()).inject({ method: 'POST', url: '/v1/notify', payload: eventRequest({ priority: 'urgent' }) });
+    expect(res.statusCode).toBe(202);
+    const { notification_event_id: eventId } = res.json();
+    expect(await eventRow(eventId)).toEqual({ event_type: 'login', domain: null, template_key: null });
+  });
+
+  it('the worker writes the identity when its status lands before the accepted insert', async () => {
+    // Realtime: the worker's upsert can be the first writer of the event row.
+    // Own variables: the 5 s content guard would answer the first test's twin 409.
+    const res = await (await app()).inject({
+      method: 'POST', url: '/v1/notify', payload: eventRequest({ domain: 'seeker', priority: 'urgent', variables: { message: '654321' } }),
+    });
+    expect(res.statusCode).toBe(202);
+    const { notification_event_id: eventId } = res.json();
+    await eventRow(eventId);
+    await getPool().query(`DELETE FROM notification_event WHERE id = $1`, [eventId]);
+    await processJob((await popFrom(redis, 'realtime', 1))!);
+    expect(await eventRow(eventId)).toEqual({ event_type: 'login', domain: 'seeker', template_key: null });
   });
 });

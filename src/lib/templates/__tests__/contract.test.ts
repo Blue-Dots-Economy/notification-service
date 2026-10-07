@@ -5,12 +5,15 @@ import {
   tokensIn,
   validateVariables,
   VariableContractSchema,
+  CONTENT_KEY,
+  callerVariables,
+  isContentVariable,
 } from '../contract';
 import { TemplateError } from '../errors';
 import type { VariableSpec } from '../../db/schema';
 
 const v = (over: Partial<VariableSpec> & { name: string }): VariableSpec => ({
-  required: true, type: 'string', sensitive: false, raw: false, ...over,
+  required: true, type: 'string', sensitive: false, raw: false, source: 'request', ...over,
 });
 
 function code(fn: () => unknown): string | undefined {
@@ -25,7 +28,7 @@ describe('VariableContractSchema', () => {
 
   it('fills defaults', () => {
     expect(VariableContractSchema.parse([{ name: 'name' }])).toEqual([
-      { name: 'name', required: true, type: 'string', sensitive: false, raw: false },
+      { name: 'name', required: true, type: 'string', sensitive: false, raw: false, source: 'request' },
     ]);
   });
   it('rejects duplicate names, bad names and urlHosts on non-url', () => {
@@ -187,4 +190,41 @@ describe('security hardening', () => {
       expect(details).not.toContain('SECRET_VALUE');
     }
   });
+});
+
+describe('content_ref variables', () => {
+  const ok = { name: 'tnc_url', type: 'url', source: 'content_ref', contentKey: 'tnc.in_force.url' };
+
+  it('accepts a content_ref spec and forces required', () => {
+    const [s] = VariableContractSchema.parse([{ ...ok, required: false }]);
+    expect(s).toMatchObject({ source: 'content_ref', contentKey: 'tnc.in_force.url', required: true });
+  });
+
+  it('defaults source to request', () => {
+    const [s] = VariableContractSchema.parse([{ name: 'name' }]);
+    expect(s.source).toBe('request');
+    expect(isContentVariable(s)).toBe(false);
+  });
+
+  it.each([
+    [{ ...ok, contentKey: undefined }, 'contentKey'],
+    [{ name: 'x', contentKey: 'tnc.in_force.url' }, 'contentKey'],
+    [{ ...ok, sensitive: true }, 'sensitive'],
+    [{ ...ok, contentKey: 'TNC.url' }, 'contentKey'],
+    [{ ...ok, contentKey: 'tnc' }, 'contentKey'],
+    [{ ...ok, contentKey: 'tnc..url' }, 'contentKey'],
+    [{ ...ok, contentKey: '__proto__.x' }, 'contentKey'],
+  ])('rejects %j', (spec, path) => {
+    const r = VariableContractSchema.safeParse([spec]);
+    expect(r.success).toBe(false);
+    expect(r.error?.issues[0]?.path).toEqual([0, path]);
+  });
+
+  it('callerVariables excludes content variables', () => {
+    const c = VariableContractSchema.parse([{ name: 'name' }, ok]);
+    expect(callerVariables(c).map((s) => s.name)).toEqual(['name']);
+  });
+
+  it.each(['tnc.in_force.url', 'tnc.on_offer.text', 'a.b', 'a1.b_2.c', 'a.b.c.d.e.f.g.h'])('key grammar accepts %s', (k) => expect(CONTENT_KEY.test(k)).toBe(true));
+  it.each(['tnc', '.tnc.url', 'tnc.url.', 'Tnc.url', 'tnc.1url', 'a.b.c.d.e.f.g.h.i'])('key grammar rejects %s', (k) => expect(CONTENT_KEY.test(k)).toBe(false));
 });

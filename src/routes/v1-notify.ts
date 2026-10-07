@@ -5,6 +5,7 @@ import type { Job } from 'src/types';
 import { recordAcceptedMany } from '../lib/audit/store';
 import { toAcceptedRecord } from '../lib/audit/redact';
 import { stamp } from '../lib/audit/stamp';
+import { contentRefsFor } from '../lib/content/refs';
 import { correlationIdFrom } from '../lib/correlation';
 import { describeDbError } from '../lib/db/errors';
 import { dedupe, releaseDedupe } from '../lib/dedupe';
@@ -16,7 +17,8 @@ import { SendError, StoreUnavailable } from '../lib/send/errors';
 import { claimIdempotency, completeIdempotency, fallbackKey, releaseIdempotency } from '../lib/send/idempotency';
 import { planSend, type SendPlan } from '../lib/send/plan';
 import { PRIORITY_MAP, V1NotifySchema, type V1Request } from '../lib/send/request';
-import { requestAuth } from '../plugins/request-auth';
+import { principalLabel } from '../lib/auth/principal';
+import { authenticate } from '../plugins/auth';
 
 
 const FALLBACK_TTL_S = 5;
@@ -33,6 +35,10 @@ function buildJobs(req: V1Request, plan: SendPlan, correlationHeader: unknown): 
       : undefined;
   const recipients: Record<string, string> = {};
   for (const [k, v] of Object.entries(req.to)) if (typeof v === 'string') recipients[k] = v;
+  // Plan-wide, like recipients: in `all` mode the event row is written from
+  // the first job, so every job carries every channel's refs and the
+  // delivering attempt's channel picks its entry.
+  const contentRefs = contentRefsFor(plan.deliveries);
   const make = (deliveries: SendPlan['deliveries']): Job => ({
     job_id: randomUUID(),
     channel: deliveries[0]!.channel,
@@ -58,6 +64,9 @@ function buildJobs(req: V1Request, plan: SendPlan, correlationHeader: unknown): 
       deliveryMode: plan.mode,
       recipients,
       ...(plan.redact ? { variableNames: Object.keys(plan.variables) } : {}),
+      ...contentRefs,
+      ...(req.event_type ? { eventType: req.event_type } : {}),
+      ...(req.domain ? { domain: req.domain } : {}),
     },
   });
   return plan.mode === 'all' ? plan.deliveries.map((d) => make([d])) : [make(plan.deliveries)];
@@ -67,7 +76,7 @@ export async function v1NotifyRoutes(app: FastifyInstance) {
   app.route({
     url: '/v1/notify',
     method: 'POST',
-    preHandler: requestAuth,
+    preHandler: authenticate({ scope: 'notify:send' }),
     bodyLimit: notifyBodyLimitBytes(),
     handler: async (req: FastifyRequest, reply: FastifyReply) => {
       const parsed = V1NotifySchema.safeParse(req.body);
@@ -140,7 +149,7 @@ export async function v1NotifyRoutes(app: FastifyInstance) {
         }
 
         const jobs = buildJobs(body, plan, req.headers['x-correlation-id']);
-        const source = String(req.headers['x-ns-key'] ?? 'unknown');
+        const source = principalLabel(req.principal);
         const records = jobs.map((j) => toAcceptedRecord(j, source));
         const eventId = jobs[0]!.audit!.eventId;
 

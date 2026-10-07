@@ -1,7 +1,13 @@
 import { providers } from '../providers';
+import { CONTENT_KEY } from '../templates/contract';
 import { serializeProvider } from './provider-docs';
 
-const adminSecurity = [{ requestSignature: [], adminKey: [] }];
+// Either credential type authenticates a request (alternatives, not both at once).
+// Role names inside `bearerAuth` are valid because the document is OpenAPI 3.1.
+const sendSecurity = [{ requestSignature: [] }, { bearerAuth: ['notify:send'] }];
+const adminSecurity = [{ requestSignature: [] }, { bearerAuth: ['templates:admin'] }];
+const anySecurity = [{ requestSignature: [] }, { bearerAuth: [] }];
+
 
 const errorBody = (description: string) => ({
   description,
@@ -20,19 +26,29 @@ const errorBody = (description: string) => ({
   },
 });
 
+const unauthorized = () =>
+  errorBody('Missing, malformed, expired or invalid credentials, or both credential types on one request');
+const AUTH_UNAVAILABLE = 'auth unavailable: the Keycloak key set could not be reached for a bearer token';
+const authUnavailable = () =>
+  errorBody('Auth service unavailable: the Keycloak key set could not be reached for a bearer token');
+const forbidden = (role: string) =>
+  errorBody(`Insufficient scope: the credential lacks \`${role}\` ({"error":"Insufficient scope","required":"${role}"})`);
+
 const adminErrors = {
   '400': {
     description: 'Validation error (Zod format): unknown keys, wrong types or a malformed id',
     content: { 'application/json': { schema: { type: 'object', additionalProperties: true } } },
   },
-  '401': { description: 'Missing or invalid request signature' },
-  '403': errorBody('The key id is not listed in NS_ADMIN_KEY_IDS ({"error":"admin scope required"})'),
+  '401': unauthorized(),
+  '403': forbidden('templates:admin'),
   '404': errorBody('not_found: no such template or policy'),
   '409': errorBody('invalid_state: the row is not in a state that allows this change'),
   '422': errorBody(
-    'A template or policy rule was violated (vendor_mismatch, incomplete_template, undeclared_token, unused_variable, body_too_long, invalid_contract, unknown_channel, missing_variable, unknown_variable, invalid_variable)'
+    'A template or policy rule was violated (vendor_mismatch, incomplete_template, undeclared_token, unused_variable, body_too_long, invalid_contract, unknown_channel, missing_variable, unknown_variable, invalid_variable, content_unavailable, unknown_content_key, content_unresolved, invalid_content)'
   ),
-  '503': errorBody('network_not_configured: NS_NETWORK is not set; database_unavailable: the template/policy store could not be reached'),
+  '503': errorBody(
+    `network_not_configured: NS_NETWORK is not set; database_unavailable: the template/policy store could not be reached; ${AUTH_UNAVAILABLE}`,
+  ),
 };
 
 const jsonBody = (schema: unknown) => ({
@@ -83,6 +99,20 @@ const policyChannels = {
 };
 
 const adminSchemas = {
+  Catalogue: {
+    type: 'object',
+    required: ['version', 'templates', 'policies'],
+    additionalProperties: false,
+    properties: {
+      version: { type: 'string', pattern: '^[A-Za-z0-9._-]{1,64}$' },
+      templates: {
+        type: 'array',
+        maxItems: 500,
+        items: { $ref: '#/components/schemas/TemplateEntry' },
+      },
+      policies: { type: 'array', maxItems: 500, items: { $ref: '#/components/schemas/PolicyCreate' } },
+    },
+  },
   SendAccepted: {
     type: 'object',
     required: ['notification_event_id', 'correlation_id', 'status', 'mode', 'deliveries'],
@@ -112,6 +142,19 @@ const adminSchemas = {
         minItems: 1,
         items: { type: 'string' },
         description: 'Allowed hosts for url variables; subdomains match. Valid only when type is url.',
+      },
+      source: {
+        type: 'string',
+        enum: ['request', 'content_ref'],
+        default: 'request',
+        description:
+          'request: the caller supplies the value. content_ref: the value comes from the shared content file by `contentKey`; callers cannot supply it. content_ref variables are always required and cannot be sensitive.',
+      },
+      contentKey: {
+        type: 'string',
+        maxLength: 128,
+        pattern: CONTENT_KEY.source,
+        description: 'The content key, e.g. tnc.in_force.url. Required when source is content_ref, and valid only then.',
       },
     },
   },
@@ -166,6 +209,19 @@ const adminSchemas = {
     },
   },
   TemplatePatch: { type: 'object', additionalProperties: false, properties: templatePatchProperties },
+  TemplateEntry: {
+    type: 'object',
+    description: 'A catalogue template: the template create body plus `provider`. Only email entries may omit `provider`; SMS and WhatsApp entries name the vendor they are for.',
+    required: ['channel', 'template_key'],
+    additionalProperties: false,
+    properties: {
+      channel: { type: 'string', minLength: 1, maxLength: 32, example: 'sms' },
+      template_key: { type: 'string', pattern: '^[a-z0-9_.-]+$', maxLength: 128, example: 'welcome' },
+      locale: { type: 'string', pattern: '^[a-z]{2,3}(-[A-Z]{2})?$', description: 'Defaults to NS_DEFAULT_LOCALE.' },
+      provider: { type: 'string', minLength: 1, maxLength: 32, example: 'msg91', description: 'Required unless channel is email.' },
+      ...templatePatchProperties,
+    },
+  },
   Policy: {
     type: 'object',
     properties: {
@@ -339,6 +395,27 @@ const adminPaths = {
   },
 };
 
+const adminExportPath = {
+  '/v1/admin/export': {
+    get: adminOp(
+      'Export the active catalogue',
+      'Active templates (for the deployment\'s current vendors) and policies of NS_NETWORK, in the catalogue format that NS_SEED_FILE reads. Carries no ids, versions, actors or timestamps; output is sorted so two exports of one store are identical apart from `version` (the export timestamp).',
+      {
+        responses: {
+          '200': {
+            description: 'Catalogue',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Catalogue' } } },
+          },
+          '401': adminErrors['401'],
+          '403': adminErrors['403'],
+          '422': errorBody('export_invalid: the active rows do not fit the catalogue format (e.g. more than 500 templates); the message names paths only'),
+          '503': adminErrors['503'],
+        },
+      }
+    ),
+  },
+};
+
 export function openApiDocument() {
   const providerExamples = Object.fromEntries(
     Object.values(providers).map((provider) => [
@@ -360,13 +437,14 @@ export function openApiDocument() {
     },
     paths: {
       ...adminPaths,
+      ...adminExportPath,
       '/v1/notify': {
         post: {
           summary: 'Send a notification (Send API v1)',
           tags: ['send'],
           description:
             'Send by `event_type` (a policy picks the channels) or by `template_key` + `channel`. Content is rendered and validated before the request is accepted. `network` is server config and is never read from the request.',
-          security: [{ requestSignature: [] }],
+          security: sendSecurity,
           requestBody: jsonBody({
             type: 'object',
             additionalProperties: false,
@@ -387,7 +465,13 @@ export function openApiDocument() {
                 },
               },
               locale: { type: 'string', pattern: '^[a-z]{2,3}(-[A-Z]{2})?$' },
-              variables: { type: 'object', additionalProperties: true, default: {} },
+              variables: {
+                type: 'object',
+                additionalProperties: true,
+                default: {},
+                description:
+                  'With `event_type`, variables are data: each planned template takes the ones it declares and the rest are ignored; a required one that is missing is `missing_variable`. With `template_key`, a name the template does not declare is `422 unknown_variable`.',
+              },
               priority: { type: 'string', enum: ['urgent', 'normal', 'bulk'], default: 'normal' },
               idempotency_key: { type: 'string', minLength: 1, maxLength: 128 },
               deadline: {
@@ -427,11 +511,12 @@ export function openApiDocument() {
               content: { 'application/json': { schema: { $ref: '#/components/schemas/SendAccepted' } } },
             },
             '400': { description: 'Invalid request (Zod format), or `invalid_deadline`' },
-            '401': { description: 'Missing or invalid request signature' },
+            '401': unauthorized(),
+            '403': forbidden('notify:send'),
             '409': errorBody('idempotency_in_progress, or duplicate-fallback (a repeat without an idempotency_key within 5 seconds)'),
             '422': {
               description:
-                'The send was refused. `kind` is `caller` (missing_variable, unknown_variable, invalid_variable, no_reachable_channel) or `configuration` (not_found, vendor_mismatch, incomplete_template, body_too_long, unknown_channel, no_policy).',
+                'The send was refused. `kind` is `caller` (missing_variable, unknown_variable, invalid_variable, no_reachable_channel) or `configuration` (not_found, vendor_mismatch, incomplete_template, body_too_long, unknown_channel, no_policy, content_unavailable, unknown_content_key, content_unresolved, invalid_content).',
               content: {
                 'application/json': {
                   schema: {
@@ -448,7 +533,7 @@ export function openApiDocument() {
               },
             },
             '503': errorBody(
-              'network_not_configured: NS_NETWORK is not set; template store unavailable: a template or policy not yet cached could not be read; audit store unavailable (normal and bulk sends)',
+              `network_not_configured: NS_NETWORK is not set; template store unavailable: a template or policy not yet cached could not be read; audit store unavailable (normal and bulk sends); ${AUTH_UNAVAILABLE}`,
             ),
           },
         },
@@ -456,7 +541,9 @@ export function openApiDocument() {
       '/notify': {
         post: {
           summary: 'Queue a notification',
-          security: [{ requestSignature: [] }],
+          description:
+            'Legacy send route, kept until the cutover release. Requires `notify:send`. Also accepts HMAC `v1` signatures (no body digest).',
+          security: sendSecurity,
           requestBody: {
             required: true,
             content: {
@@ -536,7 +623,9 @@ export function openApiDocument() {
               },
             },
             '400': { description: 'Invalid request or provider/template' },
-            '401': { description: 'Missing or invalid request signature' },
+            '401': unauthorized(),
+            '403': forbidden('notify:send'),
+            '503': authUnavailable(),
             '409': {
               description:
                 'Suppressed as a duplicate by the fallback content-hash key (no `dedupe_id` was supplied). Nothing was sent. Pass an explicit `dedupe_id` if the send is a deliberate retry.',
@@ -559,8 +648,10 @@ export function openApiDocument() {
       '/providers': {
         get: {
           summary: 'List providers and complete notify payloads',
-          security: [{ requestSignature: [] }],
+          security: anySecurity,
           responses: {
+            '401': unauthorized(),
+            '503': authUnavailable(),
             '200': {
               description: 'Provider metadata',
               content: {
@@ -575,7 +666,7 @@ export function openApiDocument() {
       '/providers/{name}': {
         get: {
           summary: 'Find a provider by name',
-          security: [{ requestSignature: [] }],
+          security: anySecurity,
           parameters: [
             {
               name: 'name',
@@ -594,15 +685,19 @@ export function openApiDocument() {
                 },
               },
             },
+            '401': unauthorized(),
             '404': { description: 'Provider not found' },
+            '503': authUnavailable(),
           },
         },
       },
       '/metrics/queue': {
         get: {
           summary: 'Read Redis queue metrics',
-          security: [{ requestSignature: [] }],
+          security: anySecurity,
           responses: {
+            '401': unauthorized(),
+            '503': authUnavailable(),
             '200': {
               description: 'Queue depths and retry timing',
               content: {
@@ -627,8 +722,7 @@ export function openApiDocument() {
       },
       '/openapi.json': {
         get: {
-          summary: 'OpenAPI document used by Scalar',
-          security: [{ requestSignature: [] }],
+          summary: 'OpenAPI document used by Scalar (served only when NS_DOCS_ENABLED=true)',
           responses: {
             '200': { description: 'OpenAPI 3.1 document' },
           },
@@ -637,7 +731,8 @@ export function openApiDocument() {
       '/failed/retry': {
         post: {
           summary: 'Manually retry failed jobs from the dead-letter queue',
-          security: [{ requestSignature: [] }],
+          description: 'Operator action: requires `templates:admin`. A credential holding only `notify:send` receives 403.',
+          security: adminSecurity,
           requestBody: {
             required: false,
             content: {
@@ -695,8 +790,10 @@ export function openApiDocument() {
               },
             },
             '400': { description: 'Invalid retry request' },
-            '401': { description: 'Missing or invalid request signature' },
+            '401': unauthorized(),
+            '403': forbidden('templates:admin'),
             '404': { description: 'Requested failed job was not found' },
+            '503': authUnavailable(),
           },
         },
       },
@@ -704,19 +801,19 @@ export function openApiDocument() {
     components: {
       schemas: adminSchemas,
       securitySchemes: {
+        bearerAuth: {
+          type: 'http',
+          scheme: 'bearer',
+          bearerFormat: 'JWT',
+          description:
+            'Keycloak access token. Requires `aud` = the configured audience (default `notification-service`) and an allowlisted `azp`. Roles come from the `notification-service` client roles: `notify:send` and `templates:admin`. Do not send alongside the HMAC headers.',
+        },
         requestSignature: {
           type: 'apiKey',
           in: 'header',
           name: 'X-NS-Signature',
           description:
-            'Signed requests also require X-NS-Key, X-NS-Timestamp, and X-NS-Nonce.',
-        },
-        adminKey: {
-          type: 'apiKey',
-          in: 'header',
-          name: 'X-NS-Key',
-          description:
-            'Admin routes also require the signing key id to be listed in NS_ADMIN_KEY_IDS (comma-separated); otherwise 403.',
+            'HMAC v2. Send X-NS-Key (key id), X-NS-Timestamp (unix seconds, within 30 s of server time), X-NS-Nonce (unique per request) and X-NS-Signature: v2=<64 lowercase hex>. The signature is HMAC-SHA256 with the key secret over the canonical string METHOD\\npath\\ntimestamp\\nnonce\\nsha256(body), where path includes the query string and the digest is lowercase hex SHA-256 over the exact body bytes (the empty string when there is no body). v1 (METHOD\\npath\\ntimestamp\\nnonce) is accepted only on legacy /notify until the cutover release. Scopes come from the key\'s `scopes` entry in internal-secrets.json (default `notify:send`). Do not send alongside an Authorization header.',
         },
       },
     },

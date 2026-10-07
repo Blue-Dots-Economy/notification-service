@@ -7,11 +7,16 @@ import { recoverAtBoot, recoverLostJobs } from './lib/audit/recover.js';
 import { validateBootConfig } from './lib/boot-config.js';
 import { describeDbError } from './lib/db/errors.js';
 import { seedBuiltinTemplates } from './lib/templates/seed.js';
+import { startContent } from './lib/content/resolver.js';
 
 const PORT = process.env.SERVER_PORT || `3000`;
 
 async function main() {
   loadSecrets();
+  // API process only: the forked worker never renders. Never throws; a broken
+  // content file leaves content unavailable and affects no other send.
+  // validateBootConfig below rejects bad NS_CONTENT_* settings before listen.
+  await startContent();
   // Before listen and before the worker: nothing may read or write a table
   // whose migration has not landed. A failure here exits non-zero so the
   // orchestrator keeps the previous pod serving.

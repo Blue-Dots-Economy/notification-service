@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-vi.mock('../../plugins/request-auth', () => ({ requestAuth: async () => {} }));
+const auth = vi.hoisted(() => ({
+  authenticate: vi.fn((_opts: unknown) => async (req: any) => {
+    req.principal = { kind: 'hmac', id: 'test-key', scopes: new Set(['notify:send', 'templates:admin']) };
+  }),
+}));
+vi.mock('../../plugins/auth', () => auth);
 const plan = vi.hoisted(() => ({ planSend: vi.fn() }));
 vi.mock('../../lib/send/plan', () => plan);
 const idem = vi.hoisted(() => ({ claimIdempotency: vi.fn(), completeIdempotency: vi.fn(async () => {}), releaseIdempotency: vi.fn(async () => {}), fallbackKey: vi.fn(() => 'fk') }));
@@ -19,7 +24,7 @@ const Fastify = (await import('fastify')).default;
 const { v1NotifyRoutes } = await import('../v1-notify');
 const { SendError, StoreUnavailable } = await import('../../lib/send/errors');
 
-const delivery = (channel: string) => ({ channel, to: channel === 'email' ? 'a@b.co' : '+919999999999', templateKey: `k_${channel}`, provider: 'msg91', providerTemplateId: 'f', rendered: { mode: 'provider', channel, providerTemplateId: 'f', variables: { name: 'A' } }, dlt: { senderId: null, dltEntityId: null, dltHeaderId: null, dltTagId: null } });
+const delivery = (channel: string, contentRefs: unknown[] = []) => ({ channel, contentRefs, to: channel === 'email' ? 'a@b.co' : '+919999999999', templateKey: `k_${channel}`, provider: 'msg91', providerTemplateId: 'f', rendered: { mode: 'provider', channel, providerTemplateId: 'f', variables: { name: 'A' } }, dlt: { senderId: null, dltEntityId: null, dltHeaderId: null, dltTagId: null } });
 
 async function app() { const a = Fastify({ logger: false }); await a.register(v1NotifyRoutes); await a.ready(); return a; }
 const post = async (payload: unknown) => (await app()).inject({ method: 'POST', url: '/v1/notify', payload, headers: { 'x-ns-key': 'signals' } });
@@ -195,6 +200,8 @@ describe('POST /v1/notify', () => {
     plan.planSend.mockResolvedValue({ mode: 'single', deliveries: [delivery('sms')], redact: true, variables: { message: '123456' } });
     await post({ template_key: 'login_otp', channel: 'sms', to: { phone: '+919999999999' }, variables: { message: '123456' } });
     const recs = store.recordAcceptedMany.mock.calls[0]![0] as any[];
+    expect(recs[0].source).toBe('hmac:test-key');
+    expect(auth.authenticate).toHaveBeenCalledWith({ scope: 'notify:send' });
     expect(recs[0].job).toBeUndefined();
     expect(recs[0].recoverable).toBe(false);
     expect(recs[0].payload.variable_names).toEqual(['message']);
@@ -202,6 +209,26 @@ describe('POST /v1/notify', () => {
     expect(dump).not.toContain('123456');
     expect(dump).not.toContain('"rendered"');
     expect(dump).not.toContain('providerTemplateId');
+  });
+
+  it('event sends carry the event type and the domain as sent on every job', async () => {
+    plan.planSend.mockResolvedValue({ mode: 'all', deliveries: [delivery('sms'), delivery('email')], redact: false, variables: {} });
+    await post({ ...body, domain: 'seeker' });
+    for (const job of queue.pushManyToPriority.mock.calls[0]![0]) {
+      expect(job.audit).toMatchObject({ eventType: 'apply', domain: 'seeker' });
+    }
+    const recs = store.recordAcceptedMany.mock.calls[0]![0] as any[];
+    expect(recs[0]).toMatchObject({ eventType: 'apply', domain: 'seeker', templateKey: null });
+  });
+
+  it('a template_key send without a domain carries neither', async () => {
+    plan.planSend.mockResolvedValue({ mode: 'single', deliveries: [delivery('sms')], redact: false, variables: {} });
+    await post({ template_key: 'k_sms', channel: 'sms', to: { phone: '+919999999999' }, variables: {} });
+    const job = queue.pushManyToPriority.mock.calls[0]![0][0];
+    expect(job.audit).not.toHaveProperty('eventType');
+    expect(job.audit).not.toHaveProperty('domain');
+    const recs = store.recordAcceptedMany.mock.calls[0]![0] as any[];
+    expect(recs[0]).toMatchObject({ eventType: null, domain: null, templateKey: 'k_sms' });
   });
 
   it('redacted sends carry no variable values on the job', async () => {
@@ -269,5 +296,49 @@ describe('POST /v1/notify', () => {
     const recs = store.recordAcceptedMany.mock.calls[0]![0] as any[];
     for (const r of recs) expect(r.payload.to).toEqual({ phone: '+919999999999', email: 'a@b.co' });
     expect(JSON.stringify(recs)).not.toContain('123456');
+  });
+});
+
+describe('POST /v1/notify — content refs', () => {
+  const en = { key: 'tnc.in_force.url', version: 'v3', locale: 'en' };
+  const hi = { key: 'tnc.in_force.url', version: 'v3', locale: 'hi' };
+
+  it('all: every job, and so the event row, carries every channel\'s refs', async () => {
+    plan.planSend.mockResolvedValue({ mode: 'all', deliveries: [delivery('sms', [hi]), delivery('email', [en])], redact: false, variables: { name: 'A' } });
+    await post(body);
+    const [smsJob, emailJob] = queue.pushManyToPriority.mock.calls[0]![0] as any[];
+    expect(smsJob.audit.contentRefs).toEqual({ sms: [hi], email: [en] });
+    expect(emailJob.audit.contentRefs).toEqual({ sms: [hi], email: [en] });
+    // The event row is written from records[0].
+    const recs = store.recordAcceptedMany.mock.calls[0]![0] as any[];
+    expect(recs[0].payload.content_refs).toEqual({ sms: [hi], email: [en] });
+  });
+
+  it('all, redacted: the event payload carries the full map', async () => {
+    plan.planSend.mockResolvedValue({ mode: 'all', deliveries: [delivery('sms', [hi]), delivery('email', [en])], redact: true, variables: { message: '123456' } });
+    await post(body);
+    const recs = store.recordAcceptedMany.mock.calls[0]![0] as any[];
+    expect(recs[0].payload.content_refs).toEqual({ sms: [hi], email: [en] });
+    expect(JSON.stringify(recs)).not.toContain('123456');
+  });
+
+  it('first_available: the map is keyed by candidate channel', async () => {
+    plan.planSend.mockResolvedValue({ mode: 'first_available', deliveries: [delivery('sms', [hi]), delivery('email', [en])], redact: false, variables: { name: 'A' } });
+    await post(body);
+    const job = queue.pushManyToPriority.mock.calls[0]![0][0];
+    expect(job.audit.contentRefs).toEqual({ sms: [hi], email: [en] });
+  });
+
+  it('refs are de-duplicated by key, version and locale; channels without refs are omitted', async () => {
+    plan.planSend.mockResolvedValue({ mode: 'first_available', deliveries: [delivery('sms', [en, en, hi]), delivery('email')], redact: true, variables: { name: 'A' } });
+    await post(body);
+    const job = queue.pushManyToPriority.mock.calls[0]![0][0];
+    expect(job.audit.contentRefs).toEqual({ sms: [en, hi] });
+  });
+
+  it('jobs carry no contentRefs when no delivery has any', async () => {
+    await post(body);
+    const job = queue.pushManyToPriority.mock.calls[0]![0][0];
+    expect(job.audit).not.toHaveProperty('contentRefs');
   });
 });
