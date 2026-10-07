@@ -372,10 +372,14 @@ vendor, with the provider's body and contract `message` (required, sensitive): m
 seeded), pinnacle reads `PINNACLE_LOGIN_OTP_TEMPLATE_ID` via its provider map; unset or blank →
 `skipped_no_id`. Existence is checked **per vendor**: any `login_otp` row (any status/locale) whose
 `provider` is the current vendor → `exists`, never overwritten, so an admin's edits always win over
-environment defaults. If rows exist only for another vendor (the deployment switched vendor), the
+environment defaults. The one exception is the seed's **own untouched draft** (`created_by =
+'system:seed'`, still `draft`, `updated_at = created_at`): e.g. Pinnacle with
+`PINNACLE_LOGIN_OTP_TEMPLATE_ID` set before `SMS_LOGIN_OTP_BODY`. Every boot re-applies the env values
+to it in place (`reapplySeedDraft`, which leaves `updated_at` alone) and retries publish; once an admin
+edits, publishes or adds a row, it is `exists`. A publish failure logs `seeded_draft` at **warn**. If rows exist only for another vendor (the deployment switched vendor), the
 current vendor's template is created and published, which retires the old vendor's active row. Replicas booting together
 serialise on a session advisory lock. Seeding is non-fatal (logged, never blocks listen) and is
-skipped when `NS_NETWORK` is unset; a template that fails publish validation is left as a draft.
+skipped when `NS_NETWORK` is unset; a template that fails publish validation is left as a draft and retried next boot.
 
 ## Key Files
 

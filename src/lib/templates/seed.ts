@@ -2,7 +2,7 @@ import { getPool } from '../db/client';
 import { providers } from '../providers';
 import { currentNetwork, NetworkNotConfigured } from '../network';
 import { TemplateError } from './errors';
-import { createTemplateDraft, listTemplates, publishTemplate } from './repo';
+import { createTemplateDraft, isUntouchedSeedDraft, listTemplates, publishTemplate, reapplySeedDraft } from './repo';
 
 type SeedOutcome = 'seeded_active' | 'seeded_draft' | 'exists' | 'skipped_no_network' | 'skipped_no_id';
 
@@ -61,7 +61,10 @@ export async function seedBuiltinTemplates(): Promise<SeedOutcome> {
 async function seedLocked(): Promise<SeedOutcome> {
   const sms = providers.sms;
   const existing = await listTemplates({ channel: 'sms', templateKey: 'login_otp' });
-  if (sms && existing.some((t) => t.provider === sms.vendor)) return 'exists';
+  const own = sms ? existing.filter((t) => t.provider === sms.vendor) : [];
+  // Only the seed's own untouched drafts are retried (e.g. the id was set
+  // before the body); anything an admin made, edited or published wins.
+  if (own.length > 0 && !own.every(isUntouchedSeedDraft)) return 'exists';
 
   const id = sms ? configuredLoginOtpId(sms) : undefined;
   if (!sms || !id) {
@@ -69,22 +72,30 @@ async function seedLocked(): Promise<SeedOutcome> {
     return 'skipped_no_id';
   }
 
-  const draft = await createTemplateDraft(
-    {
-      channel: 'sms',
-      templateKey: 'login_otp',
-      providerTemplateId: id,
-      bodyText: sms.bodies?.login_otp || process.env.SMS_LOGIN_OTP_BODY || null,
-      variables: [{ name: 'message', required: true, type: 'string', sensitive: true, raw: false }],
-    },
-    'system:seed',
-  );
+  const values = {
+    providerTemplateId: id,
+    bodyText: sms.bodies?.login_otp || process.env.SMS_LOGIN_OTP_BODY || null,
+    variables: [{ name: 'message', required: true, type: 'string' as const, sensitive: true, raw: false }],
+  };
+  let draftId: string;
+  if (own.length > 0) {
+    const latest = own.reduce((a, b) => (b.version > a.version ? b : a));
+    try {
+      draftId = (await reapplySeedDraft(latest.id, values)).id;
+    } catch (e) {
+      // An admin edited it since the listing: theirs wins.
+      if (e instanceof TemplateError && e.code === 'invalid_state') return 'exists';
+      throw e;
+    }
+  } else {
+    draftId = (await createTemplateDraft({ channel: 'sms', templateKey: 'login_otp', ...values }, 'system:seed')).id;
+  }
   try {
-    await publishTemplate(draft.id, 'system:seed');
+    await publishTemplate(draftId, 'system:seed');
     return 'seeded_active';
   } catch (e) {
     if (e instanceof TemplateError) {
-      console.log(`login_otp seeded as a draft: ${e.code}`);
+      console.warn(`login_otp seeded as a draft (retried next boot): ${e.code}`);
       return 'seeded_draft';
     }
     throw e;

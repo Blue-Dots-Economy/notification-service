@@ -8,7 +8,7 @@ vi.mock('../vendors', () => ({ channelVendor: (c: string) => (c === 'sms' ? { ve
 
 import { closeDb, getPool } from '../../db/client';
 import { runMigrations } from '../../db/migrate';
-import { listTemplates, createTemplateDraft } from '../repo';
+import { listTemplates, createTemplateDraft, updateTemplateDraft } from '../repo';
 import { seedBuiltinTemplates } from '../seed';
 
 beforeAll(async () => { await runMigrations(); });
@@ -39,6 +39,31 @@ describe('seedBuiltinTemplates', () => {
   it('leaves an invalid seed as a draft', async () => {
     sms.current = { name: 'sms', vendor: 'pinnacle', renders: 'ns', templates: { login_otp: '1107' }, bodies: { login_otp: '' } };
     expect(await seedBuiltinTemplates()).toBe('seeded_draft');
+  });
+
+  it('retries its own untouched draft on a later boot once the env is complete', async () => {
+    // Pinnacle id set before SMS_LOGIN_OTP_BODY (chart default ""): the first boot leaves a draft.
+    sms.current = { name: 'sms', vendor: 'pinnacle', renders: 'ns', templates: { login_otp: '1107' }, bodies: { login_otp: '' } };
+    expect(await seedBuiltinTemplates()).toBe('seeded_draft');
+    expect(await seedBuiltinTemplates()).toBe('seeded_draft');
+    process.env.SMS_LOGIN_OTP_BODY = '{{message}} is your OTP';
+    expect(await seedBuiltinTemplates()).toBe('seeded_active');
+    const rows = await listTemplates({ templateKey: 'login_otp' });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status: 'active', version: 1, bodyText: '{{message}} is your OTP', providerTemplateId: '1107' });
+    expect(await seedBuiltinTemplates()).toBe('exists');
+  });
+
+  it('leaves a seed draft an admin edited alone', async () => {
+    sms.current = { name: 'sms', vendor: 'pinnacle', renders: 'ns', templates: { login_otp: '1107' }, bodies: { login_otp: '' } };
+    expect(await seedBuiltinTemplates()).toBe('seeded_draft');
+    const [d] = await listTemplates({ templateKey: 'login_otp' });
+    await updateTemplateDraft(d!.id, { approvalRef: 'admin-note' });
+    process.env.SMS_LOGIN_OTP_BODY = '{{message}} is your OTP';
+    expect(await seedBuiltinTemplates()).toBe('exists');
+    const rows = await listTemplates({ templateKey: 'login_otp' });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status: 'draft', bodyText: null, approvalRef: 'admin-note' });
   });
 
   it('never publishes msg91\'s hardcoded fallback id when SMS_LOGIN_OTP_TEMPLATE_ID is unset', async () => {

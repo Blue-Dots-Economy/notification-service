@@ -108,6 +108,29 @@ export async function updateTemplateDraft(id: string, patch: TemplatePatch): Pro
   });
 }
 
+export const SEED_ACTOR = 'system:seed';
+
+/** A draft the boot seed created and nobody has edited since (admin edits bump updated_at). */
+export function isUntouchedSeedDraft(t: Pick<TemplateRow, 'status' | 'createdBy' | 'createdAt' | 'updatedAt'>): boolean {
+  return t.status === 'draft' && t.createdBy === SEED_ACTOR && t.updatedAt.getTime() === t.createdAt.getTime();
+}
+
+/**
+ * Re-apply the seed's environment values to its own untouched draft. Leaves
+ * updated_at alone so the row stays recognisably untouched for the next boot;
+ * refuses with `invalid_state` once an admin has edited or published it.
+ */
+export async function reapplySeedDraft(id: string, patch: TemplatePatch): Promise<TemplateRow> {
+  return getDb().transaction(async (tx) => {
+    const current = await loadForUpdate(tx, id);
+    if (!isUntouchedSeedDraft(current)) {
+      throw new TemplateError('invalid_state', 'not an untouched seed draft');
+    }
+    const [row] = await tx.update(template).set(patch).where(eq(template.id, id)).returning();
+    return row!;
+  });
+}
+
 export async function publishTemplate(id: string, actor: string): Promise<TemplateRow> {
   return getDb().transaction(async (tx) => {
     const peek = await loadForUpdate(tx, id);
