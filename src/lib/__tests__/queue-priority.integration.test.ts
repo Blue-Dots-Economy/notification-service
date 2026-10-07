@@ -102,3 +102,31 @@ describe('popFrom malformed entries', () => {
     }
   });
 });
+
+describe('lone UTF-16 surrogates (cjson rejects \\udXXX escapes)', () => {
+  it('a job with a lone surrogate is moved back to its own priority queue, not the DLQ', async () => {
+    await deferJob({ ...job('ls', 'realtime'), variables: { name: 'Asha \ud83d' } }, -1);
+    expect(await moveDueRetries()).toBe(1);
+    expect(await redis.llen('queue:dlq')).toBe(0);
+    const [raw] = await redis.lrange(QUEUE_KEYS.realtime, 0, -1);
+    expect(JSON.parse(raw!).variables.name).toBe('Asha �');
+  });
+
+  it.each(['realtime', 'other', 'bulk'] as const)(
+    'a %s member written raw by an older pod (unsanitized) still routes to its own queue',
+    async (priority) => {
+      const legacy = JSON.stringify({ ...job(`old-${priority}`, priority), variables: { name: 'x\ud83d', ['k\udc00']: '\\ud83d' } });
+      expect(legacy).toContain('\\ud83d');
+      await redis.zadd('queue:retry', '0', legacy);
+      expect(await moveDueRetries()).toBe(1);
+      expect(await redis.llen('queue:dlq')).toBe(0);
+      expect(await redis.lrange(QUEUE_KEYS[priority], 0, -1)).toEqual([legacy]);
+    },
+  );
+
+  it('a legacy member that is still not a job after surrogate repair is dead-lettered', async () => {
+    await redis.zadd('queue:retry', '0', '{"x":"\\ud83d"}');
+    expect(await moveDueRetries()).toBe(0);
+    expect(await redis.llen('queue:dlq')).toBe(1);
+  });
+});

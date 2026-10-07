@@ -87,6 +87,12 @@ raw and logged without its content, never lost. This includes malformed `queue:r
 entries: a raw entry cannot be classified as redacted, so it is the one way an urgent payload can
 reach the DLQ (only a non-NS writer could produce one).
 
+Every job entry is written through `serializeJob` (`queue.ts`), which turns lone UTF-16 surrogates
+(e.g. a truncated emoji in a name) into U+FFFD: `JSON.stringify` escapes one as `\udXXX`, which
+Redis's cjson rejects, so the retry scheduler could not read the priority and dead-lettered the job
+(an OTP included). For members written by older pods, the Lua retries a failed decode on a copy with
+every `\udXXX` escape replaced, used for routing only; the member itself moves unchanged.
+
 The retry score is epoch **milliseconds**. `getQueueMetrics()` exposes `retry_oldest` as that
 raw epoch-ms timestamp, and `retry_eta_seconds` converted to **seconds** — it previously
 returned the raw millisecond difference despite its name, so a 30-second retry read as
@@ -526,7 +532,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 441 unit tests across 39 files (plus 84 integration tests). The unit suite runs in about a second because Redis
+vitest 4, 445 unit tests across 39 files (plus 88 integration tests). The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real

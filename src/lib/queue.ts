@@ -44,8 +44,34 @@ function queueKeyFor(priority: unknown): string {
     : QUEUE_KEYS.other;
 }
 
+// String.prototype.toWellFormed is ES2024 (Node >= 20); tsconfig's lib is ES2020.
+const toWellFormed = (s: string): string =>
+  (s as string & { toWellFormed(): string }).toWellFormed();
+
+function wellFormed(value: unknown): unknown {
+  if (typeof value === 'string') return toWellFormed(value);
+  if (Array.isArray(value)) return value.map(wellFormed);
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) out[toWellFormed(k)] = wellFormed(v);
+    return out;
+  }
+  return value;
+}
+
+/**
+ * The ONE way a job becomes a Redis queue/retry/DLQ entry. Every string key and
+ * value is made well-formed (a lone UTF-16 surrogate, e.g. a truncated emoji in a
+ * name, becomes U+FFFD) first: JSON.stringify emits a lone surrogate as a
+ * `\udXXX` escape, which Redis's cjson rejects, so MOVE_DUE_RETRIES could not
+ * read the job's priority.
+ */
+export function serializeJob(job: Job): string {
+  return JSON.stringify(wellFormed(job));
+}
+
 export async function pushToPriority(job: Job): Promise<void> {
-  await redis.lpush(queueKeyFor(job.priority), JSON.stringify(job));
+  await redis.lpush(queueKeyFor(job.priority), serializeJob(job));
 }
 
 /**
@@ -83,7 +109,7 @@ export async function popFrom(
 
 /** Schedule a job without counting an attempt (rate-limit deferral). */
 export async function deferJob(job: Job, delayMs: number): Promise<void> {
-  await redis.zadd(RETRY_ZSET, String(Date.now() + delayMs), JSON.stringify(job));
+  await redis.zadd(RETRY_ZSET, String(Date.now() + delayMs), serializeJob(job));
 }
 
 // Claim every due retry and push it onto its own priority's queue in one atomic
@@ -91,12 +117,21 @@ export async function deferJob(job: Job, delayMs: number): Promise<void> {
 // changes pool. A member that is not a JSON object with a string job_id goes to
 // the DLQ untouched rather than vanishing. Each call claims at most RETRY_BATCH members (ARGV[2])
 // so one EVAL never blocks Redis for long; the caller simply calls again. Fixed script; keys and cutoff are passed as KEYS/ARGV.
+//
+// cjson rejects lone UTF-16 surrogate escapes ("invalid unicode escape code").
+// serializeJob never writes one, but members written by older pods can hold them,
+// so a failed decode is retried on a copy with every \udXXX escape replaced by
+// \ufffd. That copy is only read for routing; the member is pushed unchanged
+// (JSON.parse in popFrom accepts it).
 const MOVE_DUE_RETRIES = `
 local due = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'LIMIT', 0, ARGV[2])
 local moved = 0
 for _, raw in ipairs(due) do
   redis.call('ZREM', KEYS[1], raw)
   local ok, job = pcall(cjson.decode, raw)
+  if not ok then
+    ok, job = pcall(cjson.decode, (string.gsub(raw, [[\\u[dD][89a-fA-F]%x%x]], [[\\ufffd]])))
+  end
   if ok and type(job) == 'table' and type(job['job_id']) == 'string' then
     local p = job['priority']
     local target = KEYS[3]
@@ -133,7 +168,7 @@ export async function moveDueRetries(now = Date.now()): Promise<number> {
 export async function pushManyToPriority(jobs: Job[]): Promise<void> {
   if (jobs.length === 0) return;
   const tx = redis.multi();
-  for (const job of jobs) tx.lpush(queueKeyFor(job.priority), JSON.stringify(job));
+  for (const job of jobs) tx.lpush(queueKeyFor(job.priority), serializeJob(job));
   const results = await tx.exec();
   if (!results) throw new Error('Redis MULTI aborted while re-queueing');
   const failed = results.find(([err]) => err);
@@ -153,7 +188,7 @@ export async function popOther(timeoutSeconds = 1) {
 // Dead Letter Queue
 export async function pushDLQ(job: Job) {
   console.log('DLQ →', job.job_id);
-  return redis.lpush(DLQ_QUEUE, JSON.stringify(job));
+  return redis.lpush(DLQ_QUEUE, serializeJob(job));
 }
 
 type RetryFailedJobsOptions = {
@@ -258,7 +293,7 @@ export async function retryFailedJobs({
 export async function scheduleRetry(job: Job, delaySeconds: number) {
   const timestamp = Date.now() + delaySeconds * 1000;
 
-  return redis.zadd(RETRY_ZSET, timestamp.toString(), JSON.stringify(job));
+  return redis.zadd(RETRY_ZSET, timestamp.toString(), serializeJob(job));
 }
 
 /**
@@ -274,7 +309,7 @@ export async function scheduleRetryWithMarker(
   marker?: { key: string; value: string; ttlSeconds: number },
 ): Promise<void> {
   const timestamp = Date.now() + delaySeconds * 1000;
-  const tx = redis.multi().zadd(RETRY_ZSET, timestamp.toString(), JSON.stringify(job));
+  const tx = redis.multi().zadd(RETRY_ZSET, timestamp.toString(), serializeJob(job));
   if (marker) tx.set(marker.key, marker.value, 'EX', marker.ttlSeconds);
   const results = await tx.exec();
   if (!results) throw new Error('Redis MULTI aborted while scheduling a retry');

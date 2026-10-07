@@ -376,3 +376,42 @@ describe('retryFailedJobs replay accounting', () => {
     expect(rec.recoverable).toBe(false);
   });
 });
+
+describe('serializeJob (well-formed payloads)', () => {
+  it('replaces lone surrogates in values and keys with U+FFFD', () => {
+    const out = queue.serializeJob(
+      job({ variables: { name: 'Asha \ud83d', ['k\udc00']: 'ok', nested: ['\ud800x'] } as never }),
+    );
+    expect(out).not.toMatch(/\\ud[89a-f][0-9a-f]{2}/i);
+    const parsed = JSON.parse(out);
+    expect(parsed.variables.name).toBe('Asha �');
+    expect(parsed.variables['k�']).toBe('ok');
+    expect(parsed.variables.nested).toEqual(['�x']);
+  });
+
+  it('keeps valid surrogate pairs and everything else unchanged', () => {
+    const j = job({ variables: { name: 'Asha 😀', n: 3, b: true, z: null } as never, attempt: 2 });
+    expect(JSON.parse(queue.serializeJob(j))).toEqual(JSON.parse(JSON.stringify(j)));
+  });
+
+  it('drops undefined fields like JSON.stringify', () => {
+    expect(JSON.parse(queue.serializeJob(job({ next_attempt_at: undefined })))).not.toHaveProperty('next_attempt_at');
+  });
+
+  it('every push path writes the sanitized form', async () => {
+    const j = job({ variables: { name: 'x\ud83d' } as never });
+    await queue.pushToPriority(j);
+    await queue.deferJob(j, 0);
+    await queue.scheduleRetry({ ...j, job_id: 'job-3' }, 0);
+    await queue.scheduleRetryWithMarker({ ...j, job_id: 'job-2' }, 0);
+    await queue.pushManyToPriority([j]);
+    await queue.pushDLQ(j);
+    const all = [
+      ...(redis.lists.get('queue:other') ?? []),
+      ...(redis.lists.get('queue:dlq') ?? []),
+      ...(redis.zsets.get('queue:retry') ?? []).map((e) => e.member),
+    ];
+    expect(all).toHaveLength(6);
+    for (const raw of all) expect(raw).not.toMatch(/\\ud83d/i);
+  });
+});
