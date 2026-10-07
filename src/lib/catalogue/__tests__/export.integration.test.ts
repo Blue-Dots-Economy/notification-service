@@ -74,10 +74,11 @@ describe('exportCatalogue', () => {
   it('never exports draft or retired rows', async () => {
     await seedCatalogue(cat());
     await createTemplateDraft({ channel: 'email', templateKey: 'draft.only', subject: 'D', bodyHtml: '<p>d</p>' }, 'admin');
-    const [email] = await listTemplates({ channel: 'email', templateKey: 'item.paused' });
-    await retireTemplate(email!.id);
+    // Policy first: an active template cannot be retired while an active policy sends it.
     const [policy] = await listPolicies({ eventType: 'item.paused' });
     await retirePolicy(policy!.id);
+    const [email] = await listTemplates({ channel: 'email', templateKey: 'item.paused' });
+    await retireTemplate(email!.id);
 
     const out = await exportCatalogue('x');
     expect(out.templates.map((t) => t.template_key)).toEqual(['login_otp']);
