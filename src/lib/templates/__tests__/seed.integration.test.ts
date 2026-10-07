@@ -55,7 +55,7 @@ describe('seedBuiltinTemplates', () => {
 
   it('retries its own untouched draft on a later boot once the env is complete', async () => {
     // Pinnacle id set before SMS_LOGIN_OTP_BODY (chart default ""): the first boot leaves a draft.
-    sms.current = { name: 'sms', vendor: 'pinnacle', renders: 'ns', templates: { login_otp: '1107' }, bodies: { login_otp: '' } };
+    usePinnacle('1107');
     expect(await seedBuiltinTemplates()).toBe('seeded_draft');
     expect(await seedBuiltinTemplates()).toBe('seeded_draft');
     process.env.SMS_LOGIN_OTP_BODY = '{{message}} is your OTP';
@@ -67,7 +67,7 @@ describe('seedBuiltinTemplates', () => {
   });
 
   it('leaves a seed draft an admin edited alone', async () => {
-    sms.current = { name: 'sms', vendor: 'pinnacle', renders: 'ns', templates: { login_otp: '1107' }, bodies: { login_otp: '' } };
+    usePinnacle('1107');
     expect(await seedBuiltinTemplates()).toBe('seeded_draft');
     const [d] = await listTemplates({ templateKey: 'login_otp' });
     await updateTemplateDraft(d!.id, { approvalRef: 'admin-note' });

@@ -26,7 +26,8 @@ const DLQ = 'queue:dlq';
 function legacyJob(): Job {
   return {
     job_id: randomUUID(), channel: 'sms', priority: 'other', to: '+911234567890',
-    template_id: 'login_otp', variables: { message: '1' },
+    // Not an OTP template: those are redacted (no job copy) and never recovered.
+    template_id: 'welcome_sms', variables: { name: 'A' },
     audit: { eventId: randomUUID(), attemptId: randomUUID(), createdAt: new Date().toISOString(), correlationId: 'c' },
   };
 }
