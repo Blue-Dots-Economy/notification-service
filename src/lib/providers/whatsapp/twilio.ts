@@ -4,6 +4,8 @@ import { sendWhatsAppMessage } from './twilioSend';
 
 export const whatsappProvider: ProviderDefinition = {
   name: 'whatsapp',
+  vendor: 'twilio',
+  renders: 'provider',
 
   templates: {
     dialflow: 'HXa9cc9766cfdd966ae28b7ebc4ca0d09e',
@@ -21,5 +23,12 @@ export const whatsappProvider: ProviderDefinition = {
     const contentVariables = variables.contentVariables ?? null;
     const ok = await sendWhatsAppMessage(to, contentSid, contentVariables);
     return ok;
+  },
+
+  async sendRendered({ to, rendered, providerTemplateId }) {
+    if (rendered.mode !== 'provider' || !providerTemplateId) {
+      return { ok: false, retryable: false, error: 'rendered mode not supported by twilio' };
+    }
+    return sendWhatsAppMessage(to, providerTemplateId, rendered.variables);
   },
 };

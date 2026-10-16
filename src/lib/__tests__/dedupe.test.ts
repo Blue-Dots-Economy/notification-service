@@ -6,7 +6,7 @@ vi.mock('../redis', async () => {
 });
 
 const redis = (await import('../redis')).default as unknown as import('./redis-fake').RedisFake;
-const { dedupe } = await import('../dedupe');
+const { dedupe, releaseDedupe } = await import('../dedupe');
 
 beforeEach(() => {
   redis.strings.clear();
@@ -45,5 +45,17 @@ describe('dedupe', () => {
     await dedupe('sms:+911234567890:otp');
 
     expect([...redis.strings.keys()]).toEqual(['dedupe:sms:+911234567890:otp']);
+  });
+});
+
+describe('releaseDedupe', () => {
+  it('lets the same key be admitted again after release', async () => {
+    expect(await dedupe('k')).toBe(true);
+    await releaseDedupe('k');
+    expect(await dedupe('k')).toBe(true);
+  });
+
+  it('is a no-op for an unclaimed key', async () => {
+    await expect(releaseDedupe('nope')).resolves.toBeUndefined();
   });
 });

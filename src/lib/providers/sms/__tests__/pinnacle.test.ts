@@ -14,7 +14,7 @@ vi.mock('../../../metrics', () => ({
   renderPrometheus: vi.fn(async () => ''),
 }));
 
-import { errorCodeLabel, loadPinnacleConfig, pollPinnacleBalance, sendSmsWithPinnacle } from '../pinnacle';
+import { errorCodeLabel, loadPinnacleConfig, pinnacleSmsProvider, pollPinnacleBalance, sendSmsWithPinnacle } from '../pinnacle';
 
 const ENV = {
   PINNACLE_API_KEY: 'key-123',
@@ -359,5 +359,10 @@ describe('pinnacle SMS provider', () => {
 
       expect(setGauge).not.toHaveBeenCalled();
     });
+  });
+
+  it('declares its vendor and render mode', () => {
+    expect(pinnacleSmsProvider.vendor).toBe('pinnacle');
+    expect(pinnacleSmsProvider.renders).toBe('ns');
   });
 });

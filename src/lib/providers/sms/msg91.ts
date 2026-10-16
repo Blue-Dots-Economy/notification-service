@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { ProviderDefinition, ProviderSendResult } from '../../../types/provider';
 import * as metrics from '../../metrics';
 import { isRetryableHttpStatus } from './http_status';
+import { isTimeoutError, providerTimeoutMs } from '../http';
 
 export async function sendSmsWithMsg91(
   to: string,
@@ -36,12 +37,13 @@ export async function sendSmsWithMsg91(
         // able to override the resolved recipient phone (SMS-redirect guard).
         recipients: [{ ...recipientVars, mobiles: phone }],
       }),
+      signal: AbortSignal.timeout(providerTimeoutMs()),
     });
   } catch (err) {
     await metrics.incr('ns_sms_send_total', { provider: 'msg91', result: 'failed' });
     return {
       ok: false,
-      error: err instanceof Error ? err.message : 'msg91 request failed',
+      error: isTimeoutError(err) ? 'provider timeout' : err instanceof Error ? err.message : 'msg91 request failed',
       retryable: true,
     };
   }
@@ -85,6 +87,8 @@ export async function sendSmsWithMsg91(
 
 export const smsProvider: ProviderDefinition = {
   name: 'sms',
+  vendor: 'msg91',
+  renders: 'provider',
 
   // Only the legacy single-var OTP is named here; per-event DLT flow ids are
   // sent raw by signalstack (allowRawTemplateId), so they need no entry. The
@@ -102,5 +106,12 @@ export const smsProvider: ProviderDefinition = {
 
   async send({ to, template_id, variables }) {
     return await sendSmsWithMsg91(to, template_id, variables);
+  },
+
+  async sendRendered({ to, rendered, providerTemplateId }) {
+    if (rendered.mode !== 'provider' || !providerTemplateId) {
+      return { ok: false, retryable: false, error: 'rendered mode not supported by msg91' };
+    }
+    return sendSmsWithMsg91(to, providerTemplateId, rendered.variables);
   },
 };

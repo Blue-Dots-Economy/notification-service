@@ -89,6 +89,11 @@ describe('queue depths', () => {
     expect(out).toContain('ns_queue_depth{queue="realtime"} 3');
   });
 
+  it('exposes the bulk queue depth', async () => {
+    const out = await renderPrometheus({ ...EMPTY_QUEUE, bulk: 42 });
+    expect(out).toContain('ns_queue_depth{queue="bulk"} 42');
+  });
+
   it('omits a null retry eta rather than emitting NaN', async () => {
     expect(await renderPrometheus(EMPTY_QUEUE)).not.toContain('ns_retry_eta_seconds');
   });

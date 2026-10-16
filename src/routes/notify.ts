@@ -1,11 +1,18 @@
 import { randomUUID } from 'node:crypto';
 import { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { dedupe } from '../lib/dedupe';
+import { dedupe, releaseDedupe } from '../lib/dedupe';
 import { buildDedupeKey } from '../lib/dedupe_key';
 import { providers } from '../lib/providers';
 import * as queue from '../lib/queue';
-import { requestAuth } from '../plugins/request-auth';
+import { recordAccepted } from '../lib/audit/store';
+import { isOtpTemplate, toAcceptedRecord } from '../lib/audit/redact';
+import { stamp } from '../lib/audit/stamp';
+import { describeDbError } from '../lib/db/errors';
+import { urgentDefaultDeadlineS } from '../lib/deadline';
+import { principalLabel } from '../lib/auth/principal';
+import { authenticate } from '../plugins/auth';
+import { correlationIdFrom, MAX_CORRELATION_ID_LENGTH } from '../lib/correlation';
 import { notifyBodyLimitBytes } from '../lib/providers/email/attachments';
 
 const NotifySchema = z.object({
@@ -26,11 +33,13 @@ const NotifySchema = z.object({
   body: z.string().max(2000).optional(),
 });
 
+export { MAX_CORRELATION_ID_LENGTH };
+
 export async function notifyRoutes(app: FastifyInstance) {
   app.route({
     url: '/notify',
     method: 'POST',
-    preHandler: requestAuth,
+    preHandler: authenticate({ scope: 'notify:send', legacyHmacV1: true }),
     // Fastify's 1 MB default would reject every attachment-bearing request
     // (base64 inflates a 5 MB file to ~6.7 MB), so this route — and only this
     // route — is raised to the derived attachment budget. /failed/retry and the
@@ -76,11 +85,61 @@ export async function notifyRoutes(app: FastifyInstance) {
           : reply.code(409).send({ job_id, enqueued: false, reason: 'duplicate-fallback' });
       }
 
-      const job = { job_id, ...body, priority };
+      const job = {
+        job_id,
+        ...body,
+        priority,
+        ...(priority === 'realtime' ? { deadline: Date.now() + urgentDefaultDeadlineS() * 1000 } : {}),
+        audit: {
+          eventId: randomUUID(),
+          attemptId: randomUUID(),
+          createdAt: new Date().toISOString(),
+          correlationId: correlationIdFrom(req.headers['x-correlation-id'], job_id),
+          // Sticky: decided by the priority the caller sent and the template,
+          // never re-derived. An OTP template is redacted at any priority.
+          redactValues: priority === 'realtime' || isOtpTemplate(body.template_id),
+        },
+      };
+      const source = principalLabel(req.principal);
+      const record = toAcceptedRecord(job, source);
 
-      if (priority === 'realtime') await queue.pushRealtime(job);
-      else await queue.pushOther(job);
+      if (priority === 'realtime') {
+        // Queue first: a slow or unavailable Postgres must never delay an OTP.
+        await queue.pushRealtime(job);
+        void recordAccepted(record).catch((err) =>
+          req.log.error({ err: describeDbError(err), job_id }, 'realtime audit insert failed'),
+        );
+        return reply.send({ job_id, enqueued: true });
+      }
 
+      // Record before queue: a normal send that cannot be recorded is refused,
+      // so a Redis loss can always be recovered from the record (spec
+      // §Architecture, durability model).
+      try {
+        await recordAccepted(record);
+      } catch (err) {
+        req.log.error({ err: describeDbError(err), job_id }, 'audit insert failed; refusing send');
+        // Release the claim so a retry is not suppressed as a duplicate of a
+        // send that was never queued. Best-effort: never changes the 503.
+        await releaseDedupe(key).catch((e) =>
+          req.log.error({ err: (e as Error)?.message ?? String(e), job_id }, 'dedupe release failed'),
+        );
+        return reply.code(503).send({ error: 'audit store unavailable', enqueued: false });
+      }
+      try {
+        await queue.pushOther(job);
+      } catch (err) {
+        // Recorded but never queued: close the record so recovery does not
+        // send it later. Best-effort (stamp never throws); the error still
+        // propagates so the caller sees the failure.
+        await stamp(job, { status: 'failed', attemptNo: 1, error: 'enqueue failed' });
+        // Release the claim as on the 503 path, so the caller's retry is not
+        // suppressed as a duplicate of a send that was never queued.
+        await releaseDedupe(key).catch((e) =>
+          req.log.error({ err: (e as Error)?.message ?? String(e), job_id }, 'dedupe release failed'),
+        );
+        throw err;
+      }
       reply.send({ job_id, enqueued: true });
     },
   });

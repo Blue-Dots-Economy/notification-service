@@ -8,6 +8,16 @@ vi.mock('nodemailer', () => ({
   createTransport: (o: unknown) => createTransportSpy(o),
 }));
 
+const sesCtor = vi.fn();
+vi.mock('@aws-sdk/client-sesv2', () => ({
+  SESv2Client: class {
+    constructor(cfg: unknown) {
+      sesCtor(cfg);
+    }
+  },
+  SendEmailCommand: class {},
+}));
+
 const MAIL_VARS = [
   'SMTP_AWS_SES',
   'SMTP_HOST',
@@ -19,6 +29,7 @@ const MAIL_VARS = [
   'AWS_REGION',
   'AWS_ACCESS_KEY_ID',
   'AWS_SECRET_ACCESS_KEY',
+  'PROVIDER_TIMEOUT_MS',
 ];
 
 const message = {
@@ -44,6 +55,8 @@ async function send(env: Record<string, string>) {
   };
 }
 
+const TIMEOUTS = { connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 10000 };
+
 // Gmail is configured like any other relay — no dedicated flag.
 const GMAIL_ENV = {
   SMTP_HOST: 'smtp.gmail.com',
@@ -65,6 +78,7 @@ describe('transport selection', () => {
       port: 465,
       secure: true,
       auth: { user: 'relay@gmail.com', pass: 'app-pw' },
+      ...TIMEOUTS,
     });
   });
 
@@ -79,12 +93,13 @@ describe('transport selection', () => {
       port: 587,
       secure: false,
       auth: { user: 'notify@bluedots.example', pass: 'zoho-pw' },
+      ...TIMEOUTS,
     });
   });
 
   it('omits auth entirely for an unauthenticated relay', async () => {
     const { transport } = await send({ SMTP_HOST: 'localhost', SMTP_PORT: '1025' });
-    expect(transport).toEqual({ host: 'localhost', port: 1025, secure: false });
+    expect(transport).toEqual({ host: 'localhost', port: 1025, secure: false, ...TIMEOUTS });
     expect(transport).not.toHaveProperty('auth');
   });
 
@@ -172,5 +187,29 @@ describe('From address', () => {
       AWS_SECRET_ACCESS_KEY: 'secret',
     });
     expect(sent.from).toBe('Signals Support <no-reply@bluedots.example>');
+  });
+});
+
+describe('vendor timeouts', () => {
+  it('bounds every SMTP phase by PROVIDER_TIMEOUT_MS (default 10s)', async () => {
+    const dflt = await send({ SMTP_HOST: 'smtp.example.com' });
+    expect(dflt.transport).toMatchObject({ connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 10000 });
+    const custom = await send({ SMTP_HOST: 'smtp.example.com', PROVIDER_TIMEOUT_MS: '2500' });
+    expect(custom.transport).toMatchObject({ connectionTimeout: 2500, greetingTimeout: 2500, socketTimeout: 2500 });
+  });
+
+  it('bounds the SES client request and connection', async () => {
+    sesCtor.mockClear();
+    await send({
+      SMTP_AWS_SES: 'true', AWS_REGION: 'ap-south-1', AWS_ACCESS_KEY_ID: 'a', AWS_SECRET_ACCESS_KEY: 'b',
+      PROVIDER_TIMEOUT_MS: '2500',
+    });
+    expect(sesCtor.mock.calls[0]![0]).toMatchObject({ requestHandler: { requestTimeout: 2500, connectionTimeout: 2500 } });
+  });
+
+  it('reports a transport timeout as a failed (retryable by default) send, not a crash', async () => {
+    sendMailSpy.mockRejectedValueOnce(Object.assign(new Error('Connection timeout'), { code: 'ETIMEDOUT' }));
+    const { result } = await send({ SMTP_HOST: 'smtp.example.com' });
+    expect(result).toEqual({ ok: false });
   });
 });

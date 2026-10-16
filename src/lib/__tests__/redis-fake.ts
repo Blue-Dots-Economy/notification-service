@@ -54,6 +54,13 @@ export class RedisFake {
     return l.length === 0 ? null : l.pop()!;
   }
 
+  /** LINDEX — `string | null`; a negative index counts from the tail. */
+  async lindex(key: string, index: number): Promise<string | null> {
+    const l = this.list(key);
+    const i = index < 0 ? l.length + index : index;
+    return l[i] ?? null;
+  }
+
   async lrange(key: string, start: number, stop: number): Promise<string[]> {
     const l = this.list(key);
     return stop === -1 ? l.slice(start) : l.slice(start, stop + 1);
@@ -79,12 +86,18 @@ export class RedisFake {
   }
 
   /** SET key value EX ttl NX — `'OK'` on success, null when the key exists. */
+  async del(...keys: string[]): Promise<number> {
+    let n = 0;
+    for (const k of keys) if (this.strings.delete(k)) n++;
+    return n;
+  }
+
   async set(
     key: string,
     value: string,
     _ex: 'EX',
     ttlSeconds: number,
-    mode: 'NX',
+    mode?: 'NX',
   ): Promise<'OK' | null> {
     const existing = this.strings.get(key);
     const live =
@@ -92,6 +105,16 @@ export class RedisFake {
     if (mode === 'NX' && live) return null;
     this.strings.set(key, { value, expiresAt: Date.now() + ttlSeconds * 1000 });
     return 'OK';
+  }
+
+  async get(key: string): Promise<string | null> {
+    const e = this.strings.get(key);
+    if (!e || (e.expiresAt !== undefined && e.expiresAt <= Date.now())) return null;
+    return e.value;
+  }
+
+  async mget(...keys: string[]): Promise<Array<string | null>> {
+    return Promise.all(keys.map((k) => this.get(k)));
   }
 
   async zadd(key: string, score: string | number, member: string): Promise<number> {
@@ -200,6 +223,18 @@ export class RedisFake {
   multi() {
     const queued: Array<() => Promise<unknown>> = [];
     const chain = {
+      lpush: (key: string, value: string) => {
+        queued.push(() => this.lpush(key, value));
+        return chain;
+      },
+      zadd: (key: string, score: string | number, member: string) => {
+        queued.push(() => this.zadd(key, score, member));
+        return chain;
+      },
+      set: (key: string, value: string, ex: 'EX', ttlSeconds: number) => {
+        queued.push(() => this.set(key, value, ex, ttlSeconds));
+        return chain;
+      },
       llen: (key: string) => {
         queued.push(() => this.llen(key));
         return chain;

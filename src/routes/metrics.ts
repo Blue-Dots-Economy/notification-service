@@ -1,10 +1,10 @@
 import { FastifyInstance } from 'fastify';
 import * as queue from '../lib/queue';
 import { renderPrometheus } from '../lib/metrics';
-import { requestAuth } from '../plugins/request-auth';
+import { authenticate } from '../plugins/auth';
 
 export async function metricsRoutes(app: FastifyInstance) {
-  app.get('/metrics/queue', { preHandler: requestAuth }, async (req, reply) => {
+  app.get('/metrics/queue', { preHandler: authenticate({ scope: 'any' }) }, async (req, reply) => {
     try {
       const metrics = await queue.getQueueMetrics();
 
