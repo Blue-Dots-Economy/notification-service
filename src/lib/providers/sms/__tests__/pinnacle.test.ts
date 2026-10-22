@@ -17,6 +17,7 @@ vi.mock('../../../metrics', () => ({
 import {
   errorCodeLabel,
   loadPinnacleConfig,
+  linkNotAllowed,
   loadOtpTemplates,
   parseOtpTemplateRow,
   pollPinnacleBalance,
@@ -393,7 +394,10 @@ describe('sign-in / sign-up OTP templates', () => {
       provider: 'pinnacle',
       provider_template_id: id,
       approval_ref: key.endsWith('signup_otp') ? 'signup_otp_sms' : 'signin_otp_sms',
-      variables: ['message', 'url'],
+      variables: [
+        { name: 'message', sensitive: true },
+        { name: 'url', type: 'url', urlHosts: ['signals-purpledots.depwd.gov.in'] },
+      ],
       body_text: body,
       ...extra,
     });
@@ -410,8 +414,11 @@ describe('sign-in / sign-up OTP templates', () => {
       [row('signals_signup_otp', '1507', SIGNUP, { channel: 'email' }), /channel/],
       [row('signals_signup_otp', '1507', SIGNUP, { provider: 'msg91' }), /provider/],
       [row('signals_signin_otp', '1507', SIGNIN), /expected 'signals_signup_otp'/],
-      [row('signals_signup_otp', '1507', SIGNUP, { variables: ['message'] }), /undeclared variables: url/],
+      [row('signals_signup_otp', '1507', SIGNUP, { variables: [{ name: 'message' }] }), /undeclared variables: url/],
       [row('signals_signup_otp', '1507', SIGNUP, { variables: undefined }), /variables/],
+      [row('signals_signup_otp', '1507', SIGNUP, { variables: ['message', 'url'] }), /variables/],
+      [row('signals_signup_otp', '1507', SIGNUP, { network: undefined }), /network/],
+      [row('signals_signup_otp', '1507', SIGNUP, { locale: undefined }), /locale/],
     ];
     for (const [raw, reason] of cases) {
       const parsed = parseOtpTemplateRow(raw, 'signals_signup_otp');
@@ -420,7 +427,7 @@ describe('sign-in / sign-up OTP templates', () => {
   });
 
   it('declares only the templates that are configured, one per app and flow', () => {
-    expect(loadOtpTemplates({} as NodeJS.ProcessEnv)).toEqual({ templates: {}, bodies: {} });
+    expect(loadOtpTemplates({} as NodeJS.ProcessEnv)).toEqual({ templates: {}, bodies: {}, urlHosts: {} });
     const env = {
       PINNACLE_TEMPLATE_SIGNALS_SIGNIN_OTP: row('signals_signin_otp', '1507000000000001', SIGNIN),
       PINNACLE_TEMPLATE_SIGNALS_SIGNUP_OTP: row('signals_signup_otp', '1507000000000002', SIGNUP),
@@ -440,12 +447,35 @@ describe('sign-in / sign-up OTP templates', () => {
         aggregator_signin_otp: SIGNIN,
         aggregator_signup_otp: SIGNUP,
       },
+      urlHosts: {
+        '1507000000000001': { url: ['signals-purpledots.depwd.gov.in'] },
+        '1507000000000002': { url: ['signals-purpledots.depwd.gov.in'] },
+        '1507000000000003': { url: ['signals-purpledots.depwd.gov.in'] },
+        '1507000000000004': { url: ['signals-purpledots.depwd.gov.in'] },
+      },
     });
   });
 
-  it('skips an invalid row instead of declaring a blank template', () => {
+  it('fails startup on an invalid row when Pinnacle is the SMS provider', () => {
+    const env = {
+      SMS_PROVIDER: 'pinnacle',
+      PINNACLE_TEMPLATE_SIGNALS_SIGNUP_OTP: '{"template_key":"signals_signup_otp"}',
+    } as unknown as NodeJS.ProcessEnv;
+    expect(() => loadOtpTemplates(env)).toThrow(/PINNACLE_TEMPLATE_SIGNALS_SIGNUP_OTP/);
+  });
+
+  it('skips an invalid row when another vendor is the SMS provider', () => {
     const env = { PINNACLE_TEMPLATE_SIGNALS_SIGNUP_OTP: '{"template_key":"signals_signup_otp"}' } as unknown as NodeJS.ProcessEnv;
-    expect(loadOtpTemplates(env)).toEqual({ templates: {}, bodies: {} });
+    expect(loadOtpTemplates(env)).toEqual({ templates: {}, bodies: {}, urlHosts: {} });
+  });
+
+  it('allows a link only on a host listed in urlHosts', () => {
+    const hosts = { url: ['signals-purpledots.depwd.gov.in'] };
+    expect(linkNotAllowed(hosts, { message: '1', url: 'https://signals-purpledots.depwd.gov.in' })).toBeUndefined();
+    expect(linkNotAllowed(hosts, { message: '1', url: 'https://seekers-purpledots.depwd.gov.in' })).toMatch(/url host .* not in urlHosts/);
+    expect(linkNotAllowed(hosts, { message: '1', url: 'not a url' })).toMatch(/url host .* not in urlHosts/);
+    expect(linkNotAllowed(undefined, { message: '1', url: 'https://any.example' })).toBeUndefined();
+    expect(linkNotAllowed(hosts, { message: '1' })).toBeUndefined();
   });
 
   it('renders the exact approved text for both templates', () => {

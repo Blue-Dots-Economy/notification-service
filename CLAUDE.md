@@ -243,6 +243,14 @@ Required for providers (varies by implementation):
   Client UID".
   `PINNACLE_LOGIN_OTP_TEMPLATE_ID` + `SMS_LOGIN_OTP_BODY` configure the one
   named template; a blank id dead-letters with "named but not configured".
+  `PINNACLE_TEMPLATE_{SIGNALS,AGGREGATOR}_{SIGNIN,SIGNUP}_OTP` declare the
+  sign-in and sign-up OTP templates Keycloak sends per app. Each is one JSON row
+  in the event-platform `template` table shape (`network` and `locale` required,
+  `variables` as `VariableSpec[]`). A set row that does not parse stops startup
+  when `SMS_PROVIDER=pinnacle`, rather than falling through to raw pass-through.
+  A `type: "url"` variable with `urlHosts` is checked before sending; a link on
+  any other host fails the send permanently (the operator drops non-whitelisted
+  links). `PINNACLE_TIMEOUT_MS` (default 10000) bounds each Pinnacle call.
 - `SMS_LOGIN_OTP_TEMPLATE_ID` — MSG91 flow id for the legacy `login_otp` template.
   Read in `src/lib/providers/sms/msg91.ts`; optional, with a back-compat default of
   the previously-hardcoded id. Per-event DLT flow ids are sent raw and need no env

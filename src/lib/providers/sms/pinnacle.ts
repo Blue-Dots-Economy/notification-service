@@ -34,15 +34,24 @@ const OTP_TEMPLATE_ENV_VARS: Record<string, string> = {
   aggregator_signup_otp: 'PINNACLE_TEMPLATE_AGGREGATOR_SIGNUP_OTP',
 };
 
+const VariableSpecSchema = z.looseObject({
+  name: z.string().min(1),
+  required: z.boolean().optional(),
+  type: z.string().optional(),
+  sensitive: z.boolean().optional(),
+  raw: z.boolean().optional(),
+  urlHosts: z.array(z.string().min(1)).optional(),
+});
+
 const OtpTemplateRowSchema = z.looseObject({
   template_key: z.string().min(1),
+  network: z.string().min(1),
   channel: z.literal('sms'),
+  locale: z.string().min(1),
   provider: z.literal('pinnacle'),
   provider_template_id: z.string().trim().min(1),
   body_text: z.string().min(1),
-  variables: z.array(z.string()),
-  network: z.string().optional(),
-  locale: z.string().optional(),
+  variables: z.array(VariableSpecSchema),
   version: z.number().int().optional(),
   approval_ref: z.string().optional(),
 });
@@ -65,29 +74,61 @@ export function parseOtpTemplateRow(raw: string, expectedKey: string): OtpTempla
     return { error: `template_key is '${row.template_key}', expected '${expectedKey}'` };
   }
   const placeholders = [...row.body_text.matchAll(/\{\{(\w+)\}\}/g)].map((m) => m[1]);
-  const undeclaredPlaceholders = placeholders.filter((v) => !row.variables.includes(v));
+  const declared = row.variables.map((v) => v.name);
+  const undeclaredPlaceholders = placeholders.filter((v) => !declared.includes(v));
   if (undeclaredPlaceholders.length) return { error: `body_text uses undeclared variables: ${undeclaredPlaceholders.join(', ')}` };
   return row;
 }
 
+/** Allowed link hosts per url variable, keyed by DLT template id. */
+type UrlHosts = Record<string, Record<string, string[]>>;
+
 export function loadOtpTemplates(env = process.env): {
   templates: Record<string, string>;
   bodies: Record<string, string>;
+  urlHosts: UrlHosts;
 } {
   const templates: Record<string, string> = {};
   const bodies: Record<string, string> = {};
+  const urlHosts: UrlHosts = {};
   for (const [key, setting] of Object.entries(OTP_TEMPLATE_ENV_VARS)) {
     const raw = env[setting];
     if (!raw) continue;
     const row = parseOtpTemplateRow(raw, key);
     if ('error' in row) {
+      // A broken row would otherwise fall through to raw pass-through and fail
+      // only at send time, so refuse to start while Pinnacle is the vendor.
+      if (env.SMS_PROVIDER === 'pinnacle') throw new Error(`pinnacle: ${setting} is invalid (${row.error})`);
       console.log(`pinnacle: ${setting} skipped (${row.error}); template ${key} not configured`);
       continue;
     }
     templates[key] = row.provider_template_id;
     bodies[key] = row.body_text;
+    const hosts = Object.fromEntries(
+      row.variables.filter((v) => v.type === 'url' && v.urlHosts).map((v) => [v.name, v.urlHosts!])
+    );
+    if (Object.keys(hosts).length) urlHosts[row.provider_template_id] = hosts;
   }
-  return { templates, bodies };
+  return { templates, bodies, urlHosts };
+}
+
+/** Why a url variable may not be sent, or undefined when every link is on its allowed hosts. */
+export function linkNotAllowed(
+  hostsByVariable: Record<string, string[]> | undefined,
+  variables: Record<string, string>
+): string | undefined {
+  for (const [name, hosts] of Object.entries(hostsByVariable ?? {})) {
+    const value = variables[name];
+    if (value === undefined) continue;
+    let host = '';
+    try {
+      host = new URL(value).host;
+    } catch {
+      // not a URL; reported below like any other disallowed host
+    }
+    if (!hosts.includes(host)) return `${name} host '${host || value}' not in urlHosts`;
+  }
+  return undefined;
 }
 
 interface PinnacleConfig {
@@ -231,6 +272,8 @@ export async function sendSmsWithPinnacle(
       {
         number: normalisePhone(to),
         text,
+        // No clientuid: Pinnacle rejects a job id there (EC1036 Invalid Client
+        // UID). Delivery receipts will need one in a format Pinnacle accepts.
       },
     ],
   };
@@ -374,6 +417,8 @@ export const pinnacleSmsProvider: ProviderDefinition = {
   schema: z.record(z.string(), z.string()),
 
   async send({ to, template_id, variables, body, job_id }) {
+    const notAllowed = linkNotAllowed(otpTemplates.urlHosts[template_id], variables ?? {});
+    if (notAllowed) return { ok: false, error: notAllowed, retryable: false };
     return await sendSmsWithPinnacle(to, template_id, variables, body, job_id);
   },
 };
