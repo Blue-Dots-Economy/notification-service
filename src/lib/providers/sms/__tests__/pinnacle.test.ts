@@ -14,7 +14,15 @@ vi.mock('../../../metrics', () => ({
   renderPrometheus: vi.fn(async () => ''),
 }));
 
-import { errorCodeLabel, loadPinnacleConfig, pollPinnacleBalance, sendSmsWithPinnacle } from '../pinnacle';
+import {
+  errorCodeLabel,
+  loadPinnacleConfig,
+  loadOtpTemplates,
+  parseOtpTemplateRow,
+  pollPinnacleBalance,
+  sendSmsWithPinnacle,
+} from '../pinnacle';
+import { renderBody } from '../render';
 
 const ENV = {
   PINNACLE_API_KEY: 'key-123',
@@ -359,5 +367,134 @@ describe('pinnacle SMS provider', () => {
 
       expect(setGauge).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe('sign-in / sign-up OTP templates', () => {
+  const SIGNIN =
+    '{{message}} is the OTP to verify your phone number on Purple Dots {{url}}. Please do not share this with anyone. This is valid for 5 mins. - Team ALIMCO';
+  const SIGNUP =
+    '{{message}} is the OTP to verify your phone number on Purple Dots {{url}}. Do not share with anyone. Valid for 5 mins. Read the Terms of Use and Privacy Policy on the app carefully. - Team ALIMCO';
+
+  const row = (key: string, id: string, body: string, extra: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      template_key: key,
+      network: 'purple_dot',
+      channel: 'sms',
+      locale: 'en',
+      version: 1,
+      provider: 'pinnacle',
+      provider_template_id: id,
+      approval_ref: key.endsWith('signup_otp') ? 'signup_otp_sms' : 'signin_otp_sms',
+      variables: ['message', 'url'],
+      body_text: body,
+      ...extra,
+    });
+
+  it('parses a template row with the event-platform field names', () => {
+    const parsed = parseOtpTemplateRow(row('signals_signup_otp', '1507000000000002', SIGNUP), 'signals_signup_otp');
+    expect(parsed).toMatchObject({ provider_template_id: '1507000000000002', body_text: SIGNUP, network: 'purple_dot' });
+  });
+
+  it('rejects rows that are not usable', () => {
+    const cases: Array<[string, RegExp]> = [
+      ['not json', /not valid JSON/],
+      [row('signals_signup_otp', '', SIGNUP), /provider_template_id/],
+      [row('signals_signup_otp', '1507', SIGNUP, { channel: 'email' }), /channel/],
+      [row('signals_signup_otp', '1507', SIGNUP, { provider: 'msg91' }), /provider/],
+      [row('signals_signin_otp', '1507', SIGNIN), /expected 'signals_signup_otp'/],
+      [row('signals_signup_otp', '1507', SIGNUP, { variables: ['message'] }), /undeclared variables: url/],
+      [row('signals_signup_otp', '1507', SIGNUP, { variables: undefined }), /variables/],
+    ];
+    for (const [raw, reason] of cases) {
+      const parsed = parseOtpTemplateRow(raw, 'signals_signup_otp');
+      expect('error' in parsed && parsed.error).toMatch(reason);
+    }
+  });
+
+  it('declares only the templates that are configured, one per app and flow', () => {
+    expect(loadOtpTemplates({} as NodeJS.ProcessEnv)).toEqual({ templates: {}, bodies: {} });
+    const env = {
+      PINNACLE_TEMPLATE_SIGNALS_SIGNIN_OTP: row('signals_signin_otp', '1507000000000001', SIGNIN),
+      PINNACLE_TEMPLATE_SIGNALS_SIGNUP_OTP: row('signals_signup_otp', '1507000000000002', SIGNUP),
+      PINNACLE_TEMPLATE_AGGREGATOR_SIGNIN_OTP: row('aggregator_signin_otp', '1507000000000003', SIGNIN),
+      PINNACLE_TEMPLATE_AGGREGATOR_SIGNUP_OTP: row('aggregator_signup_otp', '1507000000000004', SIGNUP),
+    } as unknown as NodeJS.ProcessEnv;
+    expect(loadOtpTemplates(env)).toEqual({
+      templates: {
+        signals_signin_otp: '1507000000000001',
+        signals_signup_otp: '1507000000000002',
+        aggregator_signin_otp: '1507000000000003',
+        aggregator_signup_otp: '1507000000000004',
+      },
+      bodies: {
+        signals_signin_otp: SIGNIN,
+        signals_signup_otp: SIGNUP,
+        aggregator_signin_otp: SIGNIN,
+        aggregator_signup_otp: SIGNUP,
+      },
+    });
+  });
+
+  it('skips an invalid row instead of declaring a blank template', () => {
+    const env = { PINNACLE_TEMPLATE_SIGNALS_SIGNUP_OTP: '{"template_key":"signals_signup_otp"}' } as unknown as NodeJS.ProcessEnv;
+    expect(loadOtpTemplates(env)).toEqual({ templates: {}, bodies: {} });
+  });
+
+  it('renders the exact approved text for both templates', () => {
+    const vars = { message: '482913', url: 'https://signals-purpledots.depwd.gov.in' };
+    expect(renderBody(SIGNIN, vars)).toBe(
+      '482913 is the OTP to verify your phone number on Purple Dots https://signals-purpledots.depwd.gov.in. Please do not share this with anyone. This is valid for 5 mins. - Team ALIMCO'
+    );
+    expect(renderBody(SIGNUP, vars)).toBe(
+      '482913 is the OTP to verify your phone number on Purple Dots https://signals-purpledots.depwd.gov.in. Do not share with anyone. Valid for 5 mins. Read the Terms of Use and Privacy Policy on the app carefully. - Team ALIMCO'
+    );
+  });
+
+  it('sends the sign-up text with its DLT id', async () => {
+    const fetchMock = mockFetch(OK);
+    const res = await sendSmsWithPinnacle(
+      '+919000000001',
+      '1507000000000002',
+      { message: '482913', url: 'https://aggregators-purpledots.depwd.gov.in' },
+      SIGNUP,
+      'job-1',
+      ENV
+    );
+    expect(res.ok).toBe(true);
+    const sent = bodyOf(fetchMock);
+    expect(sent.dlttempid).toBe('1507000000000002');
+    expect(sent.message[0].text).toBe(
+      '482913 is the OTP to verify your phone number on Purple Dots https://aggregators-purpledots.depwd.gov.in. Do not share with anyone. Valid for 5 mins. Read the Terms of Use and Privacy Policy on the app carefully. - Team ALIMCO'
+    );
+  });
+
+  it('rejects a send with the link missing, without calling Pinnacle', async () => {
+    const fetchMock = mockFetch(OK);
+    const res = await sendSmsWithPinnacle('+919000000001', '1507000000000002', { message: '482913' }, SIGNUP, 'job-1', ENV);
+    expect(res).toMatchObject({ ok: false, retryable: false });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('times out a vendor call that does not answer, as a retryable failure', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_url: string, init: { signal: AbortSignal }) =>
+        new Promise((_resolve, reject) => init.signal.addEventListener('abort', () => reject(init.signal.reason)))
+      )
+    );
+    const env = { ...ENV, PINNACLE_TIMEOUT_MS: '20' } as unknown as NodeJS.ProcessEnv;
+    const res = await sendSmsWithPinnacle('+919000000001', '1507000000000001', { message: '1' }, 'code {{message}}', 'j', env);
+    expect(res).toEqual({ ok: false, error: 'pinnacle request timed out', retryable: true });
+  });
+
+  it('uses the default timeout when the configured one is not a positive number', async () => {
+    for (const timeout of ['-1', 'abc']) {
+      const fetchMock = mockFetch(OK);
+      const env = { ...ENV, PINNACLE_TIMEOUT_MS: timeout } as unknown as NodeJS.ProcessEnv;
+      const res = await sendSmsWithPinnacle('+919000000001', '1507000000000001', { message: '1' }, 'code {{message}}', 'j', env);
+      expect(res.ok).toBe(true);
+      expect(fetchMock).toHaveBeenCalledOnce();
+    }
   });
 });

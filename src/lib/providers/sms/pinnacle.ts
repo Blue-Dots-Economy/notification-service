@@ -20,6 +20,75 @@ import { MAX_LENGTH, messageType, renderBody, UnresolvedTemplateVariables } from
  */
 
 const DEFAULT_BASE_URL = 'https://api.pinnacle.in';
+const DEFAULT_TIMEOUT_MS = 10_000;
+
+const OTP_TEMPLATE_ENV_VARS: Record<string, string> = {
+  signals_signin_otp: 'PINNACLE_TEMPLATE_SIGNALS_SIGNIN_OTP',
+  signals_signup_otp: 'PINNACLE_TEMPLATE_SIGNALS_SIGNUP_OTP',
+  aggregator_signin_otp: 'PINNACLE_TEMPLATE_AGGREGATOR_SIGNIN_OTP',
+  aggregator_signup_otp: 'PINNACLE_TEMPLATE_AGGREGATOR_SIGNUP_OTP',
+};
+
+const OtpTemplateRowSchema = z.looseObject({
+  template_key: z.string().min(1),
+  channel: z.literal('sms'),
+  provider: z.literal('pinnacle'),
+  provider_template_id: z.string().trim().min(1),
+  body_text: z.string().min(1),
+  variables: z.array(z.string()),
+  network: z.string().optional(),
+  locale: z.string().optional(),
+  version: z.number().int().optional(),
+  approval_ref: z.string().optional(),
+});
+
+function requestTimeoutMs(env: NodeJS.ProcessEnv): number {
+  const configured = Number(env.PINNACLE_TIMEOUT_MS);
+  return configured > 0 ? configured : DEFAULT_TIMEOUT_MS;
+}
+
+export type OtpTemplateRow = z.infer<typeof OtpTemplateRowSchema>;
+
+export function parseOtpTemplateRow(raw: string, expectedKey: string): OtpTemplateRow | { error: string } {
+  let json: unknown;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    return { error: 'not valid JSON' };
+  }
+  const parsed = OtpTemplateRowSchema.safeParse(json);
+  if (!parsed.success) {
+    return { error: parsed.error.issues.map((i) => i.path.join('.') || 'row').join(', ') + ' invalid or missing' };
+  }
+  const row = parsed.data;
+  if (row.template_key !== expectedKey) {
+    return { error: `template_key is '${row.template_key}', expected '${expectedKey}'` };
+  }
+  const placeholders = [...row.body_text.matchAll(/\{\{(\w+)\}\}/g)].map((m) => m[1]);
+  const undeclaredPlaceholders = placeholders.filter((v) => !row.variables.includes(v));
+  if (undeclaredPlaceholders.length) return { error: `body_text uses undeclared variables: ${undeclaredPlaceholders.join(', ')}` };
+  return row;
+}
+
+export function loadOtpTemplates(env = process.env): {
+  templates: Record<string, string>;
+  bodies: Record<string, string>;
+} {
+  const templates: Record<string, string> = {};
+  const bodies: Record<string, string> = {};
+  for (const [key, setting] of Object.entries(OTP_TEMPLATE_ENV_VARS)) {
+    const raw = env[setting];
+    if (!raw) continue;
+    const row = parseOtpTemplateRow(raw, key);
+    if ('error' in row) {
+      console.log(`pinnacle: ${setting} skipped (${row.error}); template ${key} not configured`);
+      continue;
+    }
+    templates[key] = row.provider_template_id;
+    bodies[key] = row.body_text;
+  }
+  return { templates, bodies };
+}
 
 interface PinnacleConfig {
   baseUrl: string;
@@ -175,6 +244,7 @@ export async function sendSmsWithPinnacle(
       method: 'POST',
       headers: { 'Content-Type': 'application/json', apikey: config.apiKey },
       body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(requestTimeoutMs(env)),
     });
 
     if (!resp.ok) {
@@ -208,7 +278,12 @@ export async function sendSmsWithPinnacle(
     await metrics.incr('ns_sms_send_total', { provider: 'pinnacle', result: 'failed' });
     return {
       ok: false,
-      error: err instanceof Error ? err.message : 'pinnacle request failed',
+      error:
+        err instanceof Error && err.name === 'TimeoutError'
+          ? 'pinnacle request timed out'
+          : err instanceof Error
+            ? err.message
+            : 'pinnacle request failed',
       retryable: true,
     };
   }
@@ -277,6 +352,8 @@ async function failPoll(reason: string, detail: string): Promise<null> {
   return null;
 }
 
+const otpTemplates = loadOtpTemplates();
+
 export const pinnacleSmsProvider: ProviderDefinition = {
   // Deliberately `sms`, not `pinnacle-sms`: the provider registry keys on this
   // name and it is the `channel` every caller sends. Swapping vendors must not
@@ -289,9 +366,11 @@ export const pinnacleSmsProvider: ProviderDefinition = {
   // to go with it, since Pinnacle renders nothing.
   templates: {
     login_otp: process.env.PINNACLE_LOGIN_OTP_TEMPLATE_ID ?? '',
+    ...otpTemplates.templates,
   },
   bodies: {
     login_otp: process.env.SMS_LOGIN_OTP_BODY ?? '',
+    ...otpTemplates.bodies,
   },
   allowRawTemplateId: true,
 
