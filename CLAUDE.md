@@ -389,15 +389,15 @@ by `needs:`.**
   (`v*.*.*`, `20*-s*-rc*`) or a **manual run** only (#756). It previously also published on
   pushes to `main` and `feature`; those triggers are gone, and `:latest` now follows releases
   rather than the `main` branch.
-- **`create-release.yaml`** — the front door for cutting a release. Dispatch it with a tag name
-  and a base branch (`base` defaults to `main`. The `docs_only` input re-publishes an existing tag's notes to the docs PR.); it checks CI, creates the tag and the GitHub release with generated notes
+- **`create-release.yml`** — the front door for cutting a release. Dispatch it with a tag name
+  and a base branch (`base` defaults to `main`. The `docs_only` input re-publishes an existing tag's notes to the docs PR.); it checks CI, creates the tag and the GitHub release with notes taken from the release PR sections (curated, not PR titles)
   in one API call, then dispatches the image build. `dry_run` previews the notes without
   creating anything.
 
 **The CI gate (Blue-Dots-Economy/signals-dpg#765).** This repo never had one — the image build
 has always been a separate workflow from `ci.yaml` — so a release tag could publish an image
 built from a commit whose tests never ran. Both `notification-image-build.yaml`'s `verify-ci`
-job and `create-release.yaml` now query `ci.yaml` runs for the commit and refuse unless one
+job and `create-release.yml` now query `ci.yaml` runs for the commit and refuse unless one
 concluded `success`. Three things about it are deliberate and easy to undo by accident:
 
 - It reads **workflow runs**, not check runs, so it stays correct if the job names or the job
@@ -413,9 +413,9 @@ refuse a tag cut there.
 
 **Two GitHub behaviours the release path depends on**, both of which look like bugs when you
 hit them: a tag pushed with `GITHUB_TOKEN` does **not** trigger `on: push: tags` (GitHub
-suppresses it to prevent recursion), which is why `create-release.yaml` creates the tag through
+suppresses it to prevent recursion), which is why `create-release.yml` creates the tag through
 the REST API and then dispatches the build explicitly; and a workflow is **not dispatchable
-until it exists on the default branch**, so `create-release.yaml` will not appear in the Actions
+until it exists on the default branch**, so `create-release.yml` will not appear in the Actions
 tab while it sits on a side branch.
 
 **Two Docker gotchas**, both of which broke the image build in ways CI did not see:
