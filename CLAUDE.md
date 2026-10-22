@@ -389,15 +389,15 @@ by `needs:`.**
   (`v*.*.*`, `20*-s*-rc*`) or a **manual run** only (#756). It previously also published on
   pushes to `main` and `feature`; those triggers are gone, and `:latest` now follows releases
   rather than the `main` branch.
-- **`cut-release.yaml`** — the front door for cutting a release. Dispatch it with a tag name
-  and a base branch; it checks CI, creates the tag and the GitHub release with generated notes
+- **`create-release.yml`** — the front door for cutting a release. Dispatch it with a tag name
+  and a base branch (`base` defaults to `main`. The `docs_only` input re-publishes an existing tag's notes to the docs PR.); it checks CI, creates the tag and the GitHub release with notes taken from the release PR sections (curated, not PR titles)
   in one API call, then dispatches the image build. `dry_run` previews the notes without
   creating anything.
 
 **The CI gate (Blue-Dots-Economy/signals-dpg#765).** This repo never had one — the image build
 has always been a separate workflow from `ci.yaml` — so a release tag could publish an image
 built from a commit whose tests never ran. Both `notification-image-build.yaml`'s `verify-ci`
-job and `cut-release.yaml` now query `ci.yaml` runs for the commit and refuse unless one
+job and `create-release.yml` now query `ci.yaml` runs for the commit and refuse unless one
 concluded `success`. Three things about it are deliberate and easy to undo by accident:
 
 - It reads **workflow runs**, not check runs, so it stays correct if the job names or the job
@@ -407,15 +407,15 @@ concluded `success`. Three things about it are deliberate and easy to undo by ac
 - Both carry a `skip_ci_check` input for an emergency publish, which logs a warning naming the
   commit so the bypass is visible.
 
-**Cut releases from `develop` or `main`, never `feature`.** Merges into `feature` run no CI —
+**Sprint tags (`YYYYMM-sN-rcN`) are created from `main` only; `v*.*.*` and per-app tags may come from `develop` or `main`. Never `feature`.** Merges into `feature` run no CI —
 `pull_request` runs record the PR head, not the resulting merge commit — so the gate will
 refuse a tag cut there.
 
 **Two GitHub behaviours the release path depends on**, both of which look like bugs when you
 hit them: a tag pushed with `GITHUB_TOKEN` does **not** trigger `on: push: tags` (GitHub
-suppresses it to prevent recursion), which is why `cut-release.yaml` creates the tag through
+suppresses it to prevent recursion), which is why `create-release.yml` creates the tag through
 the REST API and then dispatches the build explicitly; and a workflow is **not dispatchable
-until it exists on the default branch**, so `cut-release.yaml` will not appear in the Actions
+until it exists on the default branch**, so `create-release.yml` will not appear in the Actions
 tab while it sits on a side branch.
 
 **Two Docker gotchas**, both of which broke the image build in ways CI did not see:
@@ -466,3 +466,7 @@ Import helpers from `src/lib/queue.ts`:
 - **Dependency overrides** live in `pnpm-workspace.yaml`, not the `pnpm` field of
   `package.json` (pnpm 10 stopped reading that and only warns). The file is present solely as
   pnpm's settings home — this is not a workspace.
+
+## Authoring PRs
+
+When you open a PR, include an **In Plain Terms** section in the description: a short, jargon-free explanation a non-expert teammate can follow — what the problem was and what the change does, in everyday language — alongside the usual Summary / Release Notes. Skip it only for a pure chore with no behavioural effect. This lives here as a Claude authoring rule rather than in the GitHub PR template on purpose, so PRs opened from other tools/flows aren't forced through it. For release and promotion PRs, use the `release-pr-notes` skill from the `bluedots` plugin marketplace; it writes every release section, including Breaking changes / config and What users will notice.
