@@ -390,7 +390,7 @@ by `needs:`.**
   pushes to `main` and `feature`; those triggers are gone, and `:latest` now follows releases
   rather than the `main` branch.
 - **`create-release.yaml`** — the front door for cutting a release. Dispatch it with a tag name
-  and a base branch; it checks CI, creates the tag and the GitHub release with generated notes
+  and a base branch (`base` defaults to `main`. The `docs_only` input re-publishes an existing tag's notes to the docs PR.); it checks CI, creates the tag and the GitHub release with generated notes
   in one API call, then dispatches the image build. `dry_run` previews the notes without
   creating anything.
 
@@ -407,7 +407,7 @@ concluded `success`. Three things about it are deliberate and easy to undo by ac
 - Both carry a `skip_ci_check` input for an emergency publish, which logs a warning naming the
   commit so the bypass is visible.
 
-**Create releases from `develop` or `main`, never `feature`.** Merges into `feature` run no CI —
+**Sprint tags (`YYYYMM-sN-rcN`) are created from `main` only; `v*.*.*` and per-app tags may come from `develop` or `main`. Never `feature`.** Merges into `feature` run no CI —
 `pull_request` runs record the PR head, not the resulting merge commit — so the gate will
 refuse a tag cut there.
 
