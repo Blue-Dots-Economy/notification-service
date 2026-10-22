@@ -22,6 +22,11 @@ import { MAX_LENGTH, messageType, renderBody, UnresolvedTemplateVariables } from
 const DEFAULT_BASE_URL = 'https://api.pinnacle.in';
 const DEFAULT_TIMEOUT_MS = 10_000;
 
+function requestTimeoutMs(env: NodeJS.ProcessEnv): number {
+  const configured = Number(env.PINNACLE_TIMEOUT_MS);
+  return configured > 0 ? configured : DEFAULT_TIMEOUT_MS;
+}
+
 const OTP_TEMPLATE_ENV_VARS: Record<string, string> = {
   signals_signin_otp: 'PINNACLE_TEMPLATE_SIGNALS_SIGNIN_OTP',
   signals_signup_otp: 'PINNACLE_TEMPLATE_SIGNALS_SIGNUP_OTP',
@@ -41,11 +46,6 @@ const OtpTemplateRowSchema = z.looseObject({
   version: z.number().int().optional(),
   approval_ref: z.string().optional(),
 });
-
-function requestTimeoutMs(env: NodeJS.ProcessEnv): number {
-  const configured = Number(env.PINNACLE_TIMEOUT_MS);
-  return configured > 0 ? configured : DEFAULT_TIMEOUT_MS;
-}
 
 export type OtpTemplateRow = z.infer<typeof OtpTemplateRowSchema>;
 
@@ -120,9 +120,7 @@ interface PinnacleConfig {
 const RETRYABLE_ERROR_CODES = new Set(['EC1009', 'EC1010']);
 
 export function loadPinnacleConfig(env = process.env): PinnacleConfig | { error: string } {
-  const missing = ['PINNACLE_API_KEY', 'PINNACLE_SENDER_ID'].filter(
-    (k) => !env[k]
-  );
+  const missing = ['PINNACLE_API_KEY', 'PINNACLE_SENDER_ID'].filter((k) => !env[k]);
   if (missing.length) return { error: `pinnacle not configured: missing ${missing.join(', ')}` };
 
   return {
@@ -277,12 +275,7 @@ export async function sendSmsWithPinnacle(
     await metrics.incr('ns_sms_send_total', { provider: 'pinnacle', result: 'failed' });
     return {
       ok: false,
-      error:
-        err instanceof Error && err.name === 'TimeoutError'
-          ? 'pinnacle request timed out'
-          : err instanceof Error
-            ? err.message
-            : 'pinnacle request failed',
+      error: requestErrorMessage(err),
       retryable: true,
     };
   }
@@ -349,6 +342,11 @@ async function failPoll(reason: string, detail: string): Promise<null> {
     reason,
   });
   return null;
+}
+
+function requestErrorMessage(err: unknown): string {
+  if (!(err instanceof Error)) return 'pinnacle request failed';
+  return err.name === 'TimeoutError' ? 'pinnacle request timed out' : err.message;
 }
 
 const otpTemplates = loadOtpTemplates();
