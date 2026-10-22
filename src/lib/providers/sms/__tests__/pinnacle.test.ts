@@ -99,10 +99,10 @@ describe('pinnacle SMS provider', () => {
       expect(bodyOf(fetchMock).message[0].number).toBe('919000000001');
     });
 
-    it('forwards the job id as clientuid, for receipt correlation', async () => {
+    it('does not send clientuid, which Pinnacle rejects for a job id (EC1036 Invalid Client UID)', async () => {
       const fetchMock = mockFetch(OK);
       await send();
-      expect(bodyOf(fetchMock).message[0].clientuid).toBe('job-1');
+      expect(bodyOf(fetchMock).message[0]).not.toHaveProperty('clientuid');
     });
 
     it('returns the vendor uniqueid as the provider message id', async () => {
@@ -122,6 +122,13 @@ describe('pinnacle SMS provider', () => {
       const body = bodyOf(fetchMock);
       expect(body).not.toHaveProperty('dltheaderid');
       expect(body).not.toHaveProperty('tmid');
+    });
+
+    it('sends without dltentityid when the entity id is not configured', async () => {
+      const fetchMock = mockFetch(OK);
+      const res = await send({ env: { ...ENV, PINNACLE_DLT_ENTITY_ID: '' } as unknown as NodeJS.ProcessEnv });
+      expect(res.ok).toBe(true);
+      expect(bodyOf(fetchMock)).not.toHaveProperty('dltentityid');
     });
 
     it('authenticates with the apikey header over https', async () => {

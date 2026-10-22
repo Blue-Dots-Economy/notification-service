@@ -94,7 +94,7 @@ interface PinnacleConfig {
   baseUrl: string;
   apiKey: string;
   sender: string;
-  dltEntityId: string;
+  dltEntityId?: string;
   dltHeaderId?: string;
   dltTagId?: string;
   tmid?: string;
@@ -120,7 +120,7 @@ interface PinnacleConfig {
 const RETRYABLE_ERROR_CODES = new Set(['EC1009', 'EC1010']);
 
 export function loadPinnacleConfig(env = process.env): PinnacleConfig | { error: string } {
-  const missing = ['PINNACLE_API_KEY', 'PINNACLE_SENDER_ID', 'PINNACLE_DLT_ENTITY_ID'].filter(
+  const missing = ['PINNACLE_API_KEY', 'PINNACLE_SENDER_ID'].filter(
     (k) => !env[k]
   );
   if (missing.length) return { error: `pinnacle not configured: missing ${missing.join(', ')}` };
@@ -131,7 +131,7 @@ export function loadPinnacleConfig(env = process.env): PinnacleConfig | { error:
     baseUrl: (env.PINNACLE_BASE_URL || DEFAULT_BASE_URL).replace(/^http:/, 'https:'),
     apiKey: env.PINNACLE_API_KEY!,
     sender: env.PINNACLE_SENDER_ID!,
-    dltEntityId: env.PINNACLE_DLT_ENTITY_ID!,
+    dltEntityId: env.PINNACLE_DLT_ENTITY_ID || undefined,
     dltHeaderId: env.PINNACLE_DLT_HEADER_ID || undefined,
     dltTagId: env.PINNACLE_DLT_TAG_ID || undefined,
     tmid: env.PINNACLE_TMID || undefined,
@@ -176,7 +176,7 @@ export async function sendSmsWithPinnacle(
   template_id: string,
   variables: Record<string, string>,
   body: string | undefined,
-  job_id: string | undefined,
+  _job_id: string | undefined,
   env = process.env
 ): Promise<ProviderSendResult> {
   const config = loadPinnacleConfig(env);
@@ -224,7 +224,7 @@ export async function sendSmsWithPinnacle(
   const payload = {
     sender: config.sender,
     messagetype,
-    dltentityid: config.dltEntityId,
+    ...(config.dltEntityId ? { dltentityid: config.dltEntityId } : {}),
     dlttempid: template_id,
     ...(config.dltHeaderId ? { dltheaderid: config.dltHeaderId } : {}),
     ...(config.dltTagId ? { dlttagid: config.dltTagId } : {}),
@@ -233,7 +233,6 @@ export async function sendSmsWithPinnacle(
       {
         number: normalisePhone(to),
         text,
-        ...(job_id ? { clientuid: job_id } : {}),
       },
     ],
   };

@@ -234,10 +234,13 @@ Required for providers (varies by implementation):
   operator-facing version.
 - `SMS_PROVIDER` — `msg91` (default) or `pinnacle`. Unknown values throw at boot.
 - `MSG91_AUTH_KEY` for SMS (MSG91 Flow API)
-- Pinnacle (`SMS_PROVIDER=pinnacle` only): `PINNACLE_API_KEY`,
-  `PINNACLE_SENDER_ID`, `PINNACLE_DLT_ENTITY_ID` are required; the send fails
-  **permanently** (no retries) if any is missing. `PINNACLE_DLT_HEADER_ID`,
-  `PINNACLE_DLT_TAG_ID`, `PINNACLE_TMID` are optional and omitted when unset.
+- Pinnacle (`SMS_PROVIDER=pinnacle` only): `PINNACLE_API_KEY` and
+  `PINNACLE_SENDER_ID` are required; the send fails **permanently** (no retries)
+  if either is missing. `PINNACLE_DLT_ENTITY_ID`, `PINNACLE_DLT_HEADER_ID`,
+  `PINNACLE_DLT_TAG_ID`, `PINNACLE_TMID` are optional and omitted when unset
+  (Pinnacle accepts a send with only the template id, tested for ALIMCO). No
+  `clientuid` is sent: Pinnacle rejects a job id there with EC1036 "Invalid
+  Client UID".
   `PINNACLE_LOGIN_OTP_TEMPLATE_ID` + `SMS_LOGIN_OTP_BODY` configure the one
   named template; a blank id dead-letters with "named but not configured".
 - `SMS_LOGIN_OTP_TEMPLATE_ID` — MSG91 flow id for the legacy `login_otp` template.
