@@ -80,7 +80,11 @@ export function parseOtpTemplateRow(raw: string, expectedKey: string): OtpTempla
   return row;
 }
 
-/** Allowed link hosts per url variable, keyed by DLT template id. */
+/**
+ * Allowed link hosts per url variable, keyed by template key. Not by DLT id:
+ * several templates can share one DLT registration (ALIMCO's Signals and
+ * Aggregator rows do) while allowing different hosts.
+ */
 type UrlHosts = Record<string, Record<string, string[]>>;
 
 export function loadOtpTemplates(env = process.env): {
@@ -107,7 +111,7 @@ export function loadOtpTemplates(env = process.env): {
     const hosts = Object.fromEntries(
       row.variables.filter((v) => v.type === 'url' && v.urlHosts).map((v) => [v.name, v.urlHosts!])
     );
-    if (Object.keys(hosts).length) urlHosts[row.provider_template_id] = hosts;
+    if (Object.keys(hosts).length) urlHosts[key] = hosts;
   }
   return { templates, bodies, urlHosts };
 }
@@ -416,8 +420,8 @@ export const pinnacleSmsProvider: ProviderDefinition = {
 
   schema: z.record(z.string(), z.string()),
 
-  async send({ to, template_id, variables, body, job_id }) {
-    const notAllowed = linkNotAllowed(otpTemplates.urlHosts[template_id], variables ?? {});
+  async send({ to, template_id, template_key, variables, body, job_id }) {
+    const notAllowed = linkNotAllowed(template_key ? otpTemplates.urlHosts[template_key] : undefined, variables ?? {});
     if (notAllowed) return { ok: false, error: notAllowed, retryable: false };
     return await sendSmsWithPinnacle(to, template_id, variables, body, job_id);
   },

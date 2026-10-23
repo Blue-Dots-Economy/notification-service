@@ -448,10 +448,10 @@ describe('sign-in / sign-up OTP templates', () => {
         aggregator_signup_otp: SIGNUP,
       },
       urlHosts: {
-        '1507000000000001': { url: ['signals-purpledots.depwd.gov.in'] },
-        '1507000000000002': { url: ['signals-purpledots.depwd.gov.in'] },
-        '1507000000000003': { url: ['signals-purpledots.depwd.gov.in'] },
-        '1507000000000004': { url: ['signals-purpledots.depwd.gov.in'] },
+        signals_signin_otp: { url: ['signals-purpledots.depwd.gov.in'] },
+        signals_signup_otp: { url: ['signals-purpledots.depwd.gov.in'] },
+        aggregator_signin_otp: { url: ['signals-purpledots.depwd.gov.in'] },
+        aggregator_signup_otp: { url: ['signals-purpledots.depwd.gov.in'] },
       },
     });
   });
@@ -467,6 +467,25 @@ describe('sign-in / sign-up OTP templates', () => {
   it('skips an invalid row when another vendor is the SMS provider', () => {
     const env = { PINNACLE_TEMPLATE_SIGNALS_SIGNUP_OTP: '{"template_key":"signals_signup_otp"}' } as unknown as NodeJS.ProcessEnv;
     expect(loadOtpTemplates(env)).toEqual({ templates: {}, bodies: {}, urlHosts: {} });
+  });
+
+  it('keeps each template its own link hosts when two templates share a DLT id', () => {
+    const env = {
+      PINNACLE_TEMPLATE_SIGNALS_SIGNIN_OTP: row('signals_signin_otp', '1777000000000000001', SIGNIN),
+      PINNACLE_TEMPLATE_AGGREGATOR_SIGNIN_OTP: row('aggregator_signin_otp', '1777000000000000001', SIGNIN, {
+        variables: [
+          { name: 'message', sensitive: true },
+          { name: 'url', type: 'url', urlHosts: ['aggregators-purpledots.depwd.gov.in'] },
+        ],
+      }),
+    } as unknown as NodeJS.ProcessEnv;
+    const { urlHosts } = loadOtpTemplates(env);
+    const signals = { message: '1', url: 'https://signals-purpledots.depwd.gov.in' };
+    const aggregator = { message: '1', url: 'https://aggregators-purpledots.depwd.gov.in' };
+    expect(linkNotAllowed(urlHosts.signals_signin_otp, signals)).toBeUndefined();
+    expect(linkNotAllowed(urlHosts.signals_signin_otp, aggregator)).toMatch(/not in urlHosts/);
+    expect(linkNotAllowed(urlHosts.aggregator_signin_otp, aggregator)).toBeUndefined();
+    expect(linkNotAllowed(urlHosts.aggregator_signin_otp, signals)).toMatch(/not in urlHosts/);
   });
 
   it('allows a link only on a host listed in urlHosts', () => {

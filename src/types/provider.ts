@@ -25,6 +25,8 @@ export interface ProviderSendResult {
 export interface ProviderSendArgs {
   to: string;
   template_id: string;
+  /** The public template key the caller sent (`job.template_id`), before mapping to the provider id. */
+  template_key?: string;
   variables: any;
   /**
    * Message body TEMPLATE (not yet rendered) for providers that do not render
