@@ -74,6 +74,7 @@ export async function processJob(job: Job) {
     res = await provider.send({
       to: job.to,
       template_id: templateId,
+      template_key: job.template_id,
       variables: job.variables,
       body,
       job_id: job.job_id,

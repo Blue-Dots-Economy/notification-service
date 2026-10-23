@@ -74,6 +74,7 @@ describe('processJob — routing', () => {
     expect(send).toHaveBeenCalledWith({
       to: 'someone@example.com',
       template_id: 'provider-template-123',
+      template_key: 'welcome',
       variables: {},
       body: undefined,
       job_id: 'job-1',

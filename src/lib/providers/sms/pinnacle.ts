@@ -20,12 +20,129 @@ import { MAX_LENGTH, messageType, renderBody, UnresolvedTemplateVariables } from
  */
 
 const DEFAULT_BASE_URL = 'https://api.pinnacle.in';
+const DEFAULT_TIMEOUT_MS = 10_000;
+
+function requestTimeoutMs(env: NodeJS.ProcessEnv): number {
+  const configured = Number(env.PINNACLE_TIMEOUT_MS);
+  return configured > 0 ? configured : DEFAULT_TIMEOUT_MS;
+}
+
+const OTP_TEMPLATE_ENV_VARS: Record<string, string> = {
+  signals_signin_otp: 'PINNACLE_TEMPLATE_SIGNALS_SIGNIN_OTP',
+  signals_signup_otp: 'PINNACLE_TEMPLATE_SIGNALS_SIGNUP_OTP',
+  aggregator_signin_otp: 'PINNACLE_TEMPLATE_AGGREGATOR_SIGNIN_OTP',
+  aggregator_signup_otp: 'PINNACLE_TEMPLATE_AGGREGATOR_SIGNUP_OTP',
+};
+
+const VariableSpecSchema = z.looseObject({
+  name: z.string().min(1),
+  required: z.boolean().optional(),
+  type: z.string().optional(),
+  sensitive: z.boolean().optional(),
+  raw: z.boolean().optional(),
+  urlHosts: z.array(z.string().min(1)).optional(),
+});
+
+const OtpTemplateRowSchema = z.looseObject({
+  template_key: z.string().min(1),
+  network: z.string().min(1),
+  channel: z.literal('sms'),
+  locale: z.string().min(1),
+  provider: z.literal('pinnacle'),
+  provider_template_id: z.string().trim().min(1),
+  body_text: z.string().min(1),
+  variables: z.array(VariableSpecSchema),
+  version: z.number().int().optional(),
+  approval_ref: z.string().optional(),
+});
+
+export type OtpTemplateRow = z.infer<typeof OtpTemplateRowSchema>;
+
+export function parseOtpTemplateRow(raw: string, expectedKey: string): OtpTemplateRow | { error: string } {
+  let json: unknown;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    return { error: 'not valid JSON' };
+  }
+  const parsed = OtpTemplateRowSchema.safeParse(json);
+  if (!parsed.success) {
+    return { error: parsed.error.issues.map((i) => i.path.join('.') || 'row').join(', ') + ' invalid or missing' };
+  }
+  const row = parsed.data;
+  if (row.template_key !== expectedKey) {
+    return { error: `template_key is '${row.template_key}', expected '${expectedKey}'` };
+  }
+  const placeholders = [...row.body_text.matchAll(/\{\{(\w+)\}\}/g)].map((m) => m[1]);
+  const declared = row.variables.map((v) => v.name);
+  const undeclaredPlaceholders = placeholders.filter((v) => !declared.includes(v));
+  if (undeclaredPlaceholders.length) return { error: `body_text uses undeclared variables: ${undeclaredPlaceholders.join(', ')}` };
+  return row;
+}
+
+/**
+ * Allowed link hosts per url variable, keyed by template key. Not by DLT id:
+ * several templates can share one DLT registration (ALIMCO's Signals and
+ * Aggregator rows do) while allowing different hosts.
+ */
+type UrlHosts = Record<string, Record<string, string[]>>;
+
+export function loadOtpTemplates(env = process.env): {
+  templates: Record<string, string>;
+  bodies: Record<string, string>;
+  urlHosts: UrlHosts;
+} {
+  const templates: Record<string, string> = {};
+  const bodies: Record<string, string> = {};
+  const urlHosts: UrlHosts = {};
+  for (const [key, setting] of Object.entries(OTP_TEMPLATE_ENV_VARS)) {
+    const raw = env[setting];
+    if (!raw) continue;
+    const row = parseOtpTemplateRow(raw, key);
+    if ('error' in row) {
+      // A broken row would otherwise fall through to raw pass-through and fail
+      // only at send time, so refuse to start while Pinnacle is the vendor.
+      // Same normalisation as selectSmsProvider, so " Pinnacle " counts too.
+      if ((env.SMS_PROVIDER ?? '').trim().toLowerCase() === 'pinnacle') throw new Error(`pinnacle: ${setting} is invalid (${row.error})`);
+      console.log(`pinnacle: ${setting} skipped (${row.error}); template ${key} not configured`);
+      continue;
+    }
+    templates[key] = row.provider_template_id;
+    bodies[key] = row.body_text;
+    const hosts = Object.fromEntries(
+      row.variables
+        .filter((v) => v.type === 'url' && v.urlHosts)
+        .map((v) => [v.name, v.urlHosts!.map((h) => h.trim().toLowerCase())])
+    );
+    if (Object.keys(hosts).length) urlHosts[key] = hosts;
+  }
+  return { templates, bodies, urlHosts };
+}
+
+/** Why a url variable may not be sent, or undefined when every link is on its allowed hosts. */
+export function linkNotAllowed(
+  hostsByVariable: Record<string, string[]> | undefined,
+  variables: Record<string, string>
+): string | undefined {
+  for (const [name, hosts] of Object.entries(hostsByVariable ?? {})) {
+    const value = variables[name];
+    if (value === undefined) continue;
+    let host = '';
+    try {
+      host = new URL(value).host;
+    } catch {
+      // not a URL; reported below like any other disallowed host
+    }
+    if (!hosts.includes(host)) return `${name} host '${host || value}' not in urlHosts`;
+  }
+  return undefined;
+}
 
 interface PinnacleConfig {
   baseUrl: string;
   apiKey: string;
   sender: string;
-  dltEntityId: string;
+  dltEntityId?: string;
   dltHeaderId?: string;
   dltTagId?: string;
   tmid?: string;
@@ -51,9 +168,7 @@ interface PinnacleConfig {
 const RETRYABLE_ERROR_CODES = new Set(['EC1009', 'EC1010']);
 
 export function loadPinnacleConfig(env = process.env): PinnacleConfig | { error: string } {
-  const missing = ['PINNACLE_API_KEY', 'PINNACLE_SENDER_ID', 'PINNACLE_DLT_ENTITY_ID'].filter(
-    (k) => !env[k]
-  );
+  const missing = ['PINNACLE_API_KEY', 'PINNACLE_SENDER_ID'].filter((k) => !env[k]);
   if (missing.length) return { error: `pinnacle not configured: missing ${missing.join(', ')}` };
 
   return {
@@ -62,7 +177,7 @@ export function loadPinnacleConfig(env = process.env): PinnacleConfig | { error:
     baseUrl: (env.PINNACLE_BASE_URL || DEFAULT_BASE_URL).replace(/^http:/, 'https:'),
     apiKey: env.PINNACLE_API_KEY!,
     sender: env.PINNACLE_SENDER_ID!,
-    dltEntityId: env.PINNACLE_DLT_ENTITY_ID!,
+    dltEntityId: env.PINNACLE_DLT_ENTITY_ID || undefined,
     dltHeaderId: env.PINNACLE_DLT_HEADER_ID || undefined,
     dltTagId: env.PINNACLE_DLT_TAG_ID || undefined,
     tmid: env.PINNACLE_TMID || undefined,
@@ -107,7 +222,7 @@ export async function sendSmsWithPinnacle(
   template_id: string,
   variables: Record<string, string>,
   body: string | undefined,
-  job_id: string | undefined,
+  _job_id: string | undefined,
   env = process.env
 ): Promise<ProviderSendResult> {
   const config = loadPinnacleConfig(env);
@@ -155,7 +270,7 @@ export async function sendSmsWithPinnacle(
   const payload = {
     sender: config.sender,
     messagetype,
-    dltentityid: config.dltEntityId,
+    ...(config.dltEntityId ? { dltentityid: config.dltEntityId } : {}),
     dlttempid: template_id,
     ...(config.dltHeaderId ? { dltheaderid: config.dltHeaderId } : {}),
     ...(config.dltTagId ? { dlttagid: config.dltTagId } : {}),
@@ -164,7 +279,8 @@ export async function sendSmsWithPinnacle(
       {
         number: normalisePhone(to),
         text,
-        ...(job_id ? { clientuid: job_id } : {}),
+        // No clientuid: Pinnacle rejects a job id there (EC1036 Invalid Client
+        // UID). Delivery receipts will need one in a format Pinnacle accepts.
       },
     ],
   };
@@ -175,6 +291,7 @@ export async function sendSmsWithPinnacle(
       method: 'POST',
       headers: { 'Content-Type': 'application/json', apikey: config.apiKey },
       body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(requestTimeoutMs(env)),
     });
 
     if (!resp.ok) {
@@ -208,7 +325,7 @@ export async function sendSmsWithPinnacle(
     await metrics.incr('ns_sms_send_total', { provider: 'pinnacle', result: 'failed' });
     return {
       ok: false,
-      error: err instanceof Error ? err.message : 'pinnacle request failed',
+      error: requestErrorMessage(err),
       retryable: true,
     };
   }
@@ -277,6 +394,13 @@ async function failPoll(reason: string, detail: string): Promise<null> {
   return null;
 }
 
+function requestErrorMessage(err: unknown): string {
+  if (!(err instanceof Error)) return 'pinnacle request failed';
+  return err.name === 'TimeoutError' ? 'pinnacle request timed out' : err.message;
+}
+
+const otpTemplates = loadOtpTemplates();
+
 export const pinnacleSmsProvider: ProviderDefinition = {
   // Deliberately `sms`, not `pinnacle-sms`: the provider registry keys on this
   // name and it is the `channel` every caller sends. Swapping vendors must not
@@ -289,15 +413,19 @@ export const pinnacleSmsProvider: ProviderDefinition = {
   // to go with it, since Pinnacle renders nothing.
   templates: {
     login_otp: process.env.PINNACLE_LOGIN_OTP_TEMPLATE_ID ?? '',
+    ...otpTemplates.templates,
   },
   bodies: {
     login_otp: process.env.SMS_LOGIN_OTP_BODY ?? '',
+    ...otpTemplates.bodies,
   },
   allowRawTemplateId: true,
 
   schema: z.record(z.string(), z.string()),
 
-  async send({ to, template_id, variables, body, job_id }) {
+  async send({ to, template_id, template_key, variables, body, job_id }) {
+    const notAllowed = linkNotAllowed(template_key ? otpTemplates.urlHosts[template_key] : undefined, variables ?? {});
+    if (notAllowed) return { ok: false, error: notAllowed, retryable: false };
     return await sendSmsWithPinnacle(to, template_id, variables, body, job_id);
   },
 };
