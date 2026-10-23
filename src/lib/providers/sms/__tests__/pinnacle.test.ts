@@ -464,6 +464,27 @@ describe('sign-in / sign-up OTP templates', () => {
     expect(() => loadOtpTemplates(env)).toThrow(/PINNACLE_TEMPLATE_SIGNALS_SIGNUP_OTP/);
   });
 
+  it('treats SMS_PROVIDER the way vendor selection does (case and spaces)', () => {
+    const env = {
+      SMS_PROVIDER: ' Pinnacle ',
+      PINNACLE_TEMPLATE_SIGNALS_SIGNUP_OTP: '{"template_key":"signals_signup_otp"}',
+    } as unknown as NodeJS.ProcessEnv;
+    expect(() => loadOtpTemplates(env)).toThrow(/PINNACLE_TEMPLATE_SIGNALS_SIGNUP_OTP/);
+  });
+
+  it('matches link hosts regardless of the case they are configured in', () => {
+    const env = {
+      PINNACLE_TEMPLATE_SIGNALS_SIGNIN_OTP: row('signals_signin_otp', '1507000000000001', SIGNIN, {
+        variables: [
+          { name: 'message', sensitive: true },
+          { name: 'url', type: 'url', urlHosts: ['Signals-PurpleDots.depwd.gov.in'] },
+        ],
+      }),
+    } as unknown as NodeJS.ProcessEnv;
+    const { urlHosts } = loadOtpTemplates(env);
+    expect(linkNotAllowed(urlHosts.signals_signin_otp, { message: '1', url: 'https://signals-purpledots.depwd.gov.in' })).toBeUndefined();
+  });
+
   it('skips an invalid row when another vendor is the SMS provider', () => {
     const env = { PINNACLE_TEMPLATE_SIGNALS_SIGNUP_OTP: '{"template_key":"signals_signup_otp"}' } as unknown as NodeJS.ProcessEnv;
     expect(loadOtpTemplates(env)).toEqual({ templates: {}, bodies: {}, urlHosts: {} });

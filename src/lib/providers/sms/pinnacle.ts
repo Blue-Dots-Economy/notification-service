@@ -102,14 +102,17 @@ export function loadOtpTemplates(env = process.env): {
     if ('error' in row) {
       // A broken row would otherwise fall through to raw pass-through and fail
       // only at send time, so refuse to start while Pinnacle is the vendor.
-      if (env.SMS_PROVIDER === 'pinnacle') throw new Error(`pinnacle: ${setting} is invalid (${row.error})`);
+      // Same normalisation as selectSmsProvider, so " Pinnacle " counts too.
+      if ((env.SMS_PROVIDER ?? '').trim().toLowerCase() === 'pinnacle') throw new Error(`pinnacle: ${setting} is invalid (${row.error})`);
       console.log(`pinnacle: ${setting} skipped (${row.error}); template ${key} not configured`);
       continue;
     }
     templates[key] = row.provider_template_id;
     bodies[key] = row.body_text;
     const hosts = Object.fromEntries(
-      row.variables.filter((v) => v.type === 'url' && v.urlHosts).map((v) => [v.name, v.urlHosts!])
+      row.variables
+        .filter((v) => v.type === 'url' && v.urlHosts)
+        .map((v) => [v.name, v.urlHosts!.map((h) => h.trim().toLowerCase())])
     );
     if (Object.keys(hosts).length) urlHosts[key] = hosts;
   }
