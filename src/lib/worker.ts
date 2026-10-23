@@ -114,7 +114,10 @@ export async function processJob(job: Job) {
     return scheduleRetry(job, delay);
   }
 
-  console.log('Delivered:', job.job_id);
+  // The vendor's id (Pinnacle's uniqueid) is what its delivery report is searched by.
+  console.log(
+    `Delivered: ${job.job_id}${res.provider_message_id ? ` (provider_message_id ${res.provider_message_id})` : ''}`
+  );
 }
 
 async function mainLoop() {

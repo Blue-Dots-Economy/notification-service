@@ -88,6 +88,14 @@ describe('processJob — routing', () => {
     expect(queue.pushDLQ).not.toHaveBeenCalled();
   });
 
+  it("logs the provider's message id with a delivered job, so a send can be traced at the vendor", async () => {
+    send.mockResolvedValue({ ok: true, provider_message_id: 'pm-123' });
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await processJob(job());
+    expect(log).toHaveBeenCalledWith('Delivered: job-1 (provider_message_id pm-123)');
+    log.mockRestore();
+  });
+
   it('dead-letters an unknown channel without attempting a send', async () => {
     await processJob(job({ channel: 'carrier-pigeon' }));
 
