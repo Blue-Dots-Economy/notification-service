@@ -1049,6 +1049,30 @@ tab while it sits on a side branch.
    `Cannot verify the identity of the @pnpm/exe.linux-x64 native binary: it is missing from
    pnpm-lock.yaml` — a build break with no change on our side.
 
+## Code comments
+
+Comments say what the code cannot. Git, PRs, issues and `docs/` hold the rest.
+
+**Keep:**
+
+- The reason for a non-obvious choice, in one sentence.
+- Constraints and invariants: idempotency and dedupe, ordering, transactions, retries, fail-closed behaviour.
+- Security, PII and authorisation rules (for example "Never log this value.").
+- Behaviour of external systems and contracts the code depends on: email and SMS vendors, Redis, Postgres, the event catalogue, the calling DPGs.
+- Known limitations, stated in the present tense. Track the fix in an issue; do not cite the issue number.
+- Public API docs that tell a caller something the signature does not: failure results, side effects, units.
+- Tool directives (`eslint-disable`, `@ts-expect-error`, `NOSONAR` with its rule key and reason, `@deprecated`, coverage ignores).
+
+**Do not write:**
+
+- History: issue or PR numbers, phases, plan or spec section IDs, "previously", "used to", "was renamed".
+- Design essays. Put them in `docs/architecture/` and leave a one-line pointer. Pointers to any `docs/` file are fine.
+- Comments that restate the code, or `@param` / `@returns` lines that only repeat the name and type.
+- Banners, dividers, ALL-CAPS emphasis, "NOTE:", "deliberately".
+- Commented-out code.
+
+**Style:** short, present-tense statements about the current code. A wrong comment is worse than none: when code changes, fix or delete the comments that describe it.
+
 ## Common Patterns
 
 **Adding a route:**
