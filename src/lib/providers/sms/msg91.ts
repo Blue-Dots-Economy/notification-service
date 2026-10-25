@@ -12,10 +12,9 @@ export async function sendSmsWithMsg91(
   const phone = to.startsWith('+') ? to.slice(1) : to;
 
   // MSG91 Flow renders the DLT-approved template from named variables carried
-  // per recipient (`{ mobiles, name, link, ... }`). Backward-compat: the legacy
-  // single-variable OTP template uses `##var##`, and its callers still send
-  // `{ message }` — map that lone key to `var` so login/guardian OTPs are
-  // byte-for-byte unchanged. Any other shape is spread as named vars.
+  // per recipient (`{ mobiles, name, link, ... }`). The single-variable OTP
+  // template uses `##var##` and its callers send `{ message }`, so that lone key
+  // maps to `var`. Any other shape is spread as named vars.
   const keys = Object.keys(variables);
   const recipientVars =
     keys.length === 1 && keys[0] === 'message'
@@ -33,8 +32,8 @@ export async function sendSmsWithMsg91(
       body: JSON.stringify({
         template_id,
         short_url: 0,
-        // `mobiles` spread LAST: a caller variable named `mobiles` must never be
-        // able to override the resolved recipient phone (SMS-redirect guard).
+        // `mobiles` last: a caller variable named `mobiles` must never override
+        // the resolved recipient phone.
         recipients: [{ ...recipientVars, mobiles: phone }],
       }),
       signal: AbortSignal.timeout(providerTimeoutMs()),
@@ -49,8 +48,6 @@ export async function sendSmsWithMsg91(
   }
 
   if (!resp.ok) {
-    // `resp.json()` returns a Promise, so the previous `console.log` of it
-    // printed `Promise { <pending> }` and every MSG91 failure was undiagnosable.
     const detail = await resp.text().catch(() => '');
     console.log(`msg91 error ${resp.status}: ${detail.slice(0, 500)}`);
     await metrics.incr('ns_sms_send_total', { provider: 'msg91', result: 'failed' });
@@ -65,10 +62,8 @@ export async function sendSmsWithMsg91(
     };
   }
 
-  // MSG91 answers 200 with `{"type":"error"}` for business rejections, so the
-  // HTTP status alone says nothing — the same trap this adapter's Pinnacle
-  // sibling exists to handle. Treating every 2xx as delivered is what made a
-  // bad flow id look like a successful send on the current production vendor.
+  // MSG91 answers 200 with `{"type":"error"}` for business rejections (e.g. a
+  // bad flow id), so a 2xx alone does not mean the send was accepted.
   const payload = await resp.json().catch(() => null);
   const type = String((payload as { type?: unknown } | null)?.type ?? '').toLowerCase();
   if (type === 'error') {
@@ -76,8 +71,7 @@ export async function sendSmsWithMsg91(
     console.log(`msg91 error (HTTP 200): ${detail.slice(0, 500)}`);
     await metrics.incr('ns_sms_send_total', { provider: 'msg91', result: 'failed' });
     await metrics.incr('ns_sms_provider_error_total', { provider: 'msg91', code: 'BUSINESS' });
-    // The vendor understood the request and refused it; retrying sends the same
-    // rejected payload four more times.
+    // The vendor understood the request and refused it; a retry would not change that.
     return { ok: false, error: `msg91 rejected: ${detail}`, retryable: false };
   }
 
@@ -90,18 +84,16 @@ export const smsProvider: ProviderDefinition = {
   vendor: 'msg91',
   renders: 'provider',
 
-  // Only the legacy single-var OTP is named here; per-event DLT flow ids are
-  // sent raw by signalstack (allowRawTemplateId), so they need no entry. The
-  // OTP flow id is deployment-specific (per MSG91 account) — read from env,
-  // never hardcoded. The literal is a backward-compat default so existing
-  // deploys don't break; set SMS_LOGIN_OTP_TEMPLATE_ID to override.
+  // Only the single-variable OTP is named here; other DLT flow ids are sent raw
+  // (allowRawTemplateId). The OTP flow id is per MSG91 account and comes from
+  // SMS_LOGIN_OTP_TEMPLATE_ID; the literal is a fallback for deployments that
+  // do not set it (boot seeding never uses it).
   templates: {
     login_otp: process.env.SMS_LOGIN_OTP_TEMPLATE_ID ?? '6896c26d6eb66c66340e1242',
   },
   allowRawTemplateId: true,
 
-  // Named variables — the DLT template's placeholders. Values are strings
-  // (numbers/OTPs are sent as strings on the wire).
+  // Named variables (the DLT template's placeholders), sent as strings.
   schema: z.record(z.string(), z.string()),
 
   async send({ to, template_id, variables }) {

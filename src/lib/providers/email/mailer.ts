@@ -12,13 +12,11 @@ export const EmailAttachmentSchema = z.object({
   filename: z.string().min(1).max(255),
   contentType: z.string().min(1).max(127),
   /**
-   * Base64-encoded file content, no `data:` prefix.
+   * Base64-encoded file content, no `data:` prefix and no whitespace.
    *
-   * Validated as base64 rather than any non-empty string: the decoder silently
-   * ignores characters outside the alphabet, so a malformed or `data:`-prefixed
-   * payload would pass the 400 boundary and be delivered as garbage bytes. The
-   * calling APIs compact whitespace before forwarding, so wrapped base64 from a
-   * client arrives here already canonical.
+   * Validated as base64: the decoder silently ignores characters outside the
+   * alphabet, so a malformed or `data:`-prefixed payload would otherwise be
+   * delivered as garbage bytes.
    */
   data: z.base64().min(1),
 });
@@ -33,10 +31,9 @@ export const emailProvider: ProviderDefinition = {
     login_otp: 'LOGIN_OTP_1',
   },
 
-  // The count/size limits are refinements rather than `.max()`/inline checks
-  // because both bounds are env-configurable and therefore only knowable at
-  // request time. `z.toJSONSchema` (used by the /providers docs route) drops
-  // refinements silently, so the published schema stays valid.
+  // The count/size limits are refinements because both bounds are env-configurable
+  // and read at request time. `z.toJSONSchema` (the /providers docs route) drops
+  // refinements, so the published schema stays valid.
   schema: z
     .object({
       fromName: z.string(),

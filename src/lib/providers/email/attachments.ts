@@ -1,14 +1,11 @@
 /**
- * Email attachment limits (#551).
+ * Email attachment limits.
  *
- * The relay enforces the two *resource* limits — how many attachments and how
- * many bytes it will accept and hold in Redis — and deliberately not a MIME
- * allowlist: which file types are acceptable is a per-product policy (the
- * support form's allowlist lives in the calling API), whereas queue and message
- * size are the relay's own concern.
+ * NS enforces the resource limits (attachment count and bytes held in Redis),
+ * not a MIME allowlist: acceptable file types are a per-product policy owned by
+ * the calling API.
  *
- * Env is read per call rather than at module load so the values stay
- * overridable in tests and after `loadSecrets()`.
+ * Env is read per call rather than at module load, so tests can override it.
  */
 
 export const DEFAULT_ATTACHMENT_MAX_TOTAL_BYTES = 5 * 1024 * 1024;
@@ -61,11 +58,10 @@ export function totalAttachmentBytes(
 }
 
 /**
- * HTTP body limit for the Fastify instance, derived from the attachment budget:
- * base64 inflates payloads by 4/3, and the envelope adds the html body and the
- * other fields on top. Deriving it means raising the attachment cap can never
- * turn into a silent 413. `NOTIFY_BODY_LIMIT_BYTES` overrides it outright for
- * deployments that need a different ceiling.
+ * HTTP body limit for the Fastify instance, derived from the attachment budget
+ * (base64 inflates by 4/3, plus headroom for the rest of the envelope), so
+ * raising the attachment cap never causes a 413. `NOTIFY_BODY_LIMIT_BYTES`
+ * overrides it.
  */
 export function notifyBodyLimitBytes(): number {
   const derived = Math.ceil((attachmentMaxTotalBytes() * 4) / 3) + BODY_LIMIT_HEADROOM_BYTES;

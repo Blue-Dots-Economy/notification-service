@@ -8,20 +8,12 @@ type TwilioResponse = {
 };
 
 /**
- * Sends a WhatsApp message via Twilio API.
+ * Sends a WhatsApp template message (Twilio Content `contentSid`) via the Twilio API.
  *
- * @param to - The recipient WhatsApp number.
- *   - Must start with `"whatsapp:"` followed by the E.164 formatted phone number.
- *   - Example: `"whatsapp:+919876543210"`.
- *
- * @param contentSid - contentSid for the template to be used.
- *
- * @throws Will throw an error if the Twilio API request fails or returns an error_code.
- *
- * @example
- * ```ts
- * await sendWhatsAppMessage("whatsapp:+15005550006", "HXXXXXXXXXXXXX");
- * ```
+ * `to` is a bare E.164 number (`+919876543210`); the `whatsapp:` prefix is added
+ * here. An HTTP error or a Twilio `error_code` returns `{ ok: false }` (retried
+ * by the worker); a timeout returns a retryable failure; any other network error
+ * throws.
  */
 
 export async function sendWhatsAppMessage(
