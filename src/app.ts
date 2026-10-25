@@ -10,9 +10,8 @@ import { providerRoutes } from './routes/providers';
 import { retryRoutes } from './routes/retry';
 import { registerRawJsonBody } from './plugins/raw-body';
 
-// Note: the raised body limit for attachment-bearing requests is set on the
-// /notify route itself (see routes/notify.ts), not here — every other route
-// keeps Fastify's 1 MB default.
+// The raised body limit for attachments is set on /notify and /v1/notify
+// themselves; every other route keeps Fastify's 1 MB default.
 const app = Fastify({ logger: true });
 
 // Before any route: HMAC v2 signs the exact JSON body bytes.

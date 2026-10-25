@@ -22,11 +22,10 @@ export async function metricsRoutes(app: FastifyInstance) {
   /**
    * Prometheus scrape endpoint.
    *
-   * Unauthenticated, unlike every other route here, because Prometheus cannot
-   * produce this service's HMAC signature. That is acceptable only because the
-   * exposition carries counts and queue depths — no recipients, no variables,
-   * no message content — and because the port is internal to the cluster. Keep
-   * it that way: anything recipient-identifying must not be exported here.
+   * Unauthenticated, unlike the API routes, because Prometheus cannot produce
+   * this service's credentials. Acceptable only because the exposition carries
+   * counts and queue depths (no recipients, variables or message content) and
+   * the port is internal to the cluster. Never export anything recipient-identifying.
    */
   app.get('/metrics', async (req, reply) => {
     try {

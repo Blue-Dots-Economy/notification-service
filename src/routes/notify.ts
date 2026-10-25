@@ -22,14 +22,10 @@ const NotifySchema = z.object({
   priority: z.enum(['realtime', 'other']).optional(),
   variables: z.record(z.string(), z.any()),
   dedupe_id: z.string().optional(),
-  // Only read by providers that cannot render server-side (Pinnacle SMS), and
-  // only for a raw pass-through `template_id` — when the provider names the
-  // template it owns the body, which is why the OTP callers send none.
-  //
-  // Bounded because it is caller-supplied text that ends up on the wire: the
-  // ceiling is the largest single message any supported vendor accepts (2000
-  // for Latin-1), so anything longer could not have been delivered anyway and
-  // is better rejected here than after being queued.
+  // Only read by providers that do not render (Pinnacle SMS), and only for a
+  // raw pass-through `template_id`: a template the provider names owns its body.
+  // Capped at the largest single message a supported vendor accepts (2000,
+  // Latin-1), so an undeliverable body is rejected before it is queued.
   body: z.string().max(2000).optional(),
 });
 
@@ -40,10 +36,8 @@ export async function notifyRoutes(app: FastifyInstance) {
     url: '/notify',
     method: 'POST',
     preHandler: authenticate({ scope: 'notify:send', legacyHmacV1: true }),
-    // Fastify's 1 MB default would reject every attachment-bearing request
-    // (base64 inflates a 5 MB file to ~6.7 MB), so this route — and only this
-    // route — is raised to the derived attachment budget. /failed/retry and the
-    // rest keep the 1 MB default (#551).
+    // Fastify's 1 MB default would reject attachment-bearing requests, so the
+    // send routes are raised to the derived attachment budget.
     bodyLimit: notifyBodyLimitBytes(),
     handler: async (req, reply) => {
       const parsed = NotifySchema.safeParse(req.body);
@@ -54,7 +48,7 @@ export async function notifyRoutes(app: FastifyInstance) {
       const provider = providers[body.channel];
       if (!provider)
         return reply.code(400).send({ error: 'Unknown provider channel' });
-      // Strict allowlist unless the provider owns raw ids (SMS, #532/#535).
+      // Strict allowlist unless the provider allows raw ids (SMS).
       if (
         !provider.allowRawTemplateId &&
         typeof provider.templates[body.template_id] !== 'string'
@@ -71,11 +65,9 @@ export async function notifyRoutes(app: FastifyInstance) {
       const { key, ttlSeconds, explicit } = buildDedupeKey(body);
       const isNew = await dedupe(key, ttlSeconds);
       if (!isNew) {
-        // Two different conditions wearing one shape, so they answer differently.
-        // An explicit `dedupe_id` is the caller asking for suppression, so a hit
-        // is a success with a reason. A fallback hit is nobody's intent — it is a
-        // dropped message, and every caller so far checked only `res.ok`, so a
-        // 200 made that indistinguishable from delivery (#88).
+        // An explicit `dedupe_id` hit is the suppression the caller asked for: 200
+        // with a reason. A fallback hit is a dropped message nobody intended, so
+        // it is a 409 that callers checking only `res.ok` cannot mistake for delivery.
         req.log.warn(
           { dedupe_key: key, channel: body.channel, template_id: body.template_id, explicit },
           'suppressed duplicate notify',
@@ -112,9 +104,8 @@ export async function notifyRoutes(app: FastifyInstance) {
         return reply.send({ job_id, enqueued: true });
       }
 
-      // Record before queue: a normal send that cannot be recorded is refused,
-      // so a Redis loss can always be recovered from the record (spec
-      // §Architecture, durability model).
+      // Record before queue: a send that cannot be recorded is refused, so a
+      // Redis loss can be recovered from the record.
       try {
         await recordAccepted(record);
       } catch (err) {
