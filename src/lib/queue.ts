@@ -3,8 +3,6 @@ import type Redis from 'ioredis';
 import type { Job, Priority } from 'src/types';
 import redis from './redis';
 
-// Queue Keys
-
 export const QUEUE_KEYS: Record<Priority, string> = {
   realtime: 'queue:realtime',
   other: 'queue:other',
@@ -25,14 +23,12 @@ export const RETRY_BATCH = 1000;
  */
 export const MAX_REPLAYS = 3;
 
-// Basic Queue Operations
-
 /** Enqueue realtime job (high priority). */
 export async function pushRealtime(job: Job) {
   return pushToPriority({ ...job, priority: 'realtime' });
 }
 
-/** Enqueue fallback job. */
+/** Enqueue a normal-priority (`other`) job. */
 export async function pushOther(job: Job) {
   return pushToPriority({ ...job, priority: 'other' });
 }
@@ -60,11 +56,11 @@ function wellFormed(value: unknown): unknown {
 }
 
 /**
- * The ONE way a job becomes a Redis queue/retry/DLQ entry. Every string key and
- * value is made well-formed (a lone UTF-16 surrogate, e.g. a truncated emoji in a
- * name, becomes U+FFFD) first: JSON.stringify emits a lone surrogate as a
- * `\udXXX` escape, which Redis's cjson rejects, so MOVE_DUE_RETRIES could not
- * read the job's priority.
+ * Serializes a job for a Redis queue/retry/DLQ entry. Lone UTF-16 surrogates in
+ * keys and values (e.g. a truncated emoji) become U+FFFD first: JSON.stringify
+ * emits them as `\udXXX` escapes, which Redis's cjson rejects, so
+ * MOVE_DUE_RETRIES could not read the job's priority. pushToPriorityWithMarker
+ * does not use it yet; every other writer here does.
  */
 export function serializeJob(job: Job): string {
   return JSON.stringify(wellFormed(job));
@@ -129,17 +125,16 @@ export async function deferJob(job: Job, delayMs: number): Promise<void> {
   await redis.zadd(RETRY_ZSET, String(Date.now() + delayMs), serializeJob(job));
 }
 
-// Claim every due retry and push it onto its own priority's queue in one atomic
+// Claims every due retry and pushes it onto its own priority's queue in one atomic
 // step, so concurrent schedulers never move a member twice and a retry never
 // changes pool. A member that is not a JSON object with a string job_id goes to
-// the DLQ untouched rather than vanishing. Each call claims at most RETRY_BATCH members (ARGV[2])
-// so one EVAL never blocks Redis for long; the caller simply calls again. Fixed script; keys and cutoff are passed as KEYS/ARGV.
+// the DLQ untouched. At most RETRY_BATCH members (ARGV[2]) per call, so one EVAL
+// never blocks Redis for long. Fixed script; keys and cutoff are passed as KEYS/ARGV.
 //
-// cjson rejects lone UTF-16 surrogate escapes ("invalid unicode escape code").
-// serializeJob never writes one, but members written by older pods can hold them,
-// so a failed decode is retried on a copy with every \udXXX escape replaced by
-// \ufffd. That copy is only read for routing; the member is pushed unchanged
-// (JSON.parse in popFrom accepts it).
+// cjson rejects lone UTF-16 surrogate escapes, which a member not written by
+// serializeJob can hold, so a failed decode is retried on a copy with every
+// \udXXX escape replaced by \ufffd. The copy is read for routing only; the member
+// is pushed unchanged (JSON.parse in popFrom accepts it).
 const MOVE_DUE_RETRIES = `
 local due = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'LIMIT', 0, ARGV[2])
 local moved = 0
@@ -192,17 +187,16 @@ export async function pushManyToPriority(jobs: Job[]): Promise<void> {
   if (failed) throw failed[0];
 }
 
-/** Pop from REALTIME queue. Timeout prevents starving lower-priority work. */
+/** Pop from the realtime queue on the shared connection (the worker pools use popFrom). */
 export async function popRealtime(timeoutSeconds = 1) {
   return redis.brpop(REALTIME_QUEUE, timeoutSeconds);
 }
 
-/** Pop from OTHER queue. Timeout keeps retries from waiting behind idle pops. */
+/** Pop from the other queue on the shared connection (the worker pools use popFrom). */
 export async function popOther(timeoutSeconds = 1) {
   return redis.brpop(OTHER_QUEUE, timeoutSeconds);
 }
 
-// Dead Letter Queue
 export async function pushDLQ(job: Job) {
   console.log('DLQ →', job.job_id);
   return redis.lpush(DLQ_QUEUE, serializeJob(job));
@@ -231,9 +225,9 @@ async function requeueFailedJob(raw: string, priority: Priority) {
     priority,
     attempt: 0,
     next_attempt_at: undefined,
-    // A replay is an explicit operator action: the original deadline (if any)
-    // no longer applies, or a replayed job would only expire. Redacted (OTP)
-    // jobs never reach the DLQ, so this cannot revive a stale code.
+    // A replay is an explicit operator action, so the original deadline is
+    // cleared (the job would only expire). Redacted (OTP) jobs never reach the
+    // DLQ, so this cannot revive a stale code.
     deadline: undefined,
     replays: (job.replays ?? 0) + 1,
     // A replay is a new delivery attempt: it gets its own attempt id so its
@@ -307,10 +301,7 @@ export async function retryFailedJobs({
   return { retried, skipped, refused, not_found: [] };
 }
 
-// Retry Scheduling
-/**
- * Schedule retry using a ZSET sorted by future timestamp.
- */
+/** Schedule a retry; the ZSET score is the due time in epoch milliseconds. */
 export async function scheduleRetry(job: Job, delaySeconds: number) {
   const timestamp = Date.now() + delaySeconds * 1000;
 
@@ -318,11 +309,10 @@ export async function scheduleRetry(job: Job, delaySeconds: number) {
 }
 
 /**
- * Schedule a retry and write its attempt marker in ONE MULTI, so the marker
+ * Schedule a retry and write its attempt marker in one MULTI, so the marker
  * exists if and only if the retry is in the set. Written separately, a crash
- * between the two would leave a `retry` marker for a job that was never
- * scheduled, and recovery would skip that job forever. Throws if any command
- * failed, like scheduleRetry.
+ * between the two could leave a `retry` marker for a job that was never
+ * scheduled, and recovery would skip that job. Throws if any command failed.
  */
 export async function scheduleRetryWithMarker(
   job: Job,
@@ -339,28 +329,12 @@ export async function scheduleRetryWithMarker(
 }
 
 /**
- * Claim-and-remove of due retries, in one atomic step.
- *
- * ZRANGEBYSCORE then ZREM of exactly the members returned, inside a single Lua
- * script so no other client can interleave. The previous implementation issued
- * the read and a ZREMRANGEBYSCORE as two round trips (#51), which had two
- * failure modes:
- *
- *   - a retry written between the two calls with a score <= now was deleted
- *     without ever being returned — the job silently vanished, neither delivered,
- *     retried, nor dead-lettered. No concurrency was needed for this: a
- *     scheduleRetry with a small or non-positive delay during the read's round
- *     trip is enough.
- *   - two workers (which the deployment notes explicitly suggest for scale)
- *     could both complete the read before either deleted, so both returned the
- *     same jobs and both sent them.
- *
- * Deleting the exact members rather than the score range is the part that closes
- * the first mode; doing both in one EVAL closes the second.
+ * Claims and removes all due retries in one atomic Lua step (the worker uses
+ * moveDueRetries instead). It removes exactly the members it read, not a score
+ * range, so a retry added meanwhile is never deleted unreturned, and two callers
+ * never claim the same member.
  */
-// A fixed, module-level script — Redis-side Lua via EVAL, not JavaScript eval().
-// Nothing is interpolated into it: the key and the cutoff are passed as KEYS[1]
-// and ARGV[1], so no caller-controlled value can become code.
+// Fixed Redis-side Lua script; the key and cutoff are passed as KEYS[1]/ARGV[1].
 const CLAIM_DUE_RETRIES = `
 local due = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1])
 if #due > 0 then
@@ -416,16 +390,12 @@ export async function getQueueMetrics() {
     [, bulk],
   ] = execResult;
 
-  // Handle empty retry zset
   let retry_oldest: number | null = null;
   let retry_eta_seconds: number | null = null;
 
   if (Array.isArray(oldestRetryRaw) && oldestRetryRaw.length === 2) {
-    // The score is set by scheduleRetry as Date.now() + delay, i.e. epoch
-    // MILLISECONDS — the old comment here said seconds, and retry_eta_seconds
-    // was reported as the raw millisecond difference despite its name (a 30s
-    // retry read as 30000). Convert for the *_seconds field; retry_oldest stays
-    // the raw epoch-ms timestamp it has always been.
+    // The score is epoch milliseconds. retry_eta_seconds is converted to
+    // seconds; retry_oldest stays the raw epoch-ms timestamp.
     const scoreMs = Number(oldestRetryRaw[1]);
     retry_oldest = scoreMs;
 

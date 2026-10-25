@@ -4,9 +4,8 @@ import { decodedBase64Length } from '../providers/email/attachments';
 
 /**
  * Email attachments are file bodies, not audit data: the persisted payload
- * keeps filename, contentType and size only. The JOB copy keeps them intact —
- * recovery re-pushes that copy, and an email recovered without its
- * attachments would be a different message.
+ * keeps filename, contentType and size only. The job copy keeps them intact,
+ * because recovery re-pushes that copy.
  */
 function withoutAttachmentBodies(channel: string, variables: unknown): unknown {
   if (channel !== 'email' || !variables || typeof variables !== 'object') return variables;
@@ -36,17 +35,14 @@ export function isOtpTemplate(templateId: unknown): boolean {
 /**
  * What a job persists. The one place this is decided.
  *
- * Realtime jobs carry OTP codes in their variables, and OTP codes are never
- * persisted (spec §Retention and PII): they keep the recipient and the variable
- * NAMES only, and no job copy — so they are also not recoverable after a Redis
- * loss, which is acceptable because the user simply requests a new code.
+ * Redacted jobs may carry OTP codes, which are never persisted: they keep the
+ * recipients and the variable names only, and no job copy, so they are not
+ * recoverable after a Redis loss (the user requests a new code).
  *
- * The decision keys on `audit.redactValues`, set once at /notify from the
- * original priority and template, not on the job's current priority: a DLQ
- * replay may move an OTP job to 'other', and it must stay redacted. Jobs queued
- * before the flag existed fall back to the priority. An OTP template is
- * redacted whatever the flag or priority says: priority is the caller's
- * choice, and an OTP sent without one must not be persisted either.
+ * The decision keys on `audit.redactValues`, set once at accept, not on the
+ * job's current priority: a DLQ replay may move a job to 'other', and it must
+ * stay redacted. Without the flag the priority decides. An OTP template is
+ * redacted whatever the flag or priority says.
  */
 export function toAcceptedRecord(job: Job, source: string): AcceptedRecord {
   if (!job.audit) throw new Error(`job ${job.job_id} has no audit ids`);

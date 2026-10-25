@@ -3,7 +3,7 @@ import type { AttemptStatus, EventStatus } from '../db/partitioned';
 /**
  * Rank within one attempt number. A write is applied only when
  * (attempt_no, rank) is strictly greater than what is stored, so late or
- * replayed writes can never move a record backwards — which is what makes the
+ * replayed writes can never move a record backwards. This is what makes the
  * realtime path's fire-and-forget insert safe to race the worker.
  */
 export const ATTEMPT_RANK: Record<AttemptStatus, number> = {
@@ -17,7 +17,7 @@ export const ATTEMPT_RANK: Record<AttemptStatus, number> = {
   expired: 4,
 };
 
-/** Event status for a single-attempt event (all Plan A events have exactly one). */
+/** Event status that mirrors one attempt's status (`single` events). */
 export function eventStatusFor(a: AttemptStatus): EventStatus {
   switch (a) {
     case 'queued': return 'accepted';

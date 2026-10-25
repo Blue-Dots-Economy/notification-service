@@ -4,7 +4,7 @@ import { check, index, integer, jsonb, pgTable, primaryKey, text, timestamp, uni
 /**
  * Tables drizzle-kit manages (db:generate diffs this file).
  *
- * Partitioned tables are deliberately NOT here — drizzle-kit cannot emit
+ * Partitioned tables are not here: drizzle-kit cannot emit
  * PARTITION BY, so their DDL lives in custom migrations and their query-side
  * definitions in ./partitioned.ts, which drizzle.config.ts does not include.
  */
@@ -17,7 +17,7 @@ export interface VariableSpec {
   name: string;
   required: boolean;
   type: 'string' | 'number' | 'url';
-  /** Redacted wherever a send comes to rest (rows, logs, dead letters). */
+  /** Makes the whole send redacted: names only in the audit, no job copy, never dead-lettered. */
   sensitive: boolean;
   /** Email only: insert without HTML-escaping. An explicit, reviewable opt-out. */
   raw: boolean;

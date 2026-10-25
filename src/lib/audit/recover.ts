@@ -106,7 +106,7 @@ export interface RecoveryResult {
  *
  * Candidates (recoverable, with a job copy):
  * - Epoch lost (no `ns:epoch`): queued/dispatching attempts last touched
- *   BEFORE this Redis started; anything newer reached the live Redis.
+ *   before this Redis started; anything newer reached the live Redis.
  * - Always: attempts stuck in `dispatching` past `staleDispatchMs` (a worker
  *   that died mid-send, or before its retry was scheduled; at-least-once by
  *   design).
@@ -144,7 +144,7 @@ export async function recoverLostJobs(
 
   try {
     const epochLost = gotLock && !(await redis.exists(REDIS_EPOCH_KEY));
-    // The epoch-lost cutoff is fixed ONCE as an absolute timestamp. Evaluating
+    // The epoch-lost cutoff is fixed once as an absolute timestamp. Evaluating
     // `now() - uptime` per batch would let it drift forward with the run, and a
     // later batch would pick up rows live traffic wrote after the Redis start.
     const epochCutoff = epochLost ? await redisStartedAt(await redisUptimeSeconds()) : null;
@@ -255,11 +255,9 @@ async function recoverBatch(p: {
       requeueJobs = toRequeue.map((r) => ({ ...r.job, attempt: (attemptById.get(r.id) ?? r.attempt_no + 1) - 1 }));
     }
 
-    // The events of every attempt written above (stamped, abandoned or
-    // re-queued), rolled up from all their attempts (a first_available/all
-    // event has siblings; writing one attempt's status straight onto the event
-    // would overwrite them). Sorted, so two concurrent sweeps take the event
-    // row locks in the same order.
+    // Roll up the event of every attempt written above from all its attempts
+    // (first_available/all events have siblings). Sorted, so two concurrent
+    // sweeps take the event row locks in the same order.
     const touched = new Map<string, { eventId: string; createdAt: string }>();
     for (const r of [...toMark.map((m) => m.row), ...toAbandon, ...toRequeue]) {
       touched.set(`${r.notification_event_id}|${r.created_at}`, { eventId: r.notification_event_id, createdAt: r.created_at });

@@ -83,12 +83,10 @@ function hostAllowed(host: string, allowed: string[]): boolean {
 }
 
 function normalise(spec: VariableSpec, value: unknown): string {
-  // Reject non-finite JS numbers (NaN, Infinity, -Infinity) for all variable types
   if (typeof value === 'number' && !Number.isFinite(value)) {
     throw new TemplateError('invalid_variable', `${spec.name} must be a scalar`, { variable: spec.name });
   }
 
-  // Reject non-scalar types: object, function, symbol, bigint
   const valueType = typeof value;
   if (valueType === 'object' || valueType === 'function' || valueType === 'symbol' || valueType === 'bigint') {
     throw new TemplateError('invalid_variable', `${spec.name} must be a scalar`, { variable: spec.name });
@@ -116,7 +114,7 @@ function normalise(spec: VariableSpec, value: unknown): string {
     if (url.username || url.password) {
       throw new TemplateError('invalid_variable', `${spec.name} host is not allowed`, { variable: spec.name });
     }
-    // Strip one trailing dot from hostname before allowlist comparison
+    // One trailing dot is tolerated (`example.com.`).
     let hostname = url.hostname;
     if (hostname.endsWith('.')) {
       hostname = hostname.slice(0, -1);
@@ -124,7 +122,7 @@ function normalise(spec: VariableSpec, value: unknown): string {
     if (spec.urlHosts && !hostAllowed(hostname, spec.urlHosts)) {
       throw new TemplateError('invalid_variable', `${spec.name} host is not allowed`, { variable: spec.name });
     }
-    // Return the normalized URL form
+    // The normalised form, so what was validated is what is sent.
     return url.href;
   }
 
@@ -146,7 +144,7 @@ export function validateVariables(
   }
   const out: Record<string, string> = {};
   for (const spec of contract) {
-    // Use hasOwnProperty to read only own properties, avoiding inherited prototype pollution
+    // Own properties only: `constructor`, `toString` etc. must not resolve via the prototype.
     const value = Object.prototype.hasOwnProperty.call(input, spec.name) ? input[spec.name] : undefined;
     const empty = value === undefined || value === null || value === '';
     if (empty) {

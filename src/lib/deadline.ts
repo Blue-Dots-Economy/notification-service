@@ -17,7 +17,7 @@ export function wouldExpire(job: Job, delayMs: number, now = Date.now()): boolea
   return job.deadline !== undefined && now + delayMs > job.deadline;
 }
 
-/** OTP-class jobs: never persisted with values, never dead-lettered. Sticky (Plan A R15). */
+/** OTP-class jobs: never dead-lettered. Sticky: keys on `audit.redactValues` set at accept. */
 export function isRedacted(job: Job): boolean {
   return job.audit?.redactValues ?? job.priority === 'realtime';
 }

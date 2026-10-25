@@ -2,7 +2,7 @@
  * A log-safe one-line summary of a database error.
  *
  * Drizzle wraps driver errors in `DrizzleQueryError`, whose `message` embeds the
- * full query AND every bound parameter — recipients, variables, the job copy.
+ * full query and every bound parameter: recipients, variables, the job copy.
  * That message must never reach a log. This keeps only the Postgres error code
  * and the driver's own message (from `cause` when wrapped), bounded in length.
  */

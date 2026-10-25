@@ -8,7 +8,7 @@ export interface ContentSnapshot {
   fingerprint?: string;
 }
 
-/** Where content comes from. `configmap` today; `db`/`http` later, as configuration. */
+/** Where content comes from. Only `configmap` exists; others would be a configuration change. */
 export interface ContentProvider {
   name: string;
   load(): Promise<ContentSnapshot>;
