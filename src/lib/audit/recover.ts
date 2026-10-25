@@ -256,7 +256,8 @@ async function recoverBatch(p: {
     }
 
     // Roll up the event of every attempt written above from all its attempts
-    // (first_available/all events have siblings). Sorted, so two concurrent
+    // (first_available/all events have siblings), rather than writing this
+    // attempt's status, which would overwrite its siblings'. Sorted, so two concurrent
     // sweeps take the event row locks in the same order.
     const touched = new Map<string, { eventId: string; createdAt: string }>();
     for (const r of [...toMark.map((m) => m.row), ...toAbandon, ...toRequeue]) {

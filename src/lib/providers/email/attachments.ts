@@ -58,7 +58,7 @@ export function totalAttachmentBytes(
 }
 
 /**
- * HTTP body limit for the Fastify instance, derived from the attachment budget
+ * HTTP body limit for the two send routes, derived from the attachment budget
  * (base64 inflates by 4/3, plus headroom for the rest of the envelope), so
  * raising the attachment cap never causes a 413. `NOTIFY_BODY_LIMIT_BYTES`
  * overrides it.

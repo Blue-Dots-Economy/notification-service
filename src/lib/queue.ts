@@ -60,7 +60,7 @@ function wellFormed(value: unknown): unknown {
  * keys and values (e.g. a truncated emoji) become U+FFFD first: JSON.stringify
  * emits them as `\udXXX` escapes, which Redis's cjson rejects, so
  * MOVE_DUE_RETRIES could not read the job's priority. pushToPriorityWithMarker
- * does not use it yet; every other writer here does.
+ * does not use it yet; every other writer that serialises a Job does.
  */
 export function serializeJob(job: Job): string {
   return JSON.stringify(wellFormed(job));

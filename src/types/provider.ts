@@ -10,8 +10,8 @@ export interface ProviderTemplateMap {
  * Outcome of one provider send.
  *
  * The worker retries any failure up to `MAX_RETRIES` unless `retryable` is
- * `false`, which ends the delivery on the first attempt (dead-letter, drop or
- * fall-through), so a permanent misconfiguration surfaces at once.
+ * `false`, which ends the delivery with no further retries (dead-letter, drop
+ * or fall-through), so a permanent misconfiguration surfaces at once.
  */
 export interface ProviderSendResult {
   ok: boolean;

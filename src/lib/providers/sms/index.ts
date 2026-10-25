@@ -5,7 +5,8 @@ import { pinnacleSmsProvider } from './pinnacle';
 /**
  * Which SMS vendor this deployment sends through, chosen by `SMS_PROVIDER`.
  * There is one vendor per channel per deployment: templates are registered per
- * vendor (DLT ids), so another vendor's id would be meaningless.
+ * vendor (DLT ids), so another vendor's id would be meaningless. Known
+ * limitation: a send cannot be routed to a vendor per event or priority.
  *
  * Both definitions declare `name: 'sms'`, so the channel key, the rate-limit
  * key and every caller are identical whichever is selected.
