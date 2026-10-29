@@ -3,11 +3,8 @@ import nodemailer, { type Transporter } from 'nodemailer';
 import SMTPTransport from 'nodemailer/lib/smtp-transport';
 import { providerTimeoutMs } from '../http';
 
-// Left on the default `SentMessageInfo` rather than the SMTP-specific one: this
-// holds an SES transport or an SMTP transport depending on config, and nodemailer
-// v10 gives those distinct info types. Only `messageId` is read from a send result,
-// which is on the shared base. v9's types conflated the two, so the narrower
-// annotation only ever looked correct.
+// Default `SentMessageInfo`, not the SMTP one: this holds an SES or an SMTP
+// transport, whose info types differ. Only the shared `messageId` is read.
 let transporter: Transporter;
 
 export interface Email_attachment {
@@ -50,7 +47,7 @@ const isTrue = (v?: string) => String(v).toLowerCase() === 'true';
 /** Special-cased only for the From address below; otherwise Gmail is just a relay. */
 const GMAIL_HOST = 'smtp.gmail.com';
 
-/** The SMTP connection, resolved from the environment. `SMTP_HOST` selects it (#112). */
+/** The SMTP connection, resolved from the environment. `SMTP_HOST` selects it. */
 function resolveSmtp(): SMTPTransport.Options | undefined {
   if (!SMTP_HOST) return undefined;
   const timeout = providerTimeoutMs();
@@ -140,8 +137,7 @@ export async function sendMail({
   if (MAIL_LOG === 'true') {
     console.log('📧 Sending mail to:', to);
     if (activationUrl) console.log('🔗 Activation URL/OTP:', activationUrl);
-    // Names and sizes only — never the base64 content, which would dump
-    // megabytes of a user's file into the service logs.
+    // Names and sizes only, never the base64 content.
     if (attachments?.length) {
       console.log(
         '📎 Attachments:',
@@ -159,27 +155,18 @@ export async function sendMail({
       replyTo,
       cc,
       subject,
-      // The plain-text alternative. The trailing `<`-strip is not redundant: the
-      // tag regex is a single pass, so an UNTERMINATED tag leaves its `<` behind
-      // ("<p>x<script" -> "x<script") — CodeQL
-      // js/incomplete-multi-character-sanitization. Nothing executes in a
-      // text/plain part, so this was never exploitable, but removing any residual
-      // `<` makes a surviving `<script` impossible for one linear pass.
+      // The plain-text alternative. The second `<`-strip is needed: the tag regex
+      // is a single pass, so an unterminated tag leaves its `<` behind (CodeQL
+      // js/incomplete-multi-character-sanitization). Only `<` is stripped, not
+      // `>`, which appears in ordinary copy ("Score > 90"); see the mailer test.
       //
-      // Only `<` is stripped, deliberately NOT `>`. A blanket /[<>]/ also deletes
-      // legitimate unescaped `>` from visible copy — "Score > 90" became
-      // "Score  90" and "A => B" became "A = B" — which silently corrupts the
-      // plain-text body of ordinary mail. See the mailer test.
-      //
-      // Without `text` (legacy /notify) this is exactly the original behaviour:
-      // text derived from `html`, `html` passed as given. sendRendered checks
-      // that a v1 email has a body before it gets here.
+      // Without `text` (legacy /notify) the text is derived from `html`.
+      // sendRendered checks that a v1 email has a body before it gets here.
       ...(text === undefined
         ? { text: (html as string).replace(/<[^>]+>/g, '').replace(/</g, ''), html }
         : { text, ...(html ? { html } : {}) }),
-      // Decoded here rather than passing `encoding: 'base64'` so nodemailer
-      // handles the transfer encoding itself for whatever transport is active
-      // (the SES transport re-encodes into raw MIME).
+      // Decoded here rather than passing `encoding: 'base64'`, so nodemailer
+      // picks the transfer encoding for the active transport.
       ...(attachments?.length
         ? {
             attachments: attachments.map((a) => ({

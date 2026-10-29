@@ -45,7 +45,8 @@ function buildJobs(req: V1Request, plan: SendPlan, correlationHeader: unknown): 
     priority,
     to: deliveries[0]!.to,
     template_id: deliveries[0]!.templateKey,
-    // Redacted sends carry no values anywhere the audit layer can see.
+    // Redacted sends keep no variable values here; their rendered text in `v1` is
+    // never persisted, as redacted jobs keep no job copy.
     variables: plan.redact ? {} : plan.variables,
     ...(plan.deadline !== undefined ? { deadline: plan.deadline } : {}),
     v1: {

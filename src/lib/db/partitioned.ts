@@ -4,7 +4,7 @@ import { boolean, integer, jsonb, pgTable, smallint, text, timestamp, uuid } fro
  * Query-side definitions of the partitioned audit tables. Their DDL is the
  * custom migration drizzle/0000_audit_tables.sql — drizzle.config.ts does not
  * include this file, so `db:generate` never tries to re-create them. Change a
- * column here AND in a new custom migration, together.
+ * column here and in a new custom migration, together.
  */
 
 export type EventStatus =

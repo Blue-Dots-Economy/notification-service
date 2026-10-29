@@ -6,18 +6,14 @@ export interface NotifyRequest {
   variables: any;
   dedupe_id?: string;
   /**
-   * Optional message body template, for providers that do not render
-   * server-side (Pinnacle SMS). Ignored by providers that do (MSG91 renders
-   * from the DLT flow; SES renders from the email template).
-   *
-   * Only needed for a RAW pass-through `template_id` — when the provider names
-   * the template it owns the body too (`ProviderDefinition.bodies`), which is
-   * why the OTP callers need no change.
+   * Optional body template for providers that do not render (Pinnacle SMS);
+   * ignored by the others. Only used for a raw pass-through `template_id`: a
+   * template the provider names uses its own body (`ProviderDefinition.bodies`).
    */
   body?: string;
 }
 
-/** Internal priority. Public API names (Plan C2): urgent → realtime, normal → other, bulk → bulk. */
+/** Internal priority. Send API v1 names: urgent → realtime, normal → other, bulk → bulk. */
 export type Priority = 'realtime' | 'other' | 'bulk';
 
 export interface Job {
@@ -29,7 +25,7 @@ export interface Job {
   variables: any;
   body?: string;
   attempt?: number; // number of tries so far
-  next_attempt_at?: number; // timestamp of when to retry
+  next_attempt_at?: number; // never set; the retry time is the queue:retry score
   /** Audit identity, assigned at /notify and carried to every status write. */
   audit?: import('../lib/audit/store').AuditIds;
   /** Times this job has been replayed from the DLQ (capped; see queue.ts). */

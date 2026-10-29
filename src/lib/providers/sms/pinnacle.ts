@@ -6,18 +6,16 @@ import { isTimeoutError, providerTimeoutMs } from '../http';
 import { MAX_LENGTH, messageType, renderBody, UnresolvedTemplateVariables } from './render';
 
 /**
- * Pinnacle Teleservices SMS provider — the JSON endpoint (`/index.php/sms/json`).
+ * Pinnacle Teleservices SMS provider, JSON endpoint (`/index.php/sms/json`).
  *
- * The shape difference from MSG91 is the whole reason this file is interesting.
- * MSG91's Flow API takes a flow id plus named variables and renders the
- * DLT-approved body itself. Pinnacle renders NOTHING: it takes final `text` and
- * carries the DLT identifiers alongside, for the operator to match against the
- * registered template. So this adapter renders the body (see `./render`) and
- * attaches the DLT metadata from config.
+ * Unlike MSG91 Flow, Pinnacle renders nothing: it takes the final `text` plus
+ * DLT identifiers, which the operator matches against the registered template.
+ * This adapter renders the body (see `./render`) and attaches the DLT metadata.
  *
- * DLT ids are issued by the DLT platform against the sending *principal entity*
- * — the adopter — so `sender`/`dltentityid` are deployment-wide config, while
- * `dlttempid` varies per template and arrives as the `template_id`.
+ * DLT ids are issued against the sending principal entity (the adopter), so
+ * `sender`/`dltentityid` are deployment-wide config, while `dlttempid` varies
+ * per template and arrives as the `template_id`.
+ * Design: docs/superpowers/specs/2026-09-14-pinnacle-sms-provider-design.md
  */
 
 const DEFAULT_BASE_URL = 'https://api.pinnacle.in';
@@ -36,18 +34,11 @@ interface PinnacleConfig {
  * The only two codes the vendor documents as transient: EC1009 ("unable to
  * process request") and EC1010 ("submission exceeded time limit").
  *
- * The classification is deliberately an allowlist of RETRYABLE codes rather
- * than a list of permanent ones. An enumeration of permanent codes has to track
- * the vendor's table exactly, and that table has holes — EC1018 and EC1020 do
- * not exist in it at all, and EC1024/EC1025/EC1029/EC1030 are reseller and
- * account-management errors that a send can never produce. Listing permanents
- * meant those six looked like deliberate retry decisions when they were just
- * gaps, and each one silently cost five attempts.
- *
- * Inverting it also fails safe: an `EC` code we do not recognise is the vendor
- * telling us it understood the request and refused it, which does not improve
- * on retry. Genuinely transient conditions arrive as HTTP 5xx, 408, 429 or a
- * socket error, all handled separately.
+ * An allowlist of retryable codes, not a list of permanent ones: the vendor's
+ * code table has gaps, and an unrecognised `EC` code means the vendor
+ * understood the request and refused it, which a retry does not change.
+ * Transient conditions arrive as HTTP 5xx, 408, 429 or a socket error, handled
+ * separately.
  */
 const RETRYABLE_ERROR_CODES = new Set(['EC1009', 'EC1010']);
 
@@ -76,21 +67,18 @@ function normalisePhone(to: string): string {
 }
 
 /**
- * Pinnacle answers 200 for business errors too, so the HTTP status alone says
- * nothing. Success is `status: success` AND `code: 200`; anything else carries
- * an `EC1xxx` in `code`.
- */
-/**
  * Only `EC1xxx` and `HTTP_nnn` become metric labels; anything else collapses to
- * `OTHER`. The code comes from a vendor response, so left unbounded it is both
- * a cardinality leak into a Redis hash with no TTL and — since the value is
- * interpolated into the exposition — a way for a malformed vendor payload to
- * break the entire scrape document.
+ * `OTHER`. The code comes from a vendor response: unbounded, it would grow a
+ * Redis hash with no TTL and could break the scrape document.
  */
 export function errorCodeLabel(code: string): string {
   return /^EC1\d{3}$/.test(code) || /^HTTP_\d{3}$/.test(code) ? code : 'OTHER';
 }
 
+/**
+ * Pinnacle answers 200 for business errors too. Success is `status: success`
+ * with `code: 200` (or no code); anything else carries an `EC1xxx` in `code`.
+ */
 function readResponse(payload: any): { ok: boolean; code: string; message?: string; uniqueid?: string } {
   const code = String(payload?.code ?? '');
   const status = String(payload?.status ?? '').toLowerCase();
@@ -225,9 +213,8 @@ export async function sendPinnacleText(
       };
     }
 
-    // A vendor that answers 200 with a non-JSON body would otherwise throw out
-    // of `json()` and be reported as a network error. It is a bad response, not
-    // a bad connection, and retrying it is still right — but it should say so.
+    // A 200 with a non-JSON body is reported as a bad response, not a network
+    // error. It is still retried.
     let responsePayload: unknown;
     try {
       responsePayload = await resp.json();
@@ -238,8 +225,8 @@ export async function sendPinnacleText(
     }
     parsed = readResponse(responsePayload);
   } catch (err) {
-    // Network-level failure — genuinely transient, and the message is logged
-    // rather than the error object, which can carry the request (phone, text).
+    // Network-level failure: transient. Only the message is returned, never the
+    // error object, which can carry the request (phone, text).
     await metrics.incr('ns_sms_send_total', { provider: 'pinnacle', result: 'failed' });
     return {
       ok: false,
@@ -266,10 +253,9 @@ export async function sendPinnacleText(
 }
 
 /**
- * Poll the account balance into a gauge. `EC1003 Insufficient Balance` is
- * otherwise a silent killer — every send fails permanently and nothing else in
- * the system can distinguish that from a bad template. Called on an interval by
- * the worker, never on the send path.
+ * Poll the account balance into a gauge. Without it, `EC1003 Insufficient
+ * Balance` fails every send permanently and looks like a bad template. Called on
+ * an interval by the worker, never on the send path.
  */
 export async function pollPinnacleBalance(env = process.env): Promise<number | null> {
   const config = loadPinnacleConfig(env);
@@ -287,10 +273,8 @@ export async function pollPinnacleBalance(env = process.env): Promise<number | n
     if (!Number.isFinite(balance)) return await failPoll('unparseable', 'no numeric balance in response');
 
     await metrics.setGauge('ns_provider_balance', balance, { provider: 'pinnacle' });
-    // Freshness is published alongside the value because the value alone cannot
-    // distinguish "balance is healthy" from "the poller died an hour ago and
-    // this number is stale" — and those two look identical right up until every
-    // send starts failing on EC1003.
+    // Freshness is published alongside the value: the value alone cannot tell a
+    // healthy balance from a stale one left by a dead poller.
     await metrics.setGauge('ns_provider_balance_updated_at', Math.floor(Date.now() / 1000), {
       provider: 'pinnacle',
     });
@@ -301,8 +285,8 @@ export async function pollPinnacleBalance(env = process.env): Promise<number | n
 }
 
 /**
- * A balance poll that fails silently is worse than no poll at all: the gauge
- * keeps reporting the last healthy number forever. Every exit records why.
+ * Every failed poll is logged and counted: otherwise the gauge would keep
+ * reporting the last healthy number with no sign of trouble.
  */
 async function failPoll(reason: string, detail: string): Promise<null> {
   console.log(`pinnacle balance poll failed (${reason}): ${detail}`);
@@ -314,17 +298,15 @@ async function failPoll(reason: string, detail: string): Promise<null> {
 }
 
 export const pinnacleSmsProvider: ProviderDefinition = {
-  // Deliberately `sms`, not `pinnacle-sms`: the provider registry keys on this
-  // name and it is the `channel` every caller sends. Swapping vendors must not
-  // change the channel.
+  // `sms`, not `pinnacle-sms`: the registry keys on this name and it is the
+  // `channel` every caller sends, so swapping vendors does not change it.
   name: 'sms',
   vendor: 'pinnacle',
   renders: 'ns',
 
-  // Pinnacle's `dlttempid` IS the DLT template id, so unlike MSG91 there is no
-  // vendor-internal indirection — a raw pass-through id needs no entry here.
-  // Only the templates this service NAMES need a mapping, and they need a body
-  // to go with it, since Pinnacle renders nothing.
+  // Pinnacle's `dlttempid` is the DLT template id itself, so a raw pass-through
+  // id needs no entry here. Only templates this service names need a mapping,
+  // plus a body, since Pinnacle renders nothing.
   templates: {
     login_otp: process.env.PINNACLE_LOGIN_OTP_TEMPLATE_ID ?? '',
   },

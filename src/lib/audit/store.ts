@@ -12,20 +12,19 @@ export interface AuditIds {
   createdAt: string;
   correlationId: string;
   /**
-   * Persist variable NAMES only, never values, and keep no job copy. Fixed at
-   * /notify from the ORIGINAL priority (true for realtime) and carried on the
-   * job, so a DLQ replay under another priority still never persists an OTP.
-   * Optional only for jobs queued before the flag existed.
+   * Persist variable names only, never values, and keep no job copy. Set at
+   * accept (/notify: realtime or an OTP template; /v1/notify: urgent or a
+   * sensitive variable) and carried on the job, so a DLQ replay under another
+   * priority still never persists an OTP. When absent, the priority decides.
    */
   redactValues?: boolean;
   /** Absent = `single`. `all` events roll their status up across attempts. */
   deliveryMode?: DeliveryMode;
-  /** Variable NAMES of a redacted send (its job carries no values). */
+  /** Variable names of a redacted send (its job carries no values). */
   variableNames?: string[];
   /**
-   * Send API v1: every contact point the request supplied ({email, phone}).
-   * The event payload records this rather than the one channel's address of
-   * the first job. Recipients only, never variable values.
+   * Send API v1: every contact point the request supplied ({email, phone}),
+   * recorded on the event payload. Recipients only, never variable values.
    */
   recipients?: Record<string, string>;
   /**
@@ -63,9 +62,9 @@ export interface AcceptedRecord {
   /** notification_event.domain: the recipient domain as sent; null when absent. */
   domain: string | null;
   traceId?: string;
-  /** Redacted request payload. Realtime: variable NAMES only, never values. */
+  /** Redacted request payload. Redacted sends: variable names only, never values. */
   payload: Record<string, unknown>;
-  /** The queued job, kept only when recoverable (normal priority). */
+  /** The queued job, kept only when recoverable (not redacted). */
   job?: Record<string, unknown>;
   recoverable: boolean;
 }
@@ -195,8 +194,8 @@ export interface SqlExecutor {
  *
  * - `all`: every attempt counts; mixed terminal outcomes → partially_delivered.
  * - `first_available` (and a `single` event, whose replays add attempts):
- *   delivered / sent if ANY attempt reached it — so a late failure of an
- *   earlier attempt never moves a sent event back to failed — otherwise the
+ *   delivered / sent if any attempt reached it (a late failure of an earlier
+ *   attempt never moves a sent event back to failed), otherwise the
  *   status of the latest attempt. Attempts share created_at (the partition
  *   key) and have random ids, so "latest" is: an open attempt (completed_at
  *   NULL; fall-through closes an attempt before it opens the next) first,

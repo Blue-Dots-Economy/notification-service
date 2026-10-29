@@ -1,18 +1,14 @@
 import redis from './redis';
 
 /**
- * Prometheus counters for the send path.
+ * Prometheus counters and gauges, stored in Redis because the worker that
+ * performs every send runs in a separate process from the API server that
+ * serves `/metrics` (see `src/server.ts`). An in-process registry would expose
+ * an API process that has sent nothing.
  *
- * These live in Redis rather than in process memory because the worker that
- * performs every send runs in a SEPARATE process from the API server that
- * serves `/metrics` (see `src/server.ts`). An in-process registry — prom-client
- * or hand-rolled — would expose an API process that has sent nothing, and the
- * counters that matter would be invisible. Redis is already the shared state
- * for everything else here, so it is the natural place.
- *
- * Counters only. Queue depths are read live from `getQueueMetrics()` at scrape
- * time, so they are never stale, and `setGauge` covers the one value nothing
- * else observes (provider balance).
+ * Queue depths are not stored: they are read live from `getQueueMetrics()` at
+ * scrape time. `setGauge` holds values nothing else observes (provider balance,
+ * partition default rows, content load time).
  */
 
 const COUNTERS_KEY = 'metrics:counters';
@@ -22,10 +18,9 @@ export type Labels = Record<string, string>;
 
 /**
  * `|`, `,` and `=` are the field encoding's own delimiters, so a label value
- * containing one would round-trip through `parseField` as a different series —
- * or as a malformed name, which makes Prometheus reject the ENTIRE scrape
- * document, not just that line. Values reaching here come from provider
- * responses, so they are not ours to trust.
+ * containing one would round-trip through `parseField` as a different series,
+ * or as a malformed name, which makes Prometheus reject the whole scrape
+ * document. Values can come from provider responses, so they are untrusted.
  */
 function sanitiseLabelValue(value: string): string {
   return value.replace(/[|,=]/g, '_');
@@ -52,9 +47,8 @@ function parseField(raw: string): { name: string; labels: Labels } {
 }
 
 /**
- * Metrics must never be able to fail a send. Every write is best-effort: a
- * Redis hiccup while recording that an SMS went out must not turn a delivered
- * message into a retry.
+ * Best-effort, never throws: a Redis hiccup while recording a send must not
+ * turn a delivered message into a retry.
  */
 export async function incr(name: string, labels: Labels = {}, by = 1): Promise<void> {
   try {
@@ -148,11 +142,8 @@ export async function renderPrometheus(
   // at the point of use, so a shape change cannot emit a NaN series.
   queue: Record<string, unknown>
 ): Promise<string> {
-  // Deliberately NOT caught. `incr` swallows because it has a send in flight to
-  // protect; this has none. Serving 200 with the counters silently absent looks
-  // to Prometheus like a healthy service with no traffic, which is the one
-  // reading that makes every alert built on these metrics unable to fire.
-  // Failing the scrape is what surfaces as `up == 0`.
+  // Not caught: serving 200 without the counters looks like a healthy service
+  // with no traffic, so no alert could fire. A failed scrape surfaces as `up == 0`.
   const [counters, gauges] = await Promise.all([
     redis.hgetall(COUNTERS_KEY),
     redis.hgetall(GAUGES_KEY),

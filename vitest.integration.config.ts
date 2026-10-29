@@ -1,7 +1,7 @@
 import { defineConfig } from 'vitest/config';
 
 /**
- * Integration suite — needs a REAL Redis and Postgres, unlike the default run.
+ * Integration suite: needs a real Redis and Postgres, unlike the default run.
  *
  * Locally:  redis-server --port 6399 --daemonize yes
  *           docker compose up -d postgres
@@ -12,7 +12,7 @@ import { defineConfig } from 'vitest/config';
  * In CI:    the `redis` service container on 6379 and a pg_partman Postgres
  *           built from docker/postgres (see ci.yaml)
  *
- * Single-threaded on purpose: these tests share one Redis keyspace, so running
+ * Single-threaded: these tests share one Redis keyspace, so running
  * files in parallel would let them clobber each other's `queue:retry`.
  */
 export default defineConfig({

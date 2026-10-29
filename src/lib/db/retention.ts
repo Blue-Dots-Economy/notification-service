@@ -8,7 +8,7 @@ import type { Pool } from 'pg';
  * is written to part_config (only where it differs), and the regular
  * maintenance run (maintenance.ts) drops partitions outside it.
  *
- * Partitions are MONTHLY, and pg_partman drops a whole partition only once its
+ * Partitions are monthly, and pg_partman drops a whole partition only once its
  * upper bound is older than the window. A row therefore lives between N and
  * about N + 31 days. Below one partition width the number stops describing
  * what happens (N = 7 would keep rows for up to ~38 days), so the minimum is

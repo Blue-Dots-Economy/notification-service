@@ -1,10 +1,6 @@
 /**
- * Body rendering for SMS providers that do NOT render server-side.
- *
- * MSG91's Flow API takes a flow id plus named variables and renders the
- * DLT-approved text itself. Pinnacle does not: it takes final text and attaches
- * DLT ids for the operator to match on. So for Pinnacle someone has to
- * substitute the variables, and that someone is here.
+ * Body rendering for SMS vendors that do not render (Pinnacle takes final text
+ * plus DLT ids; MSG91 Flow renders the DLT-approved text itself).
  */
 
 const TOKEN = /\{\{(\w+)\}\}/g;
@@ -19,11 +15,9 @@ export class UnresolvedTemplateVariables extends Error {
 /**
  * Substitute `{{token}}` placeholders in `body` from `variables`.
  *
- * Throws on any token with no value rather than leaving it in place. The
- * lenient behaviour is right for the dev-preview log this mirrors in
- * signalstack, and wrong here: an unsubstituted `{{name}}` would be delivered
- * to a handset verbatim, and would also no longer match the DLT-approved text
- * the operator checks against.
+ * Throws UnresolvedTemplateVariables on any token with no (or an empty) value:
+ * an unsubstituted `{{name}}` would reach the handset verbatim and no longer
+ * match the DLT-approved text.
  */
 export function renderBody(body: string, variables: Record<string, unknown>): string {
   const missing: string[] = [];
@@ -43,14 +37,11 @@ export function renderBody(body: string, variables: Record<string, unknown>): st
 
 /**
  * Pinnacle's `messagetype`: `TXT` for Latin-1 text, `UNI` for anything else.
- * Getting this wrong does not fail the send — it garbles the message on the
- * handset — and these deployments carry Hindi copy, so it is detected from the
- * text rather than configured.
+ * A wrong type garbles the message on the handset rather than failing the send,
+ * and deployments carry Hindi copy, so it is detected from the text.
  *
- * Written with `\u` escapes rather than literal characters on purpose: a raw
- * high byte here makes the whole file non-UTF-8 to git, which silently turns
- * the one module deciding what text reaches a handset into an unreviewable
- * binary blob in every diff.
+ * Uses `\u` escapes, not literal characters: a raw high byte would make git
+ * treat the file as binary and hide it from diffs.
  */
 export function messageType(text: string): 'TXT' | 'UNI' {
   // eslint-disable-next-line no-control-regex

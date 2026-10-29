@@ -6,8 +6,8 @@ import { pruneIdempotencyKeys } from '../send/idempotency';
 
 /**
  * pg_partman maintenance, driven by NS rather than pg_partman's background
- * worker (which needs shared_preload_libraries — a cluster-wide RDS parameter
- * change for one tenant). Pre-makes future monthly partitions. It does NOT
+ * worker (which needs shared_preload_libraries, a cluster-wide RDS parameter
+ * change). Pre-makes future monthly partitions. It does not
  * move rows out of the default partition: a row sitting in the default for a
  * range that a new partition would cover makes run_maintenance skip that
  * partition set, so each tick also runs partman.check_default() and reports
@@ -15,9 +15,8 @@ import { pruneIdempotencyKeys } from '../send/idempotency';
  * Moving them is a manual partman.partition_data_proc().
  *
  * run_maintenance also applies the audit retention on notification_event and
- * delivery_attempt (NS_AUDIT_RETENTION_DAYS, default 90; migration 0005 set the
- * initial 90 days and runMigrations writes the configured value at boot, see
- * retention.ts): it DROPS (not detaches) every monthly partition whose whole
+ * delivery_attempt (NS_AUDIT_RETENTION_DAYS, default 90, written at boot; see
+ * retention.ts): it drops (not detaches) every monthly partition whose whole
  * month is older than the window, so that audit data is gone. Rows in a
  * default partition are not covered.
  *

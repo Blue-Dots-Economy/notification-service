@@ -93,11 +93,9 @@ async function holdForToken(
  * Runs one job through its provider, then decides its fate: delivered, scheduled
  * for another attempt with exponential backoff, or moved to the dead-letter queue.
  *
- * Exported for tests. The worker pools are the only production caller.
+ * Exported for tests; the worker pools are the only production caller.
  * Returns `{ deferredMs }` when the job was deferred (rate limit or a failed
- * token check) so the pool loop backs off; other outcomes return as before.
- *
- * @param job - The job to attempt. Its `attempt` counter is incremented in place.
+ * token check) so the pool loop backs off. Increments `job.attempt` in place.
  */
 export async function processJob(job: Job) {
   if (job.v1) return processV1Job(job);
@@ -118,19 +116,13 @@ export async function processJob(job: Job) {
   }
 
   // Resolve a known template name to its provider-side id; when the provider
-  // owns raw ids (SMS, #532/#535) an unknown id is passed through verbatim.
+  // allows raw ids (SMS) an unknown id is passed through verbatim.
   const named = provider.templates[job.template_id];
   const namedBody = provider.bodies?.[job.template_id];
 
-  // A template the provider NAMES but has no id — or no body, where it owns one
-  // — is the placeholder case: the vendor's DLT approval has not landed yet.
-  //
-  // The body half is the security-relevant one. `bodies` and `templates` are
-  // both declarations that THIS service owns the template, so a blank body must
-  // not silently fall back to the caller's `body`: that would put arbitrary
-  // caller text on the wire under a DLT-approved template id, which is both a
-  // compliance break and a phishing primitive. Declared-but-blank is a
-  // configuration gap, never an invitation for the caller to fill it.
+  // A template the provider names with a blank id or body is unconfigured (DLT
+  // approval pending). A blank body must not fall back to the caller's `body`:
+  // that would send caller text under a DLT-approved template id.
   if (named === '' || namedBody === '') {
     console.log(
       `Template '${job.template_id}' is named but not fully configured for the active provider ` +
@@ -148,9 +140,8 @@ export async function processJob(job: Job) {
 
   console.log(`Processing ${job.job_id} (attempt ${job.attempt})`);
 
-  // `??`, never `||`: a provider that NAMES the template owns its body, and the
-  // blank case was already dead-lettered above. Only a template this service
-  // does not name — a raw pass-through id — falls back to the caller's body.
+  // `??`, never `||`: a provider that names the template owns its body (blank was
+  // handled above). Only a raw pass-through id falls back to the caller's body.
   const body = namedBody ?? job.body;
 
   await stamp(job, { status: 'dispatching', attemptNo: job.attempt });
@@ -165,9 +156,8 @@ export async function processJob(job: Job) {
       job_id: job.job_id,
     });
   } catch (err) {
-    // The job is already popped and not yet in the DLQ, so an unexpected throw
-    // from a provider would drop the notification silently. Treat it as a
-    // retryable failure and let the normal ladder below decide its fate.
+    // The job is already popped: treat a throw as a retryable failure rather
+    // than dropping it, and let the retry ladder decide its fate.
     console.log(
       `Provider threw for ${job.job_id}:`,
       err instanceof Error ? err.message : String(err)
@@ -176,9 +166,8 @@ export async function processJob(job: Job) {
   }
 
   if (!res.ok) {
-    // A failure the provider knows is permanent — an unregistered template, a
-    // rejected sender id — will fail identically four more times. Retrying it
-    // only delays the diagnosis and buries the cause under "max retries".
+    // A permanent failure (unregistered template, rejected sender id) would fail
+    // the same way on every retry, so it goes straight to its terminal fate.
     if (res.retryable === false) {
       console.log(`Permanent failure ${fate(job)}: ${job.job_id}${res.error ? ` (${res.error})` : ''}`);
       return dropOrDeadLetter(job, 'permanent_failure', res.error);
@@ -195,14 +184,11 @@ export async function processJob(job: Job) {
     if (wouldExpire(job, delay * 1000)) return expire(job, job.attempt, res.error);
     console.log(`Retry scheduled in ${delay}s:`, job.job_id);
 
-    // The retry ZADD and the `retry` marker in one MULTI, THEN the `queued`
-    // stamp. The marker exists iff the retry is scheduled, and the row stays
-    // `dispatching` until it is, so the stale-dispatch sweep covers every crash
-    // here: before (or a failed) MULTI → no marker → re-queued; after it → the
-    // marker says the job is in the retry set → left alone, whether or not the
-    // `queued` stamp landed. Stamping `queued` first would strand the row: the
-    // sweep only re-queues stale `dispatching` rows. A late `queued` stamp can
-    // never overwrite the retry's own stamps (monotonic on attempt_no, rank).
+    // Retry ZADD and `retry` marker in one MULTI, then the `queued` stamp. The
+    // row stays `dispatching` until the retry is in Redis, so the stale-dispatch
+    // sweep covers a crash: no marker → re-queued; marker → left to the retry set.
+    // Stamping `queued` first would strand the row, as the sweep only re-queues
+    // `dispatching` rows. Stamps are monotonic on (attempt_no, rank).
     await scheduleRetryWithMarker(job, delay, attemptMarker(job, 'retry', job.attempt + 1));
     await stamp(job, { status: 'queued', attemptNo: job.attempt + 1, error: res.error });
     return;
@@ -358,11 +344,9 @@ export function validateWorkerConfig(env: NodeJS.ProcessEnv = process.env): void
 }
 
 /**
- * Keep the provider balance gauge fresh. Insufficient balance fails every send
- * permanently and looks exactly like a bad template from the outside, so it
- * needs its own signal rather than being inferred from the error stream. Runs
- * on the worker because the worker is the process that holds provider
- * credentials; the interval is long because balance moves slowly.
+ * Keeps the provider balance gauge fresh. Insufficient balance fails every send
+ * permanently and looks like a bad template, so it needs its own signal. Runs on
+ * the worker, the process that holds provider credentials.
  */
 const BALANCE_POLL_INTERVAL_MS = Number(process.env.BALANCE_POLL_INTERVAL_MS) || 15 * 60 * 1000;
 

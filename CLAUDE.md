@@ -87,7 +87,8 @@ raw and logged without its content, never lost. This includes malformed `queue:r
 entries: a raw entry cannot be classified as redacted, so it is the one way an urgent payload can
 reach the DLQ (only a non-NS writer could produce one).
 
-Every job entry is written through `serializeJob` (`queue.ts`), which turns lone UTF-16 surrogates
+Job entries are written through `serializeJob` (`queue.ts`), except on the fall-through path
+(`pushToPriorityWithMarker` uses `JSON.stringify`). `serializeJob` turns lone UTF-16 surrogates
 (e.g. a truncated emoji in a name) into U+FFFD: `JSON.stringify` escapes one as `\udXXX`, which
 Redis's cjson rejects, so the retry scheduler could not read the priority and dead-lettered the job
 (an OTP included). For members written by older pods, the Lua retries a failed decode on a copy with
@@ -305,11 +306,11 @@ Providers are auto-discovered and registered by `src/lib/providers/index.ts`. To
 must name a key in the provider's `templates` map or `/notify` rejects it with a
 400. When `allowRawTemplateId: true`, an unknown `template_id` is passed through to
 the provider verbatim — treated as a raw provider-side id the caller owns. SMS uses
-this (#532/#535): signalstack sends DLT-approved MSG91 flow ids directly, so only
+this: signalstack sends DLT-approved MSG91 flow ids directly, so only
 the legacy `login_otp` flow is named in its `templates` map. Email keeps the default
 (strict allowlist).
 
-**SMS variables schema.** SMS switched its `schema` to `z.record(z.string(),
+**SMS variables schema.** SMS uses a `schema` of `z.record(z.string(),
 z.string())` — an open map of named string variables (the DLT template's
 placeholders), rather than a fixed `z.object`. This carries the multi-variable
 flow (`name`, `link`, …) through to MSG91 as per-recipient vars.
@@ -342,9 +343,8 @@ its body must come from the caller's optional `body` field on `/notify`.
 **`??`, never `||` — this one is load-bearing.** A *declared but blank* body
 (`bodies: { login_otp: '' }`, the state while a DLT approval is pending) is
 dead-lettered alongside a blank template id, and must never fall through to the
-caller's `body`. With `||` it did, which let any caller put arbitrary text on the
-wire under a DLT-approved template id: a compliance break and a phishing
-primitive in one. Declaring a template is this service claiming its text;
+caller's `body`: that would send the caller's own text under a DLT-approved
+template id, which breaks DLT compliance. Declaring a template is this service claiming its text;
 blank means unconfigured, not "caller may supply it".
 
 The body must be **byte-identical to the DLT-approved text**. The operator
@@ -375,11 +375,11 @@ are permanent; `EC1009`/`EC1010` and unrecognised codes still retry.
   payload>` (the `channel:to:template_id` prefix stays in the clear so the key is
   greppable; the digest carries message identity), **5 second** window. A suppressed
   repeat is nobody's intent — a dropped message — so it answers
-  `409 {"enqueued": false, "reason": "duplicate-fallback"}` (#88).
+  `409 {"enqueued": false, "reason": "duplicate-fallback"}`.
 
-Hashing the whole payload is what makes the fallback message-identifying: it used
-to key on `channel:to:template_id` alone, which for a generic template like
-`basic_email` collapsed to one email per recipient per window regardless of content.
+Hashing the whole payload is what makes the fallback message-identifying: keying on
+`channel:to:template_id` alone would collapse a generic template like `basic_email` to one
+email per recipient per window regardless of content.
 See README for the full request/response contract.
 
 ## Templates and policies
@@ -980,11 +980,8 @@ dead-letters on EC1003. **Alert on staleness, not just on the number.**
 
 Design problems found while writing the tests, filed rather than fixed unless marked resolved:
 
-- **#51 — `popScheduledRetries` is not atomic.** It does `zrangebyscore` then
-  `zremrangebyscore` in two round trips, deleting by *score range* rather than by the members
-  read, despite a comment claiming atomicity. A retry written between the two calls is deleted
-  without being returned (silent job loss, no concurrency required), and two workers can both
-  return the same jobs.
+- **#51 — resolved.** Due retries move in a single Lua script (`moveDueRetries`);
+  `popScheduledRetries` is a single script too and is used only by tests.
 - **#52 — resolved.** The HMAC signature is now verified before the nonce is claimed, so only a correctly signed request can claim one and `Replay detected` always means a valid request seen twice.
 
 ## CI
@@ -1048,6 +1045,30 @@ tab while it sits on a side branch.
    honoured `packageManager: pnpm@10.x`, tried to self-provision it, and failed with
    `Cannot verify the identity of the @pnpm/exe.linux-x64 native binary: it is missing from
    pnpm-lock.yaml` — a build break with no change on our side.
+
+## Code comments
+
+Comments say what the code cannot. Git, PRs, issues and `docs/` hold the rest.
+
+**Keep:**
+
+- The reason for a non-obvious choice, in one sentence.
+- Constraints and invariants: idempotency and dedupe, ordering, transactions, retries, fail-closed behaviour.
+- Security, PII and authorisation rules (for example "Never log this value.").
+- Behaviour of external systems and contracts the code depends on: email and SMS vendors, Redis, Postgres, the event catalogue, the calling DPGs.
+- Known limitations, stated in the present tense. Track the fix in an issue; do not cite the issue number.
+- Public API docs that tell a caller something the signature does not: failure results, side effects, units.
+- Tool directives (`eslint-disable`, `@ts-expect-error`, `NOSONAR` with its rule key and reason, `@deprecated`, coverage ignores).
+
+**Do not write:**
+
+- History: issue or PR numbers, phases, plan or spec section IDs, "previously", "used to", "was renamed".
+- Design essays. Put them in `docs/architecture/` and leave a one-line pointer. Pointers to any `docs/` file are fine.
+- Comments that restate the code, or `@param` / `@returns` lines that only repeat the name and type.
+- Banners, dividers, ALL-CAPS emphasis, "NOTE:", "deliberately".
+- Commented-out code.
+
+**Style:** short, present-tense statements about the current code. A wrong comment is worse than none: when code changes, fix or delete the comments that describe it.
 
 ## Common Patterns
 

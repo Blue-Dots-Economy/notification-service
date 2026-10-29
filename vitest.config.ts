@@ -9,8 +9,7 @@ export default defineConfig({
     env: { REDIS_ALLOW_NO_AUTH: 'true' },
     include: ['src/**/*.test.ts'],
     // Redis is faked (src/lib/__tests__/redis-fake.ts), so nothing here needs a
-    // server or Docker — keep it that way, and add any real-Redis coverage as a
-    // separate `*.integration.test.ts` excluded from this default run.
+    // server or Docker. Real-Redis coverage goes in `*.integration.test.ts`.
     exclude: ['**/node_modules/**', '**/dist/**', '**/*.integration.test.ts'],
   },
 });

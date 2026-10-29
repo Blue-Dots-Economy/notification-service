@@ -3,21 +3,23 @@ import type { Job } from 'src/types';
 
 /**
  * Attempt markers: the worker's own note of a job's fate, written to Redis
- * right after the fate is decided and BEFORE the Postgres stamp.
+ * right after the fate is decided and before the Postgres stamp.
  *
  * A stamp can fail (best-effort) and leave the row `dispatching`; without a
  * marker the stale-dispatch sweep would re-send a message that was already
  * sent. Recovery reads the marker first and records the marked state instead
- * of re-queueing. A double failure (stamp fails AND Redis loses the marker)
- * can still re-send — delivery is at-least-once.
+ * of re-queueing. A double failure (stamp fails and Redis loses the marker)
+ * can still re-send: delivery is at-least-once.
  *
  * `sent`/`failed`/`expired` are written on their own, best-effort (`expired`:
- * the job passed its deadline and was never sent). `retry` is written in
- * the same MULTI as the retry-set ZADD (queue.scheduleRetryWithMarker), so it
- * exists if and only if the retry was scheduled.
+ * the job passed its deadline and was never sent), except a fall-through's
+ * `failed`, which rides in the MULTI that queues the next delivery
+ * (queue.pushToPriorityWithMarker). `retry` is written in the same MULTI as the
+ * retry-set ZADD (queue.scheduleRetryWithMarker), so it exists if and only if
+ * the retry was scheduled.
  *
  * Value is `<fate>:<attemptNo>`, where attemptNo is the attempt number the
- * matching stamp would write (`retry` stamps the NEXT attempt as queued), so a
+ * matching stamp would write (`retry` stamps the next attempt as queued), so a
  * marker left by an earlier attempt never masks a later attempt's crash.
  */
 export type AttemptFate = 'sent' | 'retry' | 'failed' | 'expired';
