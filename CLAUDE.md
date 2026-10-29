@@ -390,7 +390,7 @@ by `needs:`.**
   pushes to `main` and `feature`; those triggers are gone, and `:latest` now follows releases
   rather than the `main` branch.
 - **`create-release.yml`** — the front door for cutting a release. Dispatch it with a tag name
-  and a base branch (`base` defaults to `main`. The `docs_only` input re-publishes an existing tag's notes to the docs PR.); it checks CI, creates the tag and the GitHub release with notes taken from the release PR sections (curated, not PR titles)
+  and a base branch (`base` is only for `v*.*.*`/extra tags. The `docs_only` input re-publishes an existing tag's notes to the docs PR.); it checks CI, creates the tag and the GitHub release with notes taken from the release PR sections (curated, not PR titles)
   in one API call, then dispatches the image build. `dry_run` previews the notes without
   creating anything.
 
@@ -407,9 +407,7 @@ concluded `success`. Three things about it are deliberate and easy to undo by ac
 - Both carry a `skip_ci_check` input for an emergency publish, which logs a warning naming the
   commit so the bypass is visible.
 
-**Sprint tags (`YYYYMM-sN-rcN`) are created from `main` only; `v*.*.*` and per-app tags may come from `develop` or `main`. Never `feature`.** Merges into `feature` run no CI —
-`pull_request` runs record the PR head, not the resulting merge commit — so the gate will
-refuse a tag cut there.
+**Sprint tags come in three kinds, each cut from its own branch: candidate `YYYYMM-sN-rcN` from `develop`, release `YYYYMM-sN` from `main`, hotfix `YYYYMM-sN.M` from `release/YYYYMM-sN`. Never `feature`.** Cutting the release tag also creates `release/<sprint>`; hotfixes are PRs into that branch, and `sync-release-branch.yml` opens carry-back PRs into `develop` and `feature` (merge commit, not squash). `base` is only for `v*.*.*` and extra tags (default `main`; `develop` or `main`), sprint tags ignore it. Merges into `feature` run no CI — `pull_request` runs record the PR head, not the resulting merge commit — so the gate will refuse a tag cut there.
 
 **Two GitHub behaviours the release path depends on**, both of which look like bugs when you
 hit them: a tag pushed with `GITHUB_TOKEN` does **not** trigger `on: push: tags` (GitHub
