@@ -10,9 +10,10 @@ name: CI
 # commit, so the second post-merge run was a duplicate.
 on:
   push:
-    branches: [main, develop]
+    # release/**: hotfix tags are CI-gated on the release branch commit, and hotfix PRs target it.
+    branches: [main, develop, 'release/**']
   pull_request:
-    branches: [main, develop, feature]
+    branches: [main, develop, feature, 'release/**']
   workflow_dispatch:
 
 concurrency:
