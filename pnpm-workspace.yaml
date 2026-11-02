@@ -18,10 +18,7 @@ overrides:
   diff@>=4.0.0 <4.0.4: '>=4.0.4'
   fast-uri@<=3.1.0: '>=3.1.1'
   fast-uri@<=3.1.1: '>=3.1.2'
-  # 3.1.5 and 4.1.2 carry four HIGH advisories — CVE-2026-75899, CVE-2026-75931,
-  # CVE-2026-75975, CVE-2026-76172 (SSRF via repeated hostname percent-decoding
-  # and malformed IPv6 normalization; host confusion via skipped IDN
-  # canonicalization). Fixed in 2.4.5 / 3.1.6 / 4.1.3.
+  # 3.1.5 and 4.1.2 carry high-severity security advisories. Fixed in 2.4.5 / 3.1.6 / 4.1.3.
   #
   # Only the 4.x floor is added. The two open-ended entries above already lift
   # this tree's 3.x consumer across the major into 4.x — `'>=3.1.1'` is not
@@ -32,14 +29,11 @@ overrides:
   # signals-dpg and aggregator-dpg DO floor both lines, because both majors are
   # genuinely present there.
   #
-  # Raised 4.1.4 -> 4.1.5: 4.1.4 itself carries CVE-2026-86472 and CVE-2026-86818
-  # (host-case normalization bypass, and mailto header injection via
-  # percent-encoded field-name desynchronization). Both fixed in 4.1.5. The
+  # Raised 4.1.4 -> 4.1.5: 4.1.4 itself carries security advisories, fixed in 4.1.5. The
   # selector is widened to <4.1.5 so it catches the 4.1.4 the previous pin
   # produced, not just the versions below it.
   #
-  # Raised again, 4.1.5 -> 4.2.3: CVE-2026-110180/110306/110095/110725
-  # (host/XSS/path-traversal bypasses).
+  # Raised again, 4.1.5 -> 4.2.3, to pick up further security fixes.
   fast-uri@>=4.0.0 <4.2.3: 4.2.3
   fast-xml-parser@<5.7.0: '>=5.7.0'
   fast-xml-parser@>=5.0.0 <5.3.5: '>=5.3.5'
