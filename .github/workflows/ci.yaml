@@ -124,7 +124,7 @@ jobs:
       # from fork and Dependabot-raised pull_request runs, which is why the steps
       # are gated on the token rather than failing: an ungated build would turn
       # every dependency-bump PR red for a missing credential, not a real defect.
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         if: env.DOCKERHUB_TOKEN != ''
         with:
           registry: dhi.io
