@@ -386,7 +386,7 @@ Three workflows (plus `security.yml`). The split is load-bearing: **`ci.yaml` ch
 `notification-image-build.yaml` publishes, and the two are connected by a gate rather than
 by `needs:`.**
 
-- **`ci.yaml`** — `pull_request` on `main`/`develop`/`feature` and `push` on `main`/`develop`.
+- **`ci.yaml`** — `pull_request` on `main`/`develop`/`feature`/`release/**` and `push` on `main`/`develop`/`release/**` (hotfix tags are CI-gated on the release branch commit). Dependency caching is off (`package-manager-cache: false`).
   The `ci` job does a frozen install, `pnpm build` (which is `tsc`, so it is the type-check
   too), then `pnpm test` plus the integration suite against a real Redis service container.
   Added in #46; before that this repo had **no CI at all**, which is how a tsconfig
