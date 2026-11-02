@@ -10,9 +10,10 @@ name: CI
 # commit, so the second post-merge run was a duplicate.
 on:
   push:
-    branches: [main, develop]
+    # release/**: hotfix tags are CI-gated on the release branch commit, and hotfix PRs target it.
+    branches: [main, develop, 'release/**']
   pull_request:
-    branches: [main, develop, feature]
+    branches: [main, develop, feature, 'release/**']
   workflow_dispatch:
 
 concurrency:
@@ -60,10 +61,10 @@ jobs:
       # what makes runtime-specific failures visible — a CommonJS `require()` of an
       # ESM-only package (TS1479, which is how the `uuid` bug surfaced) behaves
       # differently across Node majors, since 22.12+ can require ESM and 20 cannot.
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
-          cache: pnpm
+          package-manager-cache: false
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
