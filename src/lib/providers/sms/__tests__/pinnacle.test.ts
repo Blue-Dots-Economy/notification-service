@@ -1,3 +1,6 @@
+import { mkdtempSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // `../../metrics` opens a Redis connection on import, which would keep the test
@@ -576,7 +579,7 @@ describe('sign-in / sign-up OTP templates', () => {
   });
 });
 
-describe('event templates in PINNACLE_TEMPLATES', () => {
+describe('event templates in PINNACLE_TEMPLATES_FILE', () => {
   const CREATED = 'Your profile on Purple Dots has been created successfully. View it: {{url}} - Team ALIMCO';
   const RETIRED = 'Your profile on Purple Dots has been deleted successfully. - Team ALIMCO';
   const SEEKERS = 'seekers-purpledots.depwd.gov.in';
@@ -596,7 +599,14 @@ describe('event templates in PINNACLE_TEMPLATES', () => {
     { name: 'url', type: 'url', urlHosts: [SEEKERS] },
   ]);
   const retired = eventRow('profile_retired_sms', '1777179178309864660', RETIRED, []);
-  const list = (...rows: unknown[]) => ({ PINNACLE_TEMPLATES: JSON.stringify(rows) }) as unknown as NodeJS.ProcessEnv;
+  const dir = mkdtempSync(join(tmpdir(), 'pinnacle-templates-'));
+  let fileCount = 0;
+  const fileWith = (text: string) => {
+    const path = join(dir, `templates-${fileCount++}.json`);
+    writeFileSync(path, text);
+    return { PINNACLE_TEMPLATES_FILE: path } as unknown as NodeJS.ProcessEnv;
+  };
+  const list = (...rows: unknown[]) => fileWith(JSON.stringify(rows));
   const onPinnacle = (env: NodeJS.ProcessEnv) => ({ ...env, SMS_PROVIDER: 'pinnacle' }) as unknown as NodeJS.ProcessEnv;
 
   it('declares every listed row under its own template_key', () => {
@@ -632,11 +642,15 @@ describe('event templates in PINNACLE_TEMPLATES', () => {
 
   it('fails startup on an unusable list, an invalid row or a duplicate key when Pinnacle is the provider', () => {
     const cases: Array<[NodeJS.ProcessEnv, RegExp]> = [
-      [{ PINNACLE_TEMPLATES: 'not json' } as unknown as NodeJS.ProcessEnv, /PINNACLE_TEMPLATES is invalid \(not valid JSON\)/],
-      [{ PINNACLE_TEMPLATES: JSON.stringify(created) } as unknown as NodeJS.ProcessEnv, /not a JSON array/],
-      [list(created, { ...retired, provider_template_id: '' }), /PINNACLE_TEMPLATES\[1\] is invalid/],
-      [list(created, { ...retired, template_key: undefined }), /PINNACLE_TEMPLATES\[1\] is invalid/],
-      [list(created, created), /PINNACLE_TEMPLATES\[1\] is invalid \(duplicate template_key 'profile_created_sms'\)/],
+      [fileWith('not json'), /PINNACLE_TEMPLATES_FILE is invalid \(not valid JSON\)/],
+      [fileWith(JSON.stringify(created)), /not a JSON array/],
+      [
+        { PINNACLE_TEMPLATES_FILE: join(dir, 'missing.json') } as unknown as NodeJS.ProcessEnv,
+        /PINNACLE_TEMPLATES_FILE is invalid \(file cannot be read\)/,
+      ],
+      [list(created, { ...retired, provider_template_id: '' }), /PINNACLE_TEMPLATES_FILE\[1\] is invalid/],
+      [list(created, { ...retired, template_key: undefined }), /PINNACLE_TEMPLATES_FILE\[1\] is invalid/],
+      [list(created, created), /PINNACLE_TEMPLATES_FILE\[1\] is invalid \(duplicate template_key 'profile_created_sms'\)/],
       [
         {
           ...list(eventRow('signals_signin_otp', '1', 'code {{message}}', [{ name: 'message' }])),
@@ -651,7 +665,7 @@ describe('event templates in PINNACLE_TEMPLATES', () => {
   });
 
   it('skips only the bad rows when another vendor is the SMS provider', () => {
-    expect(loadOtpTemplates({ PINNACLE_TEMPLATES: 'not json' } as unknown as NodeJS.ProcessEnv).templates).toEqual({});
+    expect(loadOtpTemplates(fileWith('not json')).templates).toEqual({});
     expect(Object.keys(loadOtpTemplates(list(created, { ...retired, body_text: '' })).templates)).toEqual([
       'profile_created_sms',
     ]);
