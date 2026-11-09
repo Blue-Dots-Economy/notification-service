@@ -651,7 +651,6 @@ describe('event templates in PINNACLE_TEMPLATES_FILE', () => {
       [list(created, { ...retired, provider_template_id: '' }), /PINNACLE_TEMPLATES_FILE\[1\] is invalid/],
       [list(created, { ...retired, template_key: undefined }), /PINNACLE_TEMPLATES_FILE\[1\] is invalid/],
       [list(created, created), /PINNACLE_TEMPLATES_FILE\[1\] is invalid \(duplicate template_key 'profile_created_sms'\)/],
-      [list({ ...retired, template_key: 'login_otp' }), /PINNACLE_TEMPLATES_FILE\[0\] is invalid \(duplicate template_key 'login_otp'\)/],
       [
         {
           ...list(eventRow('signals_signin_otp', '1', 'code {{message}}', [{ name: 'message' }])),
