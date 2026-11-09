@@ -38,6 +38,9 @@ const OTP_TEMPLATE_ENV_VARS: Record<string, string> = {
 /** Event templates (#191): path to a JSON file holding an array of rows in the same shape, each keyed by its own template_key. */
 const TEMPLATE_FILE_ENV_VAR = 'PINNACLE_TEMPLATES_FILE';
 
+/** The legacy OTP template, set from its own env vars below; a row may not take its key. */
+const LEGACY_OTP_KEY = 'login_otp';
+
 const VariableSpecSchema = z.looseObject({
   name: z.string().min(1),
   required: z.boolean().optional(),
@@ -138,7 +141,7 @@ export function loadOtpTemplates(env = process.env): {
       refuse(setting, `${row.error}; template ${key || '(no key)'} not configured`);
       continue;
     }
-    if (Object.prototype.hasOwnProperty.call(templates, key)) {
+    if (key === LEGACY_OTP_KEY || Object.prototype.hasOwnProperty.call(templates, key)) {
       refuse(setting, `duplicate template_key '${key}'`);
       continue;
     }
@@ -447,11 +450,11 @@ export const pinnacleSmsProvider: ProviderDefinition = {
   // Only the templates this service NAMES need a mapping, and they need a body
   // to go with it, since Pinnacle renders nothing.
   templates: {
-    login_otp: process.env.PINNACLE_LOGIN_OTP_TEMPLATE_ID ?? '',
+    [LEGACY_OTP_KEY]: process.env.PINNACLE_LOGIN_OTP_TEMPLATE_ID ?? '',
     ...otpTemplates.templates,
   },
   bodies: {
-    login_otp: process.env.SMS_LOGIN_OTP_BODY ?? '',
+    [LEGACY_OTP_KEY]: process.env.SMS_LOGIN_OTP_BODY ?? '',
     ...otpTemplates.bodies,
   },
   allowRawTemplateId: true,
