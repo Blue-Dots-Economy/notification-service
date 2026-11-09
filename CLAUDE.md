@@ -253,7 +253,7 @@ Required for providers (varies by implementation):
   links). `PINNACLE_TEMPLATES_FILE` points at a JSON file declaring the event
   templates (#191) the same way: an array of rows, each named by its own
   `template_key`, which must be unique across the file and the OTP rows (format:
-  `docs/pinnacle-templates.example.json`). The four OTP env vars are unchanged.
+  `config/pinnacle-templates.example.json`). The four OTP env vars are unchanged.
   `PINNACLE_TIMEOUT_MS` (default 10000) bounds each Pinnacle call.
 - `SMS_LOGIN_OTP_TEMPLATE_ID` — MSG91 flow id for the legacy `login_otp` template.
   Read in `src/lib/providers/sms/msg91.ts`; optional, with a back-compat default of
