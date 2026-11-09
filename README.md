@@ -642,8 +642,10 @@ Operational notes:
   enqueue until delivery — and stays there in the retry ZSET or DLQ if delivery
   keeps failing. Size Redis accordingly if attachment traffic is expected to be
   heavy.
-- `MAIL_LOG=true` logs attachment filenames, content types and encoded sizes,
-  never the content itself.
+- `MAIL_LOG=true` logs the recipient masked (`a***@example.org`), whether the
+  message carries an activation link (never the link or OTP itself), and
+  attachment filenames, content types and encoded sizes, never the content
+  itself. It is safe to leave on in a deployed environment.
 - Transport ceilings still apply on top of these limits: SES caps a message at
   10 MB **after** base64 inflation, so ~7 MB of original file is the practical
   maximum regardless of configuration.
