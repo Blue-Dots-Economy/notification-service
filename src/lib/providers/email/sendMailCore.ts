@@ -44,6 +44,43 @@ const {
 
 const isTrue = (v?: string) => String(v).toLowerCase() === 'true';
 
+/**
+ * `a***@domain`, or `***` when the input is not an address. Log lines carry
+ * recipients only in this form: `MAIL_LOG` is set in deployed environments.
+ */
+export function maskEmail(address: string): string {
+  const at = address.lastIndexOf('@');
+  if (at < 1 || at === address.length - 1) return '***';
+  return `${address[0]}***${address.slice(at)}`;
+}
+
+const EMAIL_IN_TEXT = /[^\s<>"'(),;:]+@[^\s<>"'(),;:]+/g;
+const URL_IN_TEXT = /\b[a-z][a-z0-9+.-]*:\/\/\S+/gi;
+// Four or more digits: long enough to be an OTP, short SMTP codes (550, 5.7.1) survive.
+const CODE_IN_TEXT = /\d{4,}/g;
+
+/**
+ * The loggable part of a failed send. The whole error object is never logged:
+ * nodemailer and SES errors carry the SMTP response, the rejected recipients
+ * and the raw request, which can echo the message (activation links, OTPs).
+ * The message is kept with URLs, addresses and digit runs scrubbed.
+ */
+function describeSendError(err: unknown): Record<string, unknown> {
+  if (!(err instanceof Error)) return { error: typeof err };
+  const e = err as Error & { code?: unknown; responseCode?: unknown; $metadata?: { httpStatusCode?: unknown } };
+  return {
+    name: e.name,
+    ...(e.code !== undefined ? { code: e.code } : {}),
+    ...(e.responseCode !== undefined ? { responseCode: e.responseCode } : {}),
+    ...(e.$metadata?.httpStatusCode !== undefined ? { httpStatus: e.$metadata.httpStatusCode } : {}),
+    // The SMTP reply is part of the message, and a content filter may quote the email back.
+    message: e.message
+      .replace(URL_IN_TEXT, '[url]')
+      .replace(EMAIL_IN_TEXT, maskEmail)
+      .replace(CODE_IN_TEXT, '[digits]'),
+  };
+}
+
 /** Special-cased only for the From address below; otherwise Gmail is just a relay. */
 const GMAIL_HOST = 'smtp.gmail.com';
 
@@ -135,8 +172,8 @@ export async function sendMail({
   attachments,
 }: Email_request): Promise<{ ok: boolean }> {
   if (MAIL_LOG === 'true') {
-    console.log('📧 Sending mail to:', to);
-    if (activationUrl) console.log('🔗 Activation URL/OTP:', activationUrl);
+    // Never log the activation link or OTP itself, only whether there is one.
+    console.log('📧 Sending mail to:', maskEmail(to), `(activation link: ${activationUrl ? 'present' : 'none'})`);
     // Names and sizes only, never the base64 content.
     if (attachments?.length) {
       console.log(
@@ -184,7 +221,7 @@ export async function sendMail({
 
     return { ok: true };
   } catch (err) {
-    console.error('❌ Email sending error:', err);
+    console.error('❌ Email sending error:', describeSendError(err));
     return { ok: false };
   }
 }

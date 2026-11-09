@@ -87,8 +87,7 @@ raw and logged without its content, never lost. This includes malformed `queue:r
 entries: a raw entry cannot be classified as redacted, so it is the one way an urgent payload can
 reach the DLQ (only a non-NS writer could produce one).
 
-Job entries are written through `serializeJob` (`queue.ts`), except on the fall-through path
-(`pushToPriorityWithMarker` uses `JSON.stringify`). `serializeJob` turns lone UTF-16 surrogates
+Every job entry is written through `serializeJob` (`queue.ts`). `serializeJob` turns lone UTF-16 surrogates
 (e.g. a truncated emoji in a name) into U+FFFD: `JSON.stringify` escapes one as `\udXXX`, which
 Redis's cjson rejects, so the retry scheduler could not read the priority and dead-lettered the job
 (an OTP included). For members written by older pods, the Lua retries a failed decode on a copy with
@@ -795,6 +794,10 @@ Required for providers (varies by implementation):
   and seeds nothing when it is unset. Per-event DLT flow ids are sent raw and need no env
   (see `allowRawTemplateId`). Note: `MSG91_TEMPLATE_ID` in `example.env` is unused —
   the code never reads it; use `SMS_LOGIN_OTP_TEMPLATE_ID` instead.
+- `MAIL_LOG` — `true` adds per-send email log lines. They never carry the activation link or
+  OTP, and the recipient is masked (`maskEmail` in `sendMailCore.ts`). A failed send is logged
+  through `describeSendError` (name, code, SMTP/HTTP status, scrubbed message), never as the
+  whole error object, which holds the SMTP reply and the raw request.
 - Twilio credentials for WhatsApp
 - etc.
 
@@ -824,7 +827,7 @@ was fixed (#46).
 
 ## Testing Notes
 
-vitest 4, 801 unit tests across 57 files, plus 159 integration tests across 17 files. The unit suite runs in about a second because Redis
+vitest 4, 808 unit tests across 58 files, plus 160 integration tests across 17 files. The unit suite runs in about a second because Redis
 is a **fake** and Postgres is mocked, not containers.
 
 **Provider tests must mock `src/lib/metrics.ts`.** It imports `./redis`, which opens a real
