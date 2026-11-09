@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import redis from '../redis';
-import { deferJob, moveDueRetries, popFrom, pushToPriority, QUEUE_KEYS } from '../queue';
+import { deferJob, moveDueRetries, popFrom, pushToPriority, pushToPriorityWithMarker, QUEUE_KEYS } from '../queue';
 import type { Job } from 'src/types';
 
 const job = (id: string, priority: Job['priority']): Job => ({
@@ -110,6 +110,13 @@ describe('lone UTF-16 surrogates (cjson rejects \\udXXX escapes)', () => {
     expect(await redis.llen('queue:dlq')).toBe(0);
     const [raw] = await redis.lrange(QUEUE_KEYS.realtime, 0, -1);
     expect(JSON.parse(raw!).variables.name).toBe('Asha �');
+  });
+
+  it('a fall-through job with a lone surrogate is written as JSON cjson can decode', async () => {
+    await pushToPriorityWithMarker({ ...job('ft', 'realtime'), variables: { name: 'Asha \ud83d' } });
+    const [raw] = await redis.lrange(QUEUE_KEYS.realtime, 0, -1);
+    expect(raw).not.toMatch(/\\ud83d/i);
+    expect(await redis.eval('return cjson.decode(ARGV[1]).priority', 0, raw!)).toBe('realtime');
   });
 
   it.each(['realtime', 'other', 'bulk'] as const)(

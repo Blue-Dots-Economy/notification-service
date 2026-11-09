@@ -59,8 +59,8 @@ function wellFormed(value: unknown): unknown {
  * Serializes a job for a Redis queue/retry/DLQ entry. Lone UTF-16 surrogates in
  * keys and values (e.g. a truncated emoji) become U+FFFD first: JSON.stringify
  * emits them as `\udXXX` escapes, which Redis's cjson rejects, so
- * MOVE_DUE_RETRIES could not read the job's priority. pushToPriorityWithMarker
- * does not use it yet; every other writer that serialises a Job does.
+ * MOVE_DUE_RETRIES could not read the job's priority. Every writer that
+ * serialises a Job goes through it.
  */
 export function serializeJob(job: Job): string {
   return JSON.stringify(wellFormed(job));
@@ -79,7 +79,7 @@ export async function pushToPriorityWithMarker(
   job: Job,
   marker?: { key: string; value: string; ttlSeconds: number },
 ): Promise<void> {
-  const tx = redis.multi().lpush(queueKeyFor(job.priority), JSON.stringify(job));
+  const tx = redis.multi().lpush(queueKeyFor(job.priority), serializeJob(job));
   if (marker) tx.set(marker.key, marker.value, 'EX', marker.ttlSeconds);
   const results = await tx.exec();
   if (!results) throw new Error('Redis MULTI aborted while queueing a job');

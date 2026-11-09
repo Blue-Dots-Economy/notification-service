@@ -451,12 +451,13 @@ describe('serializeJob (well-formed payloads)', () => {
     await queue.scheduleRetryWithMarker({ ...j, job_id: 'job-2' }, 0);
     await queue.pushManyToPriority([j]);
     await queue.pushDLQ(j);
+    await queue.pushToPriorityWithMarker({ ...j, job_id: 'job-4' });
     const all = [
       ...(redis.lists.get('queue:other') ?? []),
       ...(redis.lists.get('queue:dlq') ?? []),
       ...(redis.zsets.get('queue:retry') ?? []).map((e) => e.member),
     ];
-    expect(all).toHaveLength(6);
+    expect(all).toHaveLength(7);
     for (const raw of all) expect(raw).not.toMatch(/\\ud83d/i);
   });
 });
