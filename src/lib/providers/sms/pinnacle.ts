@@ -1,3 +1,4 @@
+import { readFileSync } from 'fs';
 import { z } from 'zod';
 import { ProviderDefinition, ProviderSendResult } from '../../../types/provider';
 import * as metrics from '../../metrics';
@@ -33,6 +34,9 @@ const OTP_TEMPLATE_ENV_VARS: Record<string, string> = {
   aggregator_signin_otp: 'PINNACLE_TEMPLATE_AGGREGATOR_SIGNIN_OTP',
   aggregator_signup_otp: 'PINNACLE_TEMPLATE_AGGREGATOR_SIGNUP_OTP',
 };
+
+/** Event templates (#191): path to a JSON file holding an array of rows in the same shape, each keyed by its own template_key. */
+const TEMPLATE_FILE_ENV_VAR = 'PINNACLE_TEMPLATES_FILE';
 
 const VariableSpecSchema = z.looseObject({
   name: z.string().min(1),
@@ -87,6 +91,30 @@ export function parseOtpTemplateRow(raw: string, expectedKey: string): OtpTempla
  */
 type UrlHosts = Record<string, Record<string, string[]>>;
 
+type RowSource = { setting: string; key: string; raw: string };
+
+/** The set OTP rows, then each row of the PINNACLE_TEMPLATES_FILE file; `listError` when the file itself is unusable. */
+function templateRowSources(env: NodeJS.ProcessEnv): { sources: RowSource[]; listError?: string } {
+  const sources: RowSource[] = Object.entries(OTP_TEMPLATE_ENV_VARS)
+    .filter(([, setting]) => env[setting])
+    .map(([key, setting]) => ({ setting, key, raw: env[setting]! }));
+  const path = env[TEMPLATE_FILE_ENV_VAR]?.trim();
+  if (!path) return { sources };
+  let list: unknown;
+  try {
+    list = JSON.parse(readFileSync(path, 'utf-8'));
+  } catch (err) {
+    const notJson = err instanceof SyntaxError;
+    return { sources, listError: notJson ? 'not valid JSON' : 'file cannot be read' };
+  }
+  if (!Array.isArray(list)) return { sources, listError: 'not a JSON array' };
+  list.forEach((item, i) => {
+    const key = typeof item?.template_key === 'string' ? item.template_key : '';
+    sources.push({ setting: `${TEMPLATE_FILE_ENV_VAR}[${i}]`, key, raw: JSON.stringify(item) });
+  });
+  return { sources };
+}
+
 export function loadOtpTemplates(env = process.env): {
   templates: Record<string, string>;
   bodies: Record<string, string>;
@@ -95,16 +123,23 @@ export function loadOtpTemplates(env = process.env): {
   const templates: Record<string, string> = {};
   const bodies: Record<string, string> = {};
   const urlHosts: UrlHosts = {};
-  for (const [key, setting] of Object.entries(OTP_TEMPLATE_ENV_VARS)) {
-    const raw = env[setting];
-    if (!raw) continue;
+  // A broken row would otherwise fall through to raw pass-through and fail
+  // only at send time, so refuse to start while Pinnacle is the vendor.
+  // Same normalisation as selectSmsProvider, so " Pinnacle " counts too.
+  const refuse = (setting: string, reason: string) => {
+    if ((env.SMS_PROVIDER ?? '').trim().toLowerCase() === 'pinnacle') throw new Error(`pinnacle: ${setting} is invalid (${reason})`);
+    console.log(`pinnacle: ${setting} skipped (${reason})`);
+  };
+  const { sources, listError } = templateRowSources(env);
+  if (listError) refuse(TEMPLATE_FILE_ENV_VAR, listError);
+  for (const { setting, key, raw } of sources) {
     const row = parseOtpTemplateRow(raw, key);
     if ('error' in row) {
-      // A broken row would otherwise fall through to raw pass-through and fail
-      // only at send time, so refuse to start while Pinnacle is the vendor.
-      // Same normalisation as selectSmsProvider, so " Pinnacle " counts too.
-      if ((env.SMS_PROVIDER ?? '').trim().toLowerCase() === 'pinnacle') throw new Error(`pinnacle: ${setting} is invalid (${row.error})`);
-      console.log(`pinnacle: ${setting} skipped (${row.error}); template ${key} not configured`);
+      refuse(setting, `${row.error}; template ${key || '(no key)'} not configured`);
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(templates, key)) {
+      refuse(setting, `duplicate template_key '${key}'`);
       continue;
     }
     templates[key] = row.provider_template_id;

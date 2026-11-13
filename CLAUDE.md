@@ -250,7 +250,11 @@ Required for providers (varies by implementation):
   when `SMS_PROVIDER=pinnacle`, rather than falling through to raw pass-through.
   A `type: "url"` variable with `urlHosts` is checked before sending; a link on
   any other host fails the send permanently (the operator drops non-whitelisted
-  links). `PINNACLE_TIMEOUT_MS` (default 10000) bounds each Pinnacle call.
+  links). `PINNACLE_TEMPLATES_FILE` points at a JSON file declaring the event
+  templates (#191) the same way: an array of rows, each named by its own
+  `template_key`, which must be unique across the file and the OTP rows (format:
+  `config/pinnacle-templates.example.json`). The four OTP env vars are unchanged.
+  `PINNACLE_TIMEOUT_MS` (default 10000) bounds each Pinnacle call.
 - `SMS_LOGIN_OTP_TEMPLATE_ID` — MSG91 flow id for the legacy `login_otp` template.
   Read in `src/lib/providers/sms/msg91.ts`; optional, with a back-compat default of
   the previously-hardcoded id. Per-event DLT flow ids are sent raw and need no env
