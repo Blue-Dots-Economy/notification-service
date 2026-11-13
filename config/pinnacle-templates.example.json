@@ -1,0 +1,22 @@
+[
+  {
+    "template_key": "profile_created_sms",
+    "network": "purple_dot",
+    "channel": "sms",
+    "locale": "en",
+    "provider": "pinnacle",
+    "provider_template_id": "1000000000000000001",
+    "body_text": "Your profile on Example Dots has been created. View it: {{url}} - Team Example",
+    "variables": [{ "name": "url", "type": "url", "urlHosts": ["seekers.example.org"] }]
+  },
+  {
+    "template_key": "support_complaint_confirmation_sms",
+    "network": "purple_dot",
+    "channel": "sms",
+    "locale": "en",
+    "provider": "pinnacle",
+    "provider_template_id": "1000000000000000002",
+    "body_text": "Example Dots: We have received your {{type}} (Ref: {{reference}}). Our team will get back to you soon. - Team Example",
+    "variables": [{ "name": "type" }, { "name": "reference" }]
+  }
+]
