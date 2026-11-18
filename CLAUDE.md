@@ -260,6 +260,11 @@ Required for providers (varies by implementation):
   the previously-hardcoded id. Per-event DLT flow ids are sent raw and need no env
   (see `allowRawTemplateId`). Note: `MSG91_TEMPLATE_ID` in `example.env` is unused —
   the code never reads it; use `SMS_LOGIN_OTP_TEMPLATE_ID` instead.
+- `MSG91_TEMPLATE_{SIGNALS,AGGREGATOR}_{SIGNIN,SIGNUP}_OTP` — optional MSG91 flow ids
+  for the sign-in and sign-up OTP keys Keycloak sends when `SMS_HTTP_CLIENT_APPS` is
+  set. Unset keys are not named, so the deployment behaves as before. Keycloak sends
+  `{message, url}`, so the MSG91 template must use `##message##` and `##url##`. Set
+  these before turning on Keycloak routing: an unset key is passed raw and MSG91 rejects it.
 - Twilio credentials for WhatsApp
 - etc.
 
