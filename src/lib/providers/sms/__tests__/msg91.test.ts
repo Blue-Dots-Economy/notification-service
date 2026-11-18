@@ -8,7 +8,7 @@ vi.mock('../../../metrics', () => ({
   renderPrometheus: vi.fn(async () => ''),
 }));
 
-import { sendSmsWithMsg91, smsProvider } from '../msg91';
+import { otpTemplateIdsFromEnv, sendSmsWithMsg91, smsProvider } from '../msg91';
 
 function mockFetchOk() {
   const fetchMock = vi
@@ -109,5 +109,34 @@ describe('msg91 SMS provider', () => {
     expect(smsProvider.allowRawTemplateId).toBe(true);
     expect(smsProvider.schema.safeParse({ name: 'Asha', link: 'https://x' }).success).toBe(true);
     expect(smsProvider.schema.safeParse({ message: '123' }).success).toBe(true);
+  });
+});
+
+describe('msg91 sign-in and sign-up OTP templates', () => {
+  it('names no OTP key when none of the env vars is set', () => {
+    expect(otpTemplateIdsFromEnv({})).toEqual({});
+  });
+
+  it('maps only the keys whose env var is set, trimmed', () => {
+    expect(
+      otpTemplateIdsFromEnv({
+        MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP: ' flow-signin ',
+        MSG91_TEMPLATE_SIGNALS_SIGNUP_OTP: 'flow-signup',
+        MSG91_TEMPLATE_AGGREGATOR_SIGNIN_OTP: '  ',
+      })
+    ).toEqual({ signals_signin_otp: 'flow-signin', signals_signup_otp: 'flow-signup' });
+  });
+
+  it('sends the Keycloak {message, url} payload as named variables', async () => {
+    process.env.MSG91_AUTH_KEY = 'k';
+    const fetchMock = mockFetchOk();
+    await sendSmsWithMsg91('+919000000005', 'flow-signin', {
+      message: '123456',
+      url: 'https://app.example.in',
+    });
+    expect(bodyOf(fetchMock).recipients).toEqual([
+      { mobiles: '919000000005', message: '123456', url: 'https://app.example.in' },
+    ]);
+    vi.unstubAllGlobals();
   });
 });

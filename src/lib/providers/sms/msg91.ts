@@ -3,6 +3,24 @@ import { ProviderDefinition, ProviderSendResult } from '../../../types/provider'
 import * as metrics from '../../metrics';
 import { isRetryableHttpStatus } from './http_status';
 
+// Sign-in and sign-up OTP keys Keycloak sends (SMS_HTTP_CLIENT_APPS), each mapped to an MSG91 flow id.
+const OTP_TEMPLATE_ENV_VARS: Record<string, string> = {
+  signals_signin_otp: 'MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP',
+  signals_signup_otp: 'MSG91_TEMPLATE_SIGNALS_SIGNUP_OTP',
+  aggregator_signin_otp: 'MSG91_TEMPLATE_AGGREGATOR_SIGNIN_OTP',
+  aggregator_signup_otp: 'MSG91_TEMPLATE_AGGREGATOR_SIGNUP_OTP',
+};
+
+/** Names only the OTP keys whose env var is set, so a deployment without them is unchanged. */
+export function otpTemplateIdsFromEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  const templates: Record<string, string> = {};
+  for (const [key, envVar] of Object.entries(OTP_TEMPLATE_ENV_VARS)) {
+    const flowId = env[envVar]?.trim();
+    if (flowId) templates[key] = flowId;
+  }
+  return templates;
+}
+
 export async function sendSmsWithMsg91(
   to: string,
   template_id: string,
@@ -86,13 +104,14 @@ export async function sendSmsWithMsg91(
 export const smsProvider: ProviderDefinition = {
   name: 'sms',
 
-  // Only the legacy single-var OTP is named here; per-event DLT flow ids are
+  // Only the OTP templates are named here; per-event DLT flow ids are
   // sent raw by signalstack (allowRawTemplateId), so they need no entry. The
   // OTP flow id is deployment-specific (per MSG91 account) — read from env,
   // never hardcoded. The literal is a backward-compat default so existing
   // deploys don't break; set SMS_LOGIN_OTP_TEMPLATE_ID to override.
   templates: {
     login_otp: process.env.SMS_LOGIN_OTP_TEMPLATE_ID ?? '6896c26d6eb66c66340e1242',
+    ...otpTemplateIdsFromEnv(),
   },
   allowRawTemplateId: true,
 
