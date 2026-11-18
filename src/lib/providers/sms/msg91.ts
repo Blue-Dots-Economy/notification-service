@@ -12,7 +12,7 @@ const OTP_TEMPLATE_ENV_VARS: Record<string, string> = {
 };
 
 /** Names only the OTP keys whose env var is set, so a deployment without them is unchanged. */
-export function msg91OtpTemplates(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+export function otpTemplateIdsFromEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const templates: Record<string, string> = {};
   for (const [key, envVar] of Object.entries(OTP_TEMPLATE_ENV_VARS)) {
     const flowId = env[envVar]?.trim();
@@ -111,7 +111,7 @@ export const smsProvider: ProviderDefinition = {
   // deploys don't break; set SMS_LOGIN_OTP_TEMPLATE_ID to override.
   templates: {
     login_otp: process.env.SMS_LOGIN_OTP_TEMPLATE_ID ?? '6896c26d6eb66c66340e1242',
-    ...msg91OtpTemplates(),
+    ...otpTemplateIdsFromEnv(),
   },
   allowRawTemplateId: true,
 

@@ -8,7 +8,7 @@ vi.mock('../../../metrics', () => ({
   renderPrometheus: vi.fn(async () => ''),
 }));
 
-import { msg91OtpTemplates, sendSmsWithMsg91, smsProvider } from '../msg91';
+import { otpTemplateIdsFromEnv, sendSmsWithMsg91, smsProvider } from '../msg91';
 
 function mockFetchOk() {
   const fetchMock = vi
@@ -114,12 +114,12 @@ describe('msg91 SMS provider', () => {
 
 describe('msg91 sign-in and sign-up OTP templates', () => {
   it('names no OTP key when none of the env vars is set', () => {
-    expect(msg91OtpTemplates({})).toEqual({});
+    expect(otpTemplateIdsFromEnv({})).toEqual({});
   });
 
   it('maps only the keys whose env var is set, trimmed', () => {
     expect(
-      msg91OtpTemplates({
+      otpTemplateIdsFromEnv({
         MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP: ' flow-signin ',
         MSG91_TEMPLATE_SIGNALS_SIGNUP_OTP: 'flow-signup',
         MSG91_TEMPLATE_AGGREGATOR_SIGNIN_OTP: '  ',
