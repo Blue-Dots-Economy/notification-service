@@ -8,7 +8,7 @@ vi.mock('../../../metrics', () => ({
   renderPrometheus: vi.fn(async () => ''),
 }));
 
-import { sendSmsWithMsg91, smsProvider } from '../msg91';
+import { loadMsg91Templates, sendSmsWithMsg91, smsProvider } from '../msg91';
 
 function mockFetchOk() {
   const fetchMock = vi
@@ -109,5 +109,66 @@ describe('msg91 SMS provider', () => {
     expect(smsProvider.allowRawTemplateId).toBe(true);
     expect(smsProvider.schema.safeParse({ name: 'Asha', link: 'https://x' }).success).toBe(true);
     expect(smsProvider.schema.safeParse({ message: '123' }).success).toBe(true);
+  });
+
+  it('refuses the send with a non-retryable error when template_id is empty or missing', async () => {
+    const fetchMock = mockFetchOk();
+    const res = await sendSmsWithMsg91('+919000000001', '', { message: '123456' });
+
+    expect(res.ok).toBe(false);
+    expect(res.retryable).toBe(false);
+    expect(res.error).toBe('no template_id configured; msg91 requires a template id');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses the send with a non-retryable error when template_id is only whitespace', async () => {
+    const fetchMock = mockFetchOk();
+    const res = await sendSmsWithMsg91('+919000000001', '   ', { message: '123456' });
+
+    expect(res.ok).toBe(false);
+    expect(res.retryable).toBe(false);
+    expect(res.error).toBe('no template_id configured; msg91 requires a template id');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when smsProvider.send is called with empty template_id', async () => {
+    const fetchMock = mockFetchOk();
+    const res = await smsProvider.send({
+      to: '+919000000001',
+      template_id: '',
+      variables: { message: '123456' },
+    });
+
+    expect(res.ok).toBe(false);
+    expect(res.retryable).toBe(false);
+    expect(res.error).toBe('no template_id configured; msg91 requires a template id');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  describe('MSG91 template configuration', () => {
+    const origEnv = process.env.SMS_LOGIN_OTP_TEMPLATE_ID;
+
+    afterEach(() => {
+      if (origEnv !== undefined) {
+        process.env.SMS_LOGIN_OTP_TEMPLATE_ID = origEnv;
+      } else {
+        delete process.env.SMS_LOGIN_OTP_TEMPLATE_ID;
+      }
+    });
+
+    it('returns empty string for login_otp when SMS_LOGIN_OTP_TEMPLATE_ID is unset', () => {
+      delete process.env.SMS_LOGIN_OTP_TEMPLATE_ID;
+      expect(loadMsg91Templates({} as NodeJS.ProcessEnv).login_otp).toBe('');
+      expect(smsProvider.templates.login_otp).toBe('');
+    });
+
+    it('returns configured template id when SMS_LOGIN_OTP_TEMPLATE_ID is set', () => {
+      expect(
+        loadMsg91Templates({ SMS_LOGIN_OTP_TEMPLATE_ID: 'flow-custom-otp' } as unknown as NodeJS.ProcessEnv).login_otp
+      ).toBe('flow-custom-otp');
+
+      process.env.SMS_LOGIN_OTP_TEMPLATE_ID = 'flow-env-otp';
+      expect(smsProvider.templates.login_otp).toBe('flow-env-otp');
+    });
   });
 });

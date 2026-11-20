@@ -463,8 +463,8 @@ SMS is delivered through the MSG91 Flow API and accepts **raw provider-side
 template ids** (#86/#532/#535). Two ways to pass `template_id`:
 
 - **Named template** — `login_otp` is the one key in the SMS provider metadata. Its
-  MSG91 flow id comes from `SMS_LOGIN_OTP_TEMPLATE_ID` (a built-in default applies
-  if unset), so it is deployment-specific per MSG91 account.
+  MSG91 flow id comes from `SMS_LOGIN_OTP_TEMPLATE_ID` (fails closed if unset), so
+  it is deployment-specific per MSG91 account.
 - **Raw DLT flow id** — any other `template_id` is passed through verbatim to MSG91
   (the SMS provider sets `allowRawTemplateId`). Signalstack sends its per-event
   DLT-approved flow ids directly this way; they need no entry in the templates map.
