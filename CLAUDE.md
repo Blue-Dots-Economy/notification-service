@@ -256,9 +256,8 @@ Required for providers (varies by implementation):
   `config/pinnacle-templates.example.json`). The four OTP env vars are unchanged.
   `PINNACLE_TIMEOUT_MS` (default 10000) bounds each Pinnacle call.
 - `SMS_LOGIN_OTP_TEMPLATE_ID` — MSG91 flow id for the legacy `login_otp` template.
-  Read in `src/lib/providers/sms/msg91.ts`; optional, with a back-compat default of
-  the previously-hardcoded id. Per-event DLT flow ids are sent raw and need no env
-  (see `allowRawTemplateId`). Note: `MSG91_TEMPLATE_ID` in `example.env` is unused —
+  Read in `src/lib/providers/sms/msg91.ts`; required when using MSG91 for login OTP (fails closed if unset).
+  Per-event DLT flow ids are sent raw and need no env (see `allowRawTemplateId`). Note: `MSG91_TEMPLATE_ID` in `example.env` is unused —
   the code never reads it; use `SMS_LOGIN_OTP_TEMPLATE_ID` instead.
 - Twilio credentials for WhatsApp
 - etc.

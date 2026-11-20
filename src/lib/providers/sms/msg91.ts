@@ -8,6 +8,20 @@ export async function sendSmsWithMsg91(
   template_id: string,
   variables: Record<string, string>
 ): Promise<ProviderSendResult> {
+  if (!template_id || !template_id.trim()) {
+    console.log('msg91 error: no template_id configured');
+    await metrics.incr('ns_sms_send_total', { provider: 'msg91', result: 'failed' });
+    await metrics.incr('ns_sms_provider_error_total', {
+      provider: 'msg91',
+      code: 'NO_TEMPLATE_ID',
+    });
+    return {
+      ok: false,
+      error: 'no template_id configured; msg91 requires a template id',
+      retryable: false,
+    };
+  }
+
   const phone = to.startsWith('+') ? to.slice(1) : to;
 
   // MSG91 Flow renders the DLT-approved template from named variables carried
@@ -83,16 +97,24 @@ export async function sendSmsWithMsg91(
   return { ok: true };
 }
 
+export function loadMsg91Templates(env = process.env): Record<string, string> {
+  return {
+    login_otp: (env.SMS_LOGIN_OTP_TEMPLATE_ID ?? '').trim(),
+  };
+}
+
 export const smsProvider: ProviderDefinition = {
   name: 'sms',
 
   // Only the legacy single-var OTP is named here; per-event DLT flow ids are
   // sent raw by signalstack (allowRawTemplateId), so they need no entry. The
   // OTP flow id is deployment-specific (per MSG91 account) — read from env,
-  // never hardcoded. The literal is a backward-compat default so existing
-  // deploys don't break; set SMS_LOGIN_OTP_TEMPLATE_ID to override.
+  // never hardcoded. Set SMS_LOGIN_OTP_TEMPLATE_ID to configure. With no
+  // template id configured, it fails closed with a clear, non-retryable error.
   templates: {
-    login_otp: process.env.SMS_LOGIN_OTP_TEMPLATE_ID ?? '6896c26d6eb66c66340e1242',
+    get login_otp() {
+      return (process.env.SMS_LOGIN_OTP_TEMPLATE_ID ?? '').trim();
+    },
   },
   allowRawTemplateId: true,
 
