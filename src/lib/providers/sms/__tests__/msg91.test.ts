@@ -142,9 +142,13 @@ describe('msg91 sign-in and sign-up OTP templates', () => {
 });
 
 describe('msg91 MSG91_OTP_VAR_NAMES', () => {
-  async function send(template_key: string, variables: Record<string, string>) {
+  async function send(
+    template_key: string,
+    variables: Record<string, string>,
+    varNames = 'message:num,url:urg'
+  ) {
     vi.resetModules();
-    process.env.MSG91_OTP_VAR_NAMES = 'message:num,url:urg';
+    process.env.MSG91_OTP_VAR_NAMES = varNames;
     const { smsProvider: provider } = await import('../msg91');
     const fetchMock = mockFetchOk();
     await provider.send({ to: '919000000006', template_id: 'flow', template_key, variables });
@@ -159,6 +163,11 @@ describe('msg91 MSG91_OTP_VAR_NAMES', () => {
       num: '123456',
       urg: 'https://x',
     });
+  });
+
+  it('sends OTP variables unchanged when unset (every other instance)', async () => {
+    const vars = { message: '123456', url: 'https://x', constructor: 'c' };
+    expect(await send('signals_signin_otp', vars, '')).toEqual({ mobiles: '919000000006', ...vars });
   });
 
   it('leaves login_otp on ##var##', async () => {
