@@ -23,12 +23,19 @@ export function otpTemplateIdsFromEnv(env: NodeJS.ProcessEnv = process.env): Rec
 
 // MSG91_OTP_VAR_NAMES=message:num,url:urg renames Keycloak's OTP variables to the template's placeholders.
 // A Map, not an object: unset must be a strict no-op, and `{}['constructor']` is not undefined.
-const OTP_VAR_NAMES = new Map(
-  (process.env.MSG91_OTP_VAR_NAMES ?? '')
-    .split(',')
-    .filter((pair) => pair.includes(':'))
-    .map((pair) => pair.split(':').map((name) => name.trim()) as [string, string])
-);
+const otpVarPairs = (process.env.MSG91_OTP_VAR_NAMES ?? '')
+  .split(',')
+  .filter((pair) => pair.trim())
+  .map((pair) => pair.split(':').map((name) => name.trim()));
+// A typo would send the OTP with an empty slot that MSG91 still accepts, so fail at boot instead.
+if (
+  otpVarPairs.some((pair) => pair.length !== 2 || !pair[0] || !pair[1]) ||
+  new Set(otpVarPairs.map((pair) => pair[0])).size !== otpVarPairs.length ||
+  new Set(otpVarPairs.map((pair) => pair[1])).size !== otpVarPairs.length
+) {
+  throw new Error('Invalid MSG91_OTP_VAR_NAMES: expected unique from:to pairs, e.g. message:num,url:urg');
+}
+const OTP_VAR_NAMES = new Map(otpVarPairs as [string, string][]);
 
 // MSG91_OTP_URL replaces Keycloak's per-portal link with one fixed URL, so DLT needs one whitelist entry.
 const OTP_URL = process.env.MSG91_OTP_URL?.trim();
@@ -133,9 +140,9 @@ export const smsProvider: ProviderDefinition = {
 
   async send({ to, template_id, template_key, variables }) {
     // Only the sign-in/sign-up OTP keys are changed; login_otp and event templates are untouched.
-    const otpVars = OTP_URL ? { ...variables, url: OTP_URL } : variables;
+    const otpVars = OTP_URL && 'url' in variables ? { ...variables, url: OTP_URL } : variables;
     const vars =
-      template_key && template_key in OTP_TEMPLATE_ENV_VARS
+      template_key && Object.prototype.hasOwnProperty.call(OTP_TEMPLATE_ENV_VARS, template_key)
         ? Object.fromEntries(Object.entries(otpVars).map(([k, v]) => [OTP_VAR_NAMES.get(k) ?? k, v]))
         : variables;
     return await sendSmsWithMsg91(to, template_id, vars);

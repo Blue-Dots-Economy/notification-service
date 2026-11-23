@@ -151,13 +151,16 @@ describe('msg91 MSG91_OTP_VAR_NAMES', () => {
     vi.resetModules();
     process.env.MSG91_OTP_VAR_NAMES = varNames;
     process.env.MSG91_OTP_URL = otpUrl;
-    const { smsProvider: provider } = await import('../msg91');
-    const fetchMock = mockFetchOk();
-    await provider.send({ to: '919000000006', template_id: 'flow', template_key, variables });
-    delete process.env.MSG91_OTP_VAR_NAMES;
-    delete process.env.MSG91_OTP_URL;
-    vi.unstubAllGlobals();
-    return bodyOf(fetchMock).recipients[0];
+    try {
+      const { smsProvider: provider } = await import('../msg91');
+      const fetchMock = mockFetchOk();
+      await provider.send({ to: '919000000006', template_id: 'flow', template_key, variables });
+      return bodyOf(fetchMock).recipients[0];
+    } finally {
+      delete process.env.MSG91_OTP_VAR_NAMES;
+      delete process.env.MSG91_OTP_URL;
+      vi.unstubAllGlobals();
+    }
   }
 
   it('renames the variables for a sign-in/sign-up OTP key', async () => {
@@ -179,6 +182,30 @@ describe('msg91 MSG91_OTP_VAR_NAMES', () => {
       mobiles: '919000000006',
       num: '123456',
       urg: 'https://example.in',
+    });
+  });
+
+  it('adds no url when Keycloak sent none, so a lone message still maps to ##var##', async () => {
+    expect(await send('signals_signin_otp', { message: '123456' }, '', 'https://example.in')).toEqual({
+      mobiles: '919000000006',
+      var: '123456',
+    });
+  });
+
+  it.each(['message:', ':num', 'message:num:x', 'message:num,url:num', 'message:num,message:otp'])(
+    'refuses to start on a malformed value %j',
+    async (value) => {
+      await expect(send('signals_signin_otp', { message: '1' }, value)).rejects.toThrow(
+        /MSG91_OTP_VAR_NAMES/
+      );
+    }
+  );
+
+  it('does not treat a built-in name like constructor as an OTP key', async () => {
+    const vars = { message: '1', url: 'https://x' };
+    expect(await send('constructor', vars, undefined, 'https://example.in')).toEqual({
+      mobiles: '919000000006',
+      ...vars,
     });
   });
 
