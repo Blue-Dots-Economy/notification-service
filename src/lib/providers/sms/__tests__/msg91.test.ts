@@ -140,3 +140,31 @@ describe('msg91 sign-in and sign-up OTP templates', () => {
     vi.unstubAllGlobals();
   });
 });
+
+describe('msg91 MSG91_OTP_VAR_NAMES', () => {
+  async function send(template_key: string, variables: Record<string, string>) {
+    vi.resetModules();
+    process.env.MSG91_OTP_VAR_NAMES = 'message:num,url:urg';
+    const { smsProvider: provider } = await import('../msg91');
+    const fetchMock = mockFetchOk();
+    await provider.send({ to: '919000000006', template_id: 'flow', template_key, variables });
+    delete process.env.MSG91_OTP_VAR_NAMES;
+    vi.unstubAllGlobals();
+    return bodyOf(fetchMock).recipients[0];
+  }
+
+  it('renames the variables for a sign-in/sign-up OTP key', async () => {
+    expect(await send('signals_signin_otp', { message: '123456', url: 'https://x' })).toEqual({
+      mobiles: '919000000006',
+      num: '123456',
+      urg: 'https://x',
+    });
+  });
+
+  it('leaves login_otp on ##var##', async () => {
+    expect(await send('login_otp', { message: '123456' })).toEqual({
+      mobiles: '919000000006',
+      var: '123456',
+    });
+  });
+});

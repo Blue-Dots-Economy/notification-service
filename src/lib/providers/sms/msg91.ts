@@ -21,6 +21,14 @@ export function otpTemplateIdsFromEnv(env: NodeJS.ProcessEnv = process.env): Rec
   return templates;
 }
 
+// MSG91_OTP_VAR_NAMES=message:num,url:urg renames Keycloak's OTP variables to the template's placeholders.
+const OTP_VAR_NAMES: Record<string, string> = Object.fromEntries(
+  (process.env.MSG91_OTP_VAR_NAMES ?? '')
+    .split(',')
+    .filter((pair) => pair.includes(':'))
+    .map((pair) => pair.split(':').map((name) => name.trim()))
+);
+
 export async function sendSmsWithMsg91(
   to: string,
   template_id: string,
@@ -119,7 +127,12 @@ export const smsProvider: ProviderDefinition = {
   // (numbers/OTPs are sent as strings on the wire).
   schema: z.record(z.string(), z.string()),
 
-  async send({ to, template_id, variables }) {
-    return await sendSmsWithMsg91(to, template_id, variables);
+  async send({ to, template_id, template_key, variables }) {
+    // Only the sign-in/sign-up OTP keys are renamed; login_otp and event templates are untouched.
+    const vars =
+      template_key && template_key in OTP_TEMPLATE_ENV_VARS
+        ? Object.fromEntries(Object.entries(variables).map(([k, v]) => [OTP_VAR_NAMES[k] ?? k, v]))
+        : variables;
+    return await sendSmsWithMsg91(to, template_id, vars);
   },
 };
