@@ -8,7 +8,7 @@ vi.mock('../../../metrics', () => ({
   renderPrometheus: vi.fn(async () => ''),
 }));
 
-import { otpTemplateIdsFromEnv, sendSmsWithMsg91, smsProvider } from '../msg91';
+import { loadOtpTemplateRows, sendSmsWithMsg91, smsProvider } from '../msg91';
 
 function mockFetchOk() {
   const fetchMock = vi
@@ -112,107 +112,124 @@ describe('msg91 SMS provider', () => {
   });
 });
 
-describe('msg91 sign-in and sign-up OTP templates', () => {
-  it('names no OTP key when none of the env vars is set', () => {
-    expect(otpTemplateIdsFromEnv({})).toEqual({});
+// One row in the notification-service template table shape, as up-gzb configures it.
+function otpRow(key: string, overrides: Record<string, unknown> = {}) {
+  return JSON.stringify({
+    template_key: key,
+    network: 'blue_dot',
+    channel: 'sms',
+    locale: 'en',
+    provider: 'msg91',
+    provider_template_id: `flow-${key}`,
+    body_text: '{{num}} is the OTP on Rojgar Mitra {{urg}}.',
+    variables: [
+      { name: 'num', from: 'message', sensitive: true },
+      { name: 'urg', type: 'url', value: 'https://example.in' },
+    ],
+    ...overrides,
+  });
+}
+
+describe('msg91 OTP template rows', () => {
+  it('loads nothing when no row is set', () => {
+    expect(loadOtpTemplateRows({})).toEqual({});
   });
 
-  it('maps only the keys whose env var is set, trimmed', () => {
-    expect(
-      otpTemplateIdsFromEnv({
-        MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP: ' flow-signin ',
-        MSG91_TEMPLATE_SIGNALS_SIGNUP_OTP: 'flow-signup',
-        MSG91_TEMPLATE_AGGREGATOR_SIGNIN_OTP: '  ',
-      })
-    ).toEqual({ signals_signin_otp: 'flow-signin', signals_signup_otp: 'flow-signup' });
-  });
-
-  it('sends the Keycloak {message, url} payload as named variables', async () => {
-    process.env.MSG91_AUTH_KEY = 'k';
-    const fetchMock = mockFetchOk();
-    await sendSmsWithMsg91('+919000000005', 'flow-signin', {
-      message: '123456',
-      url: 'https://app.example.in',
+  it('loads signals and aggregator rows by template key', () => {
+    const rows = loadOtpTemplateRows({
+      MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP: otpRow('signals_signin_otp'),
+      MSG91_TEMPLATE_AGGREGATOR_SIGNUP_OTP: otpRow('aggregator_signup_otp'),
     });
-    expect(bodyOf(fetchMock).recipients).toEqual([
-      { mobiles: '919000000005', message: '123456', url: 'https://app.example.in' },
-    ]);
-    vi.unstubAllGlobals();
+    expect(Object.keys(rows)).toEqual(['signals_signin_otp', 'aggregator_signup_otp']);
+    expect(rows.aggregator_signup_otp.provider_template_id).toBe('flow-aggregator_signup_otp');
+  });
+
+  it.each([
+    ['not JSON', '{'],
+    ['the wrong template_key', otpRow('signals_signup_otp')],
+    ['provider pinnacle', otpRow('signals_signin_otp', { provider: 'pinnacle' })],
+    ['no provider_template_id', otpRow('signals_signin_otp', { provider_template_id: ' ' })],
+    ['an undeclared placeholder', otpRow('signals_signin_otp', { body_text: '{{otp}} is your OTP' })],
+    ['a duplicate variable', otpRow('signals_signin_otp', { variables: [{ name: 'num' }, { name: 'num' }] })],
+  ])('refuses to start on a row with %s', (_why, raw) => {
+    expect(() => loadOtpTemplateRows({ MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP: raw })).toThrow(
+      /MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP is invalid/
+    );
+  });
+
+  it('only skips a broken row when Pinnacle is the vendor', () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    expect(loadOtpTemplateRows({ SMS_PROVIDER: 'pinnacle', MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP: '{' })).toEqual({});
+    log.mockRestore();
   });
 });
 
-describe('msg91 MSG91_OTP_VAR_NAMES', () => {
-  async function send(
-    template_key: string,
-    variables: Record<string, string>,
-    varNames = 'message:num,url:urg',
-    otpUrl = ''
-  ) {
+describe('msg91 send with OTP template rows', () => {
+  async function send(env: Record<string, string>, template_key: string, variables: Record<string, string>) {
     vi.resetModules();
-    process.env.MSG91_OTP_VAR_NAMES = varNames;
-    process.env.MSG91_OTP_URL = otpUrl;
+    Object.assign(process.env, env);
     try {
       const { smsProvider: provider } = await import('../msg91');
       const fetchMock = mockFetchOk();
-      await provider.send({ to: '919000000006', template_id: 'flow', template_key, variables });
-      return bodyOf(fetchMock).recipients[0];
+      const res = await provider.send({ to: '919000000006', template_id: 'flow', template_key, variables });
+      return { res, recipient: fetchMock.mock.calls.length ? bodyOf(fetchMock).recipients[0] : undefined };
     } finally {
-      delete process.env.MSG91_OTP_VAR_NAMES;
-      delete process.env.MSG91_OTP_URL;
+      for (const key of Object.keys(env)) delete process.env[key];
       vi.unstubAllGlobals();
     }
   }
 
-  it('renames the variables for a sign-in/sign-up OTP key', async () => {
-    expect(await send('signals_signin_otp', { message: '123456', url: 'https://x' })).toEqual({
-      mobiles: '919000000006',
-      num: '123456',
-      urg: 'https://x',
-    });
+  const keycloak = { message: '123456', url: 'https://jobs.example.in' };
+
+  it.each([
+    ['MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP', 'signals_signin_otp'],
+    ['MSG91_TEMPLATE_AGGREGATOR_SIGNUP_OTP', 'aggregator_signup_otp'],
+  ])('%s sends the row variables: renamed OTP and fixed url', async (setting, key) => {
+    const { recipient } = await send({ [setting]: otpRow(key) }, key, keycloak);
+    expect(recipient).toEqual({ mobiles: '919000000006', num: '123456', urg: 'https://example.in' });
   });
 
-  it('sends OTP variables unchanged when unset (every other instance)', async () => {
-    const vars = { message: '123456', url: 'https://x', constructor: 'c' };
-    expect(await send('signals_signin_otp', vars, '')).toEqual({ mobiles: '919000000006', ...vars });
+  it('refuses to send when a declared variable has no value', async () => {
+    const env = { MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP: otpRow('signals_signin_otp') };
+    const { res, recipient } = await send(env, 'signals_signin_otp', { url: 'https://x' });
+    expect(res).toMatchObject({ ok: false, retryable: false });
+    expect(res.error).toContain('num');
+    expect(recipient).toBeUndefined();
   });
 
-  it('sends the fixed MSG91_OTP_URL instead of the portal link', async () => {
-    const vars = { message: '123456', url: 'https://jobs.example.in' };
-    expect(await send('signals_signup_otp', vars, undefined, 'https://example.in')).toEqual({
-      mobiles: '919000000006',
-      num: '123456',
-      urg: 'https://example.in',
-    });
+  it('sends a lone declared `message` as message, not the legacy ##var##', async () => {
+    const env = {
+      MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP: otpRow('signals_signin_otp', {
+        body_text: '{{message}} is your OTP',
+        variables: [{ name: 'message' }],
+      }),
+    };
+    const { recipient } = await send(env, 'signals_signin_otp', { message: '123456' });
+    expect(recipient).toEqual({ mobiles: '919000000006', message: '123456' });
   });
 
-  it('adds no url when Keycloak sent none, so a lone message still maps to ##var##', async () => {
-    expect(await send('signals_signin_otp', { message: '123456' }, '', 'https://example.in')).toEqual({
+  it('sends OTP keys unchanged when no row is set (every other instance)', async () => {
+    const { recipient } = await send({}, 'signals_signin_otp', keycloak);
+    expect(recipient).toEqual({ mobiles: '919000000006', ...keycloak });
+  });
+
+  it('leaves login_otp on ##var## and ignores built-in names', async () => {
+    const env = { MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP: otpRow('signals_signin_otp') };
+    expect((await send(env, 'login_otp', { message: '123456' })).recipient).toEqual({
       mobiles: '919000000006',
       var: '123456',
     });
+    expect((await send(env, 'constructor', keycloak)).recipient).toEqual({ mobiles: '919000000006', ...keycloak });
   });
 
-  it.each(['message:', ':num', 'message:num:x', 'message:num,url:num', 'message:num,message:otp'])(
-    'refuses to start on a malformed value %j',
-    async (value) => {
-      await expect(send('signals_signin_otp', { message: '1' }, value)).rejects.toThrow(
-        /MSG91_OTP_VAR_NAMES/
-      );
+  it('names the row template ids for the worker', async () => {
+    vi.resetModules();
+    process.env.MSG91_TEMPLATE_AGGREGATOR_SIGNIN_OTP = otpRow('aggregator_signin_otp');
+    try {
+      const { smsProvider: provider } = await import('../msg91');
+      expect(provider.templates.aggregator_signin_otp).toBe('flow-aggregator_signin_otp');
+    } finally {
+      delete process.env.MSG91_TEMPLATE_AGGREGATOR_SIGNIN_OTP;
     }
-  );
-
-  it('does not treat a built-in name like constructor as an OTP key', async () => {
-    const vars = { message: '1', url: 'https://x' };
-    expect(await send('constructor', vars, undefined, 'https://example.in')).toEqual({
-      mobiles: '919000000006',
-      ...vars,
-    });
-  });
-
-  it('leaves login_otp on ##var##', async () => {
-    expect(await send('login_otp', { message: '123456' }, undefined, 'https://example.in')).toEqual({
-      mobiles: '919000000006',
-      var: '123456',
-    });
   });
 });

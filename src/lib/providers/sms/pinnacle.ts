@@ -4,6 +4,7 @@ import { ProviderDefinition, ProviderSendResult } from '../../../types/provider'
 import * as metrics from '../../metrics';
 import { isRetryableHttpStatus } from './http_status';
 import { MAX_LENGTH, messageType, renderBody, UnresolvedTemplateVariables } from './render';
+import { parseTemplateRow, TemplateRow } from './template_row';
 
 /**
  * Pinnacle Teleservices SMS provider — the JSON endpoint (`/index.php/sms/json`).
@@ -38,50 +39,10 @@ const OTP_TEMPLATE_ENV_VARS: Record<string, string> = {
 /** Event templates (#191): path to a JSON file holding an array of rows in the same shape, each keyed by its own template_key. */
 const TEMPLATE_FILE_ENV_VAR = 'PINNACLE_TEMPLATES_FILE';
 
-const VariableSpecSchema = z.looseObject({
-  name: z.string().min(1),
-  required: z.boolean().optional(),
-  type: z.string().optional(),
-  sensitive: z.boolean().optional(),
-  raw: z.boolean().optional(),
-  urlHosts: z.array(z.string().min(1)).optional(),
-});
-
-const OtpTemplateRowSchema = z.looseObject({
-  template_key: z.string().min(1),
-  network: z.string().min(1),
-  channel: z.literal('sms'),
-  locale: z.string().min(1),
-  provider: z.literal('pinnacle'),
-  provider_template_id: z.string().trim().min(1),
-  body_text: z.string().min(1),
-  variables: z.array(VariableSpecSchema),
-  version: z.number().int().optional(),
-  approval_ref: z.string().optional(),
-});
-
-export type OtpTemplateRow = z.infer<typeof OtpTemplateRowSchema>;
+export type OtpTemplateRow = TemplateRow;
 
 export function parseOtpTemplateRow(raw: string, expectedKey: string): OtpTemplateRow | { error: string } {
-  let json: unknown;
-  try {
-    json = JSON.parse(raw);
-  } catch {
-    return { error: 'not valid JSON' };
-  }
-  const parsed = OtpTemplateRowSchema.safeParse(json);
-  if (!parsed.success) {
-    return { error: parsed.error.issues.map((i) => i.path.join('.') || 'row').join(', ') + ' invalid or missing' };
-  }
-  const row = parsed.data;
-  if (row.template_key !== expectedKey) {
-    return { error: `template_key is '${row.template_key}', expected '${expectedKey}'` };
-  }
-  const placeholders = [...row.body_text.matchAll(/\{\{(\w+)\}\}/g)].map((m) => m[1]);
-  const declared = row.variables.map((v) => v.name);
-  const undeclaredPlaceholders = placeholders.filter((v) => !declared.includes(v));
-  if (undeclaredPlaceholders.length) return { error: `body_text uses undeclared variables: ${undeclaredPlaceholders.join(', ')}` };
-  return row;
+  return parseTemplateRow(raw, expectedKey, 'pinnacle');
 }
 
 /**

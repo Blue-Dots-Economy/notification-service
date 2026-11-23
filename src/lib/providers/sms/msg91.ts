@@ -2,8 +2,10 @@ import { z } from 'zod';
 import { ProviderDefinition, ProviderSendResult } from '../../../types/provider';
 import * as metrics from '../../metrics';
 import { isRetryableHttpStatus } from './http_status';
+import { parseTemplateRow, TemplateRow } from './template_row';
 
-// Sign-in and sign-up OTP keys Keycloak sends (SMS_HTTP_CLIENT_APPS), each mapped to an MSG91 flow id.
+// Sign-in and sign-up OTP keys Keycloak sends (SMS_HTTP_CLIENT_APPS). Each env var holds one row in
+// the notification-service template table shape, with provider "msg91".
 const OTP_TEMPLATE_ENV_VARS: Record<string, string> = {
   signals_signin_otp: 'MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP',
   signals_signup_otp: 'MSG91_TEMPLATE_SIGNALS_SIGNUP_OTP',
@@ -11,39 +13,50 @@ const OTP_TEMPLATE_ENV_VARS: Record<string, string> = {
   aggregator_signup_otp: 'MSG91_TEMPLATE_AGGREGATOR_SIGNUP_OTP',
 };
 
-/** Names only the OTP keys whose env var is set, so a deployment without them is unchanged. */
-export function otpTemplateIdsFromEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
-  const templates: Record<string, string> = {};
-  for (const [key, envVar] of Object.entries(OTP_TEMPLATE_ENV_VARS)) {
-    const flowId = env[envVar]?.trim();
-    if (flowId) templates[key] = flowId;
+function parseOtpTemplateRow(raw: string, expectedKey: string): TemplateRow | string {
+  const row = parseTemplateRow(raw, expectedKey, 'msg91');
+  if ('error' in row) return String(row.error);
+  const names = row.variables.map((v) => v.name);
+  return new Set(names).size === names.length ? row : 'variables has a duplicate name';
+}
+
+/** The set OTP rows by template key. A broken row would only fail at send time, so it stops startup while MSG91 is the vendor. */
+export function loadOtpTemplateRows(env: NodeJS.ProcessEnv = process.env): Record<string, TemplateRow> {
+  const rows: Record<string, TemplateRow> = {};
+  const isActive = (env.SMS_PROVIDER || 'msg91').trim().toLowerCase() === 'msg91';
+  for (const [key, setting] of Object.entries(OTP_TEMPLATE_ENV_VARS)) {
+    const raw = env[setting]?.trim();
+    if (!raw) continue;
+    const row = parseOtpTemplateRow(raw, key);
+    if (typeof row === 'string') {
+      if (isActive) throw new Error(`msg91: ${setting} is invalid (${row})`);
+      console.log(`msg91: ${setting} skipped (${row})`);
+      continue;
+    }
+    rows[key] = row;
   }
-  return templates;
+  return rows;
 }
 
-// MSG91_OTP_VAR_NAMES=message:num,url:urg renames Keycloak's OTP variables to the template's placeholders.
-// A Map, not an object: unset must be a strict no-op, and `{}['constructor']` is not undefined.
-const otpVarPairs = (process.env.MSG91_OTP_VAR_NAMES ?? '')
-  .split(',')
-  .filter((pair) => pair.trim())
-  .map((pair) => pair.split(':').map((name) => name.trim()));
-// A typo would send the OTP with an empty slot that MSG91 still accepts, so fail at boot instead.
-if (
-  otpVarPairs.some((pair) => pair.length !== 2 || !pair[0] || !pair[1]) ||
-  new Set(otpVarPairs.map((pair) => pair[0])).size !== otpVarPairs.length ||
-  new Set(otpVarPairs.map((pair) => pair[1])).size !== otpVarPairs.length
-) {
-  throw new Error('Invalid MSG91_OTP_VAR_NAMES: expected unique from:to pairs, e.g. message:num,url:urg');
-}
-const OTP_VAR_NAMES = new Map(otpVarPairs as [string, string][]);
+const OTP_ROWS = loadOtpTemplateRows();
 
-// MSG91_OTP_URL replaces Keycloak's per-portal link with one fixed URL, so DLT needs one whitelist entry.
-const OTP_URL = process.env.MSG91_OTP_URL?.trim();
+/** Exactly the row's variables: a fixed `value`, else the caller's `from` (or same-named) variable. */
+function rowVariables(row: TemplateRow, variables: Record<string, string>) {
+  const vars: Record<string, string> = {};
+  const missing: string[] = [];
+  for (const spec of row.variables) {
+    const value = spec.value ?? variables[spec.from ?? spec.name];
+    if (value) vars[spec.name] = value;
+    else missing.push(spec.name);
+  }
+  return { vars, missing };
+}
 
 export async function sendSmsWithMsg91(
   to: string,
   template_id: string,
-  variables: Record<string, string>
+  variables: Record<string, string>,
+  asDeclared = false
 ): Promise<ProviderSendResult> {
   const phone = to.startsWith('+') ? to.slice(1) : to;
 
@@ -54,7 +67,7 @@ export async function sendSmsWithMsg91(
   // byte-for-byte unchanged. Any other shape is spread as named vars.
   const keys = Object.keys(variables);
   const recipientVars =
-    keys.length === 1 && keys[0] === 'message'
+    !asDeclared && keys.length === 1 && keys[0] === 'message'
       ? { var: variables.message }
       : variables;
 
@@ -130,7 +143,7 @@ export const smsProvider: ProviderDefinition = {
   // deploys don't break; set SMS_LOGIN_OTP_TEMPLATE_ID to override.
   templates: {
     login_otp: process.env.SMS_LOGIN_OTP_TEMPLATE_ID ?? '6896c26d6eb66c66340e1242',
-    ...otpTemplateIdsFromEnv(),
+    ...Object.fromEntries(Object.entries(OTP_ROWS).map(([key, row]) => [key, row.provider_template_id])),
   },
   allowRawTemplateId: true,
 
@@ -139,12 +152,15 @@ export const smsProvider: ProviderDefinition = {
   schema: z.record(z.string(), z.string()),
 
   async send({ to, template_id, template_key, variables }) {
-    // Only the sign-in/sign-up OTP keys are changed; login_otp and event templates are untouched.
-    const otpVars = OTP_URL && 'url' in variables ? { ...variables, url: OTP_URL } : variables;
-    const vars =
-      template_key && Object.prototype.hasOwnProperty.call(OTP_TEMPLATE_ENV_VARS, template_key)
-        ? Object.fromEntries(Object.entries(otpVars).map(([k, v]) => [OTP_VAR_NAMES.get(k) ?? k, v]))
-        : variables;
-    return await sendSmsWithMsg91(to, template_id, vars);
+    // A sign-in/sign-up OTP row sends exactly its declared variables; login_otp and event templates are untouched.
+    const row =
+      template_key && Object.prototype.hasOwnProperty.call(OTP_ROWS, template_key) ? OTP_ROWS[template_key] : undefined;
+    if (!row) return await sendSmsWithMsg91(to, template_id, variables);
+    const { vars, missing } = rowVariables(row, variables);
+    if (missing.length) {
+      // MSG91 still sends a template with an empty slot, so refuse rather than deliver an SMS without the OTP.
+      return { ok: false, error: `msg91: ${template_key} is missing ${missing.join(', ')}`, retryable: false };
+    }
+    return await sendSmsWithMsg91(to, template_id, vars, true);
   },
 };
