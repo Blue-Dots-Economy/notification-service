@@ -145,14 +145,17 @@ describe('msg91 MSG91_OTP_VAR_NAMES', () => {
   async function send(
     template_key: string,
     variables: Record<string, string>,
-    varNames = 'message:num,url:urg'
+    varNames = 'message:num,url:urg',
+    otpUrl = ''
   ) {
     vi.resetModules();
     process.env.MSG91_OTP_VAR_NAMES = varNames;
+    process.env.MSG91_OTP_URL = otpUrl;
     const { smsProvider: provider } = await import('../msg91');
     const fetchMock = mockFetchOk();
     await provider.send({ to: '919000000006', template_id: 'flow', template_key, variables });
     delete process.env.MSG91_OTP_VAR_NAMES;
+    delete process.env.MSG91_OTP_URL;
     vi.unstubAllGlobals();
     return bodyOf(fetchMock).recipients[0];
   }
@@ -170,8 +173,17 @@ describe('msg91 MSG91_OTP_VAR_NAMES', () => {
     expect(await send('signals_signin_otp', vars, '')).toEqual({ mobiles: '919000000006', ...vars });
   });
 
+  it('sends the fixed MSG91_OTP_URL instead of the portal link', async () => {
+    const vars = { message: '123456', url: 'https://jobs.example.in' };
+    expect(await send('signals_signup_otp', vars, undefined, 'https://example.in')).toEqual({
+      mobiles: '919000000006',
+      num: '123456',
+      urg: 'https://example.in',
+    });
+  });
+
   it('leaves login_otp on ##var##', async () => {
-    expect(await send('login_otp', { message: '123456' })).toEqual({
+    expect(await send('login_otp', { message: '123456' }, undefined, 'https://example.in')).toEqual({
       mobiles: '919000000006',
       var: '123456',
     });
