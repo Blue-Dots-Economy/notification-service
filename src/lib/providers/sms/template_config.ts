@@ -1,8 +1,9 @@
 import { z } from 'zod';
 
 /**
- * One row of the notification-service template table, as the SMS providers read
- * their OTP templates from env. Shared so Pinnacle and MSG91 accept the same shape.
+ * An SMS template config, as the providers read their OTP templates from env. It has the
+ * same fields as a row of the notification-service template table, but is not stored
+ * anywhere. Shared so Pinnacle and MSG91 accept the same shape.
  */
 
 const VariableSpecSchema = z.looseObject({
@@ -18,7 +19,7 @@ const VariableSpecSchema = z.looseObject({
   value: z.string().min(1).optional(),
 });
 
-function templateRowSchema<P extends string>(provider: P) {
+function templateConfigSchema<P extends string>(provider: P) {
   return z.looseObject({
     template_key: z.string().min(1),
     network: z.string().min(1),
@@ -33,16 +34,16 @@ function templateRowSchema<P extends string>(provider: P) {
   });
 }
 
-const SCHEMAS = { pinnacle: templateRowSchema('pinnacle'), msg91: templateRowSchema('msg91') };
+const SCHEMAS = { pinnacle: templateConfigSchema('pinnacle'), msg91: templateConfigSchema('msg91') };
 
 export type SmsTemplateProvider = keyof typeof SCHEMAS;
-export type TemplateRow = z.infer<(typeof SCHEMAS)[SmsTemplateProvider]>;
+export type TemplateConfig = z.infer<(typeof SCHEMAS)[SmsTemplateProvider]>;
 
-export function parseTemplateRow(
+export function parseTemplateConfig(
   raw: string,
   expectedKey: string,
   provider: SmsTemplateProvider
-): TemplateRow | { error: string } {
+): TemplateConfig | { error: string } {
   let json: unknown;
   try {
     json = JSON.parse(raw);

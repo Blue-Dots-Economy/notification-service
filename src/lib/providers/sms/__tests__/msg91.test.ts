@@ -8,7 +8,7 @@ vi.mock('../../../metrics', () => ({
   renderPrometheus: vi.fn(async () => ''),
 }));
 
-import { loadOtpTemplateRows, sendSmsWithMsg91, smsProvider } from '../msg91';
+import { loadOtpTemplateConfigs, sendSmsWithMsg91, smsProvider } from '../msg91';
 
 function mockFetchOk() {
   const fetchMock = vi
@@ -130,13 +130,13 @@ function otpRow(key: string, overrides: Record<string, unknown> = {}) {
   });
 }
 
-describe('msg91 OTP template rows', () => {
+describe('msg91 OTP template configs', () => {
   it('loads nothing when no row is set', () => {
-    expect(loadOtpTemplateRows({})).toEqual({});
+    expect(loadOtpTemplateConfigs({})).toEqual({});
   });
 
   it('loads signals and aggregator rows by template key', () => {
-    const rows = loadOtpTemplateRows({
+    const rows = loadOtpTemplateConfigs({
       MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP: otpRow('signals_signin_otp'),
       MSG91_TEMPLATE_AGGREGATOR_SIGNUP_OTP: otpRow('aggregator_signup_otp'),
     });
@@ -152,19 +152,19 @@ describe('msg91 OTP template rows', () => {
     ['an undeclared placeholder', otpRow('signals_signin_otp', { body_text: '{{otp}} is your OTP' })],
     ['a duplicate variable', otpRow('signals_signin_otp', { variables: [{ name: 'num' }, { name: 'num' }] })],
   ])('refuses to start on a row with %s', (_why, raw) => {
-    expect(() => loadOtpTemplateRows({ MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP: raw })).toThrow(
+    expect(() => loadOtpTemplateConfigs({ MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP: raw })).toThrow(
       /MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP is invalid/
     );
   });
 
   it('only skips a broken row when Pinnacle is the vendor', () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
-    expect(loadOtpTemplateRows({ SMS_PROVIDER: 'pinnacle', MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP: '{' })).toEqual({});
+    expect(loadOtpTemplateConfigs({ SMS_PROVIDER: 'pinnacle', MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP: '{' })).toEqual({});
     log.mockRestore();
   });
 });
 
-describe('msg91 send with OTP template rows', () => {
+describe('msg91 send with OTP template configs', () => {
   async function send(env: Record<string, string>, template_key: string, variables: Record<string, string>) {
     vi.resetModules();
     Object.assign(process.env, env);
@@ -206,6 +206,21 @@ describe('msg91 send with OTP template rows', () => {
     };
     const { recipient } = await send(env, 'signals_signin_otp', { message: '123456' });
     expect(recipient).toEqual({ mobiles: '919000000006', message: '123456' });
+  });
+
+  it('MSG91_TEMPLATE_LOGIN_OTP sends the guardian {message} through the row, replacing the default id', async () => {
+    const env = { MSG91_TEMPLATE_LOGIN_OTP: otpRow('login_otp') };
+    const { recipient } = await send(env, 'login_otp', { message: '123456' });
+    expect(recipient).toEqual({ mobiles: '919000000006', num: '123456', urg: 'https://example.in' });
+
+    vi.resetModules();
+    process.env.MSG91_TEMPLATE_LOGIN_OTP = otpRow('login_otp');
+    try {
+      const { smsProvider: provider } = await import('../msg91');
+      expect(provider.templates.login_otp).toBe('flow-login_otp');
+    } finally {
+      delete process.env.MSG91_TEMPLATE_LOGIN_OTP;
+    }
   });
 
   it('sends OTP keys unchanged when no row is set (every other instance)', async () => {

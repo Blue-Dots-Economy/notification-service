@@ -2,46 +2,48 @@ import { z } from 'zod';
 import { ProviderDefinition, ProviderSendResult } from '../../../types/provider';
 import * as metrics from '../../metrics';
 import { isRetryableHttpStatus } from './http_status';
-import { parseTemplateRow, TemplateRow } from './template_row';
+import { parseTemplateConfig, TemplateConfig } from './template_config';
 
-// Sign-in and sign-up OTP keys Keycloak sends (SMS_HTTP_CLIENT_APPS). Each env var holds one row in
-// the notification-service template table shape, with provider "msg91".
+// Sign-in and sign-up OTP keys Keycloak sends (SMS_HTTP_CLIENT_APPS), plus login_otp (Signals guardian
+// OTP, and Keycloak's fallback). Each env var holds one JSON template config (see ./template_config),
+// with provider "msg91". A login_otp config replaces SMS_LOGIN_OTP_TEMPLATE_ID.
 const OTP_TEMPLATE_ENV_VARS: Record<string, string> = {
+  login_otp: 'MSG91_TEMPLATE_LOGIN_OTP',
   signals_signin_otp: 'MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP',
   signals_signup_otp: 'MSG91_TEMPLATE_SIGNALS_SIGNUP_OTP',
   aggregator_signin_otp: 'MSG91_TEMPLATE_AGGREGATOR_SIGNIN_OTP',
   aggregator_signup_otp: 'MSG91_TEMPLATE_AGGREGATOR_SIGNUP_OTP',
 };
 
-function parseOtpTemplateRow(raw: string, expectedKey: string): TemplateRow | string {
-  const row = parseTemplateRow(raw, expectedKey, 'msg91');
+function parseOtpTemplateConfig(raw: string, expectedKey: string): TemplateConfig | string {
+  const row = parseTemplateConfig(raw, expectedKey, 'msg91');
   if ('error' in row) return String(row.error);
   const names = row.variables.map((v) => v.name);
   return new Set(names).size === names.length ? row : 'variables has a duplicate name';
 }
 
-/** The set OTP rows by template key. A broken row would only fail at send time, so it stops startup while MSG91 is the vendor. */
-export function loadOtpTemplateRows(env: NodeJS.ProcessEnv = process.env): Record<string, TemplateRow> {
-  const rows: Record<string, TemplateRow> = {};
+/** The set OTP template configs by key. A broken one would only fail at send time, so it stops startup while MSG91 is the vendor. */
+export function loadOtpTemplateConfigs(env: NodeJS.ProcessEnv = process.env): Record<string, TemplateConfig> {
+  const templates: Record<string, TemplateConfig> = {};
   const isActive = (env.SMS_PROVIDER || 'msg91').trim().toLowerCase() === 'msg91';
   for (const [key, setting] of Object.entries(OTP_TEMPLATE_ENV_VARS)) {
     const raw = env[setting]?.trim();
     if (!raw) continue;
-    const row = parseOtpTemplateRow(raw, key);
+    const row = parseOtpTemplateConfig(raw, key);
     if (typeof row === 'string') {
       if (isActive) throw new Error(`msg91: ${setting} is invalid (${row})`);
       console.log(`msg91: ${setting} skipped (${row})`);
       continue;
     }
-    rows[key] = row;
+    templates[key] = row;
   }
-  return rows;
+  return templates;
 }
 
-const OTP_ROWS = loadOtpTemplateRows();
+const OTP_TEMPLATES = loadOtpTemplateConfigs();
 
-/** Exactly the row's variables: a fixed `value`, else the caller's `from` (or same-named) variable. */
-function rowVariables(row: TemplateRow, variables: Record<string, string>) {
+/** Exactly the template's variables: a fixed `value`, else the caller's `from` (or same-named) variable. */
+function templateVariables(row: TemplateConfig, variables: Record<string, string>) {
   const vars: Record<string, string> = {};
   const missing: string[] = [];
   for (const spec of row.variables) {
@@ -143,7 +145,7 @@ export const smsProvider: ProviderDefinition = {
   // deploys don't break; set SMS_LOGIN_OTP_TEMPLATE_ID to override.
   templates: {
     login_otp: process.env.SMS_LOGIN_OTP_TEMPLATE_ID ?? '6896c26d6eb66c66340e1242',
-    ...Object.fromEntries(Object.entries(OTP_ROWS).map(([key, row]) => [key, row.provider_template_id])),
+    ...Object.fromEntries(Object.entries(OTP_TEMPLATES).map(([key, row]) => [key, row.provider_template_id])),
   },
   allowRawTemplateId: true,
 
@@ -152,11 +154,11 @@ export const smsProvider: ProviderDefinition = {
   schema: z.record(z.string(), z.string()),
 
   async send({ to, template_id, template_key, variables }) {
-    // A sign-in/sign-up OTP row sends exactly its declared variables; login_otp and event templates are untouched.
+    // A sign-in/sign-up OTP template sends exactly its declared variables; login_otp and event templates are untouched.
     const row =
-      template_key && Object.prototype.hasOwnProperty.call(OTP_ROWS, template_key) ? OTP_ROWS[template_key] : undefined;
+      template_key && Object.prototype.hasOwnProperty.call(OTP_TEMPLATES, template_key) ? OTP_TEMPLATES[template_key] : undefined;
     if (!row) return await sendSmsWithMsg91(to, template_id, variables);
-    const { vars, missing } = rowVariables(row, variables);
+    const { vars, missing } = templateVariables(row, variables);
     if (missing.length) {
       // MSG91 still sends a template with an empty slot, so refuse rather than deliver an SMS without the OTP.
       return { ok: false, error: `msg91: ${template_key} is missing ${missing.join(', ')}`, retryable: false };
