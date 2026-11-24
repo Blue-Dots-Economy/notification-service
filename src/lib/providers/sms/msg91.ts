@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { ProviderDefinition, ProviderSendResult } from '../../../types/provider';
 import * as metrics from '../../metrics';
 import { isRetryableHttpStatus } from './http_status';
-import { parseTemplateConfig, TemplateConfig } from './template_config';
+import { linkNotAllowed, parseTemplateConfig, TemplateConfig, urlHostsOf } from './template_config';
 
 // Sign-in and sign-up OTP keys Keycloak sends (SMS_HTTP_CLIENT_APPS), plus login_otp (Signals guardian
 // OTP, and Keycloak's fallback). Each env var holds one JSON template config (see ./template_config),
@@ -42,14 +42,14 @@ export function loadOtpTemplateConfigs(env: NodeJS.ProcessEnv = process.env): Re
 
 const OTP_TEMPLATES = loadOtpTemplateConfigs();
 
-/** Exactly the template's variables: a fixed `value`, else the caller's `from` (or same-named) variable. */
+/** Exactly the template's variables: a fixed `value`, else the caller's `from` (or same-named) variable. Optional ones may be absent. */
 function templateVariables(row: TemplateConfig, variables: Record<string, string>) {
   const vars: Record<string, string> = {};
   const missing: string[] = [];
   for (const spec of row.variables) {
     const value = spec.value ?? variables[spec.from ?? spec.name];
     if (value) vars[spec.name] = value;
-    else missing.push(spec.name);
+    else if (spec.required !== false) missing.push(spec.name);
   }
   return { vars, missing };
 }
@@ -154,7 +154,8 @@ export const smsProvider: ProviderDefinition = {
   schema: z.record(z.string(), z.string()),
 
   async send({ to, template_id, template_key, variables }) {
-    // A sign-in/sign-up OTP template sends exactly its declared variables; login_otp and event templates are untouched.
+    // A configured OTP template sends exactly its declared variables. Event templates, and login_otp
+    // while MSG91_TEMPLATE_LOGIN_OTP is unset, keep the caller's variables (a lone message is ##var##).
     const row =
       template_key && Object.prototype.hasOwnProperty.call(OTP_TEMPLATES, template_key) ? OTP_TEMPLATES[template_key] : undefined;
     if (!row) return await sendSmsWithMsg91(to, template_id, variables);
@@ -163,6 +164,8 @@ export const smsProvider: ProviderDefinition = {
       // MSG91 still sends a template with an empty slot, so refuse rather than deliver an SMS without the OTP.
       return { ok: false, error: `msg91: ${template_key} is missing ${missing.join(', ')}`, retryable: false };
     }
+    const notAllowed = linkNotAllowed(urlHostsOf(row), vars);
+    if (notAllowed) return { ok: false, error: `msg91: ${template_key}: ${notAllowed}`, retryable: false };
     return await sendSmsWithMsg91(to, template_id, vars, true);
   },
 };

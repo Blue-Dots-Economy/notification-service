@@ -4,7 +4,7 @@ import { ProviderDefinition, ProviderSendResult } from '../../../types/provider'
 import * as metrics from '../../metrics';
 import { isRetryableHttpStatus } from './http_status';
 import { MAX_LENGTH, messageType, renderBody, UnresolvedTemplateVariables } from './render';
-import { parseTemplateConfig, TemplateConfig } from './template_config';
+import { linkNotAllowed, parseTemplateConfig, TemplateConfig, urlHostsOf } from './template_config';
 
 /**
  * Pinnacle Teleservices SMS provider — the JSON endpoint (`/index.php/sms/json`).
@@ -105,34 +105,13 @@ export function loadOtpTemplates(env = process.env): {
     }
     templates[key] = row.provider_template_id;
     bodies[key] = row.body_text;
-    const hosts = Object.fromEntries(
-      row.variables
-        .filter((v) => v.type === 'url' && v.urlHosts)
-        .map((v) => [v.name, v.urlHosts!.map((h) => h.trim().toLowerCase())])
-    );
+    const hosts = urlHostsOf(row);
     if (Object.keys(hosts).length) urlHosts[key] = hosts;
   }
   return { templates, bodies, urlHosts };
 }
 
-/** Why a url variable may not be sent, or undefined when every link is on its allowed hosts. */
-export function linkNotAllowed(
-  hostsByVariable: Record<string, string[]> | undefined,
-  variables: Record<string, string>
-): string | undefined {
-  for (const [name, hosts] of Object.entries(hostsByVariable ?? {})) {
-    const value = variables[name];
-    if (value === undefined) continue;
-    let host = '';
-    try {
-      host = new URL(value).host;
-    } catch {
-      // not a URL; reported below like any other disallowed host
-    }
-    if (!hosts.includes(host)) return `${name} host '${host || value}' not in urlHosts`;
-  }
-  return undefined;
-}
+export { linkNotAllowed };
 
 interface PinnacleConfig {
   baseUrl: string;

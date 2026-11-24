@@ -9,6 +9,7 @@ vi.mock('../../../metrics', () => ({
 }));
 
 import { loadOtpTemplateConfigs, sendSmsWithMsg91, smsProvider } from '../msg91';
+import { parseTemplateConfig } from '../template_config';
 
 function mockFetchOk() {
   const fetchMock = vi
@@ -150,11 +151,23 @@ describe('msg91 OTP template configs', () => {
     ['provider pinnacle', otpRow('signals_signin_otp', { provider: 'pinnacle' })],
     ['no provider_template_id', otpRow('signals_signin_otp', { provider_template_id: ' ' })],
     ['an undeclared placeholder', otpRow('signals_signin_otp', { body_text: '{{otp}} is your OTP' })],
-    ['a duplicate variable', otpRow('signals_signin_otp', { variables: [{ name: 'num' }, { name: 'num' }] })],
   ])('refuses to start on a row with %s', (_why, raw) => {
     expect(() => loadOtpTemplateConfigs({ MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP: raw })).toThrow(
       /MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP is invalid/
     );
+  });
+
+  it('refuses to start on a duplicate variable name', () => {
+    const raw = otpRow('signals_signin_otp', { body_text: '{{num}}', variables: [{ name: 'num' }, { name: 'num' }] });
+    expect(() => loadOtpTemplateConfigs({ MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP: raw })).toThrow(/duplicate/);
+  });
+
+  it('only accepts from/value on msg91 configs, not pinnacle', () => {
+    const msg91 = JSON.parse(otpRow('signals_signin_otp'));
+    expect('error' in parseTemplateConfig(JSON.stringify(msg91), 'signals_signin_otp', 'msg91')).toBe(false);
+    const pinnacle = { ...msg91, provider: 'pinnacle' };
+    const parsed = parseTemplateConfig(JSON.stringify(pinnacle), 'signals_signin_otp', 'pinnacle');
+    expect('error' in parsed && parsed.error).toMatch(/variables\.\d\.(from|value)/);
   });
 
   it('only skips a broken row when Pinnacle is the vendor', () => {
@@ -195,6 +208,37 @@ describe('msg91 send with OTP template configs', () => {
     expect(res).toMatchObject({ ok: false, retryable: false });
     expect(res.error).toContain('num');
     expect(recipient).toBeUndefined();
+  });
+
+  it('enforces urlHosts on a caller-supplied link', async () => {
+    const env = {
+      MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP: otpRow('signals_signin_otp', {
+        variables: [
+          { name: 'num', from: 'message' },
+          { name: 'urg', from: 'url', type: 'url', urlHosts: ['Jobs.Example.in'] },
+        ],
+      }),
+    };
+    const ok = await send(env, 'signals_signin_otp', keycloak);
+    expect(ok.recipient).toEqual({ mobiles: '919000000006', num: '123456', urg: 'https://jobs.example.in' });
+
+    const bad = await send(env, 'signals_signin_otp', { message: '1', url: 'https://evil.example' });
+    expect(bad.res).toMatchObject({ ok: false, retryable: false });
+    expect(bad.res.error).toContain('not in urlHosts');
+    expect(bad.recipient).toBeUndefined();
+  });
+
+  it('sends without an optional (required: false) variable the caller left out', async () => {
+    const env = {
+      MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP: otpRow('signals_signin_otp', {
+        variables: [
+          { name: 'num', from: 'message' },
+          { name: 'urg', from: 'url', required: false },
+        ],
+      }),
+    };
+    const { recipient } = await send(env, 'signals_signin_otp', { message: '123456' });
+    expect(recipient).toEqual({ mobiles: '919000000006', num: '123456' });
   });
 
   it('sends a lone declared `message` as message, not the legacy ##var##', async () => {
