@@ -23,7 +23,7 @@ const VARIABLE_SCHEMAS = {
   msg91: VariableSpecSchema.extend({ from: z.string().min(1).optional(), value: z.string().min(1).optional() }),
 };
 
-function templateConfigSchema<P extends keyof typeof VARIABLE_SCHEMAS>(provider: P) {
+function templateConfigSchema<P extends keyof typeof VARIABLE_SCHEMAS, B extends z.ZodType>(provider: P, bodyText: B) {
   return z.looseObject({
     template_key: z.string().min(1),
     network: z.string().min(1),
@@ -31,23 +31,28 @@ function templateConfigSchema<P extends keyof typeof VARIABLE_SCHEMAS>(provider:
     locale: z.string().min(1),
     provider: z.literal(provider),
     provider_template_id: z.string().trim().min(1),
-    body_text: z.string().min(1),
+    body_text: bodyText,
     variables: z.array(VARIABLE_SCHEMAS[provider]),
     version: z.number().int().optional(),
     approval_ref: z.string().optional(),
   });
 }
 
-const SCHEMAS = { pinnacle: templateConfigSchema('pinnacle'), msg91: templateConfigSchema('msg91') };
+// Pinnacle sends body_text; MSG91 renders its own stored template, so it is optional there.
+const SCHEMAS = {
+  pinnacle: templateConfigSchema('pinnacle', z.string().min(1)),
+  msg91: templateConfigSchema('msg91', z.string().min(1).optional()),
+};
 
 export type SmsTemplateProvider = keyof typeof SCHEMAS;
-export type TemplateConfig = z.infer<(typeof SCHEMAS)[SmsTemplateProvider]>;
+export type TemplateConfigFor<P extends SmsTemplateProvider> = z.infer<(typeof SCHEMAS)[P]>;
+export type TemplateConfig = TemplateConfigFor<SmsTemplateProvider>;
 
-export function parseTemplateConfig(
+export function parseTemplateConfig<P extends SmsTemplateProvider>(
   raw: string,
   expectedKey: string,
-  provider: SmsTemplateProvider
-): TemplateConfig | { error: string } {
+  provider: P
+): TemplateConfigFor<P> | { error: string } {
   let json: unknown;
   try {
     json = JSON.parse(raw);
@@ -58,11 +63,11 @@ export function parseTemplateConfig(
   if (!parsed.success) {
     return { error: parsed.error.issues.map((i) => i.path.join('.') || 'row').join(', ') + ' invalid or missing' };
   }
-  const row = parsed.data;
+  const row = parsed.data as TemplateConfigFor<P>;
   if (row.template_key !== expectedKey) {
     return { error: `template_key is '${row.template_key}', expected '${expectedKey}'` };
   }
-  const placeholders = [...row.body_text.matchAll(/\{\{(\w+)\}\}/g)].map((m) => m[1]);
+  const placeholders = [...(row.body_text ?? '').matchAll(/\{\{(\w+)\}\}/g)].map((m) => m[1]);
   const declared = row.variables.map((v) => v.name);
   const undeclaredPlaceholders = placeholders.filter((v) => !declared.includes(v));
   if (undeclaredPlaceholders.length) return { error: `body_text uses undeclared variables: ${undeclaredPlaceholders.join(', ')}` };

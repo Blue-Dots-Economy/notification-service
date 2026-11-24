@@ -2,7 +2,9 @@ import { z } from 'zod';
 import { ProviderDefinition, ProviderSendResult } from '../../../types/provider';
 import * as metrics from '../../metrics';
 import { isRetryableHttpStatus } from './http_status';
-import { linkNotAllowed, parseTemplateConfig, TemplateConfig, urlHostsOf } from './template_config';
+import { linkNotAllowed, parseTemplateConfig, TemplateConfigFor, urlHostsOf } from './template_config';
+
+type TemplateConfig = TemplateConfigFor<'msg91'>;
 
 // Sign-in and sign-up OTP keys Keycloak sends (SMS_HTTP_CLIENT_APPS), plus login_otp (Signals guardian
 // OTP, and Keycloak's fallback). Each env var holds one JSON template config (see ./template_config),

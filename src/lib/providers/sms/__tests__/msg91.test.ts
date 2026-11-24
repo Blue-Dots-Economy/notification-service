@@ -162,6 +162,15 @@ describe('msg91 OTP template configs', () => {
     expect(() => loadOtpTemplateConfigs({ MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP: raw })).toThrow(/duplicate/);
   });
 
+  it('makes body_text optional for msg91 but not pinnacle', () => {
+    const { body_text: _omit, ...noBody } = JSON.parse(otpRow('signals_signin_otp'));
+    const rows = loadOtpTemplateConfigs({ MSG91_TEMPLATE_SIGNALS_SIGNIN_OTP: JSON.stringify(noBody) });
+    expect(rows.signals_signin_otp.provider_template_id).toBe('flow-signals_signin_otp');
+    const pinnacle = { ...noBody, provider: 'pinnacle', variables: [{ name: 'message' }] };
+    const parsed = parseTemplateConfig(JSON.stringify(pinnacle), 'signals_signin_otp', 'pinnacle');
+    expect('error' in parsed && parsed.error).toMatch(/body_text/);
+  });
+
   it('only accepts from/value on msg91 configs, not pinnacle', () => {
     const msg91 = JSON.parse(otpRow('signals_signin_otp'));
     expect('error' in parseTemplateConfig(JSON.stringify(msg91), 'signals_signin_otp', 'msg91')).toBe(false);

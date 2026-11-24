@@ -4,7 +4,7 @@ import { ProviderDefinition, ProviderSendResult } from '../../../types/provider'
 import * as metrics from '../../metrics';
 import { isRetryableHttpStatus } from './http_status';
 import { MAX_LENGTH, messageType, renderBody, UnresolvedTemplateVariables } from './render';
-import { linkNotAllowed, parseTemplateConfig, TemplateConfig, urlHostsOf } from './template_config';
+import { linkNotAllowed, parseTemplateConfig, TemplateConfigFor, urlHostsOf } from './template_config';
 
 /**
  * Pinnacle Teleservices SMS provider — the JSON endpoint (`/index.php/sms/json`).
@@ -39,7 +39,7 @@ const OTP_TEMPLATE_ENV_VARS: Record<string, string> = {
 /** Event templates (#191): path to a JSON file holding an array of rows in the same shape, each keyed by its own template_key. */
 const TEMPLATE_FILE_ENV_VAR = 'PINNACLE_TEMPLATES_FILE';
 
-export type OtpTemplateRow = TemplateConfig;
+export type OtpTemplateRow = TemplateConfigFor<'pinnacle'>;
 
 export function parseOtpTemplateRow(raw: string, expectedKey: string): OtpTemplateRow | { error: string } {
   return parseTemplateConfig(raw, expectedKey, 'pinnacle');
