@@ -2,7 +2,7 @@
 # npm and corepack. The runtime stage below uses the hardened variant, which has
 # none of them, so no RUN is possible past that FROM.
 # dhi.io/node:24-alpine-dev
-FROM dhi.io/node@sha256:d71115a04968ba554a4dbaf4f413ce6bde1a3988b344b60fbabb9bce8cdd5e50 AS builder
+FROM dhi.io/node@sha256:417af41fd2803f7dab71a0d2602711d1bd3f69cc064000555e9ecd8f52733bb5 AS builder
 WORKDIR /app
 
 # Manifests first, so the pnpm version can be derived from `packageManager` below,
@@ -36,7 +36,7 @@ RUN pnpm run build
 # pnpm version, same lockfile, same --prod --frozen-lockfile flags, so the
 # resulting dependency tree is unchanged.
 # dhi.io/node:24-alpine-dev
-FROM dhi.io/node@sha256:d71115a04968ba554a4dbaf4f413ce6bde1a3988b344b60fbabb9bce8cdd5e50 AS prod-deps
+FROM dhi.io/node@sha256:417af41fd2803f7dab71a0d2602711d1bd3f69cc064000555e9ecd8f52733bb5 AS prod-deps
 WORKDIR /app
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN npm install -g "pnpm@$(sed -n 's/.*"packageManager": *"pnpm@\([^"]*\)".*/\1/p' package.json)"
@@ -51,7 +51,7 @@ RUN pnpm install --prod --frozen-lockfile
 # ['worker']) (src/lib/worker.ts). fork spawns via process.execPath — the node
 # binary — not a shell, so it is unaffected by the missing shell here.
 # dhi.io/node:24-alpine
-FROM dhi.io/node@sha256:17b2b728ef4250c311ee9fb80f3a4a1060db6996750e85c1bf2dec10ccc5b6e6 AS runtime
+FROM dhi.io/node@sha256:4544851709621aa77a18134101ef4cd6af39233cf57bdfe2adcc17e2e72866db AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 
