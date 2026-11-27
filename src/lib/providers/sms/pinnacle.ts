@@ -4,6 +4,7 @@ import { ProviderDefinition, ProviderSendResult } from '../../../types/provider'
 import * as metrics from '../../metrics';
 import { isRetryableHttpStatus } from './http_status';
 import { MAX_LENGTH, messageType, renderBody, UnresolvedTemplateVariables } from './render';
+import { linkNotAllowed, parseTemplateConfig, TemplateConfigFor, urlHostsOf } from './template_config';
 
 /**
  * Pinnacle Teleservices SMS provider — the JSON endpoint (`/index.php/sms/json`).
@@ -38,50 +39,10 @@ const OTP_TEMPLATE_ENV_VARS: Record<string, string> = {
 /** Event templates (#191): path to a JSON file holding an array of rows in the same shape, each keyed by its own template_key. */
 const TEMPLATE_FILE_ENV_VAR = 'PINNACLE_TEMPLATES_FILE';
 
-const VariableSpecSchema = z.looseObject({
-  name: z.string().min(1),
-  required: z.boolean().optional(),
-  type: z.string().optional(),
-  sensitive: z.boolean().optional(),
-  raw: z.boolean().optional(),
-  urlHosts: z.array(z.string().min(1)).optional(),
-});
-
-const OtpTemplateRowSchema = z.looseObject({
-  template_key: z.string().min(1),
-  network: z.string().min(1),
-  channel: z.literal('sms'),
-  locale: z.string().min(1),
-  provider: z.literal('pinnacle'),
-  provider_template_id: z.string().trim().min(1),
-  body_text: z.string().min(1),
-  variables: z.array(VariableSpecSchema),
-  version: z.number().int().optional(),
-  approval_ref: z.string().optional(),
-});
-
-export type OtpTemplateRow = z.infer<typeof OtpTemplateRowSchema>;
+export type OtpTemplateRow = TemplateConfigFor<'pinnacle'>;
 
 export function parseOtpTemplateRow(raw: string, expectedKey: string): OtpTemplateRow | { error: string } {
-  let json: unknown;
-  try {
-    json = JSON.parse(raw);
-  } catch {
-    return { error: 'not valid JSON' };
-  }
-  const parsed = OtpTemplateRowSchema.safeParse(json);
-  if (!parsed.success) {
-    return { error: parsed.error.issues.map((i) => i.path.join('.') || 'row').join(', ') + ' invalid or missing' };
-  }
-  const row = parsed.data;
-  if (row.template_key !== expectedKey) {
-    return { error: `template_key is '${row.template_key}', expected '${expectedKey}'` };
-  }
-  const placeholders = [...row.body_text.matchAll(/\{\{(\w+)\}\}/g)].map((m) => m[1]);
-  const declared = row.variables.map((v) => v.name);
-  const undeclaredPlaceholders = placeholders.filter((v) => !declared.includes(v));
-  if (undeclaredPlaceholders.length) return { error: `body_text uses undeclared variables: ${undeclaredPlaceholders.join(', ')}` };
-  return row;
+  return parseTemplateConfig(raw, expectedKey, 'pinnacle');
 }
 
 /**
@@ -144,34 +105,13 @@ export function loadOtpTemplates(env = process.env): {
     }
     templates[key] = row.provider_template_id;
     bodies[key] = row.body_text;
-    const hosts = Object.fromEntries(
-      row.variables
-        .filter((v) => v.type === 'url' && v.urlHosts)
-        .map((v) => [v.name, v.urlHosts!.map((h) => h.trim().toLowerCase())])
-    );
+    const hosts = urlHostsOf(row);
     if (Object.keys(hosts).length) urlHosts[key] = hosts;
   }
   return { templates, bodies, urlHosts };
 }
 
-/** Why a url variable may not be sent, or undefined when every link is on its allowed hosts. */
-export function linkNotAllowed(
-  hostsByVariable: Record<string, string[]> | undefined,
-  variables: Record<string, string>
-): string | undefined {
-  for (const [name, hosts] of Object.entries(hostsByVariable ?? {})) {
-    const value = variables[name];
-    if (value === undefined) continue;
-    let host = '';
-    try {
-      host = new URL(value).host;
-    } catch {
-      // not a URL; reported below like any other disallowed host
-    }
-    if (!hosts.includes(host)) return `${name} host '${host || value}' not in urlHosts`;
-  }
-  return undefined;
-}
+export { linkNotAllowed };
 
 interface PinnacleConfig {
   baseUrl: string;
